@@ -86,6 +86,10 @@ sample count as the MONAI baseline.
 The baseline script compares against a MONAI `CacheDataset` pipeline with
 `LoadImaged`, `EnsureChannelFirstd`, `Spacingd`, `ScaleIntensityRanged`,
 `CropForegroundd`, and `RandCropByPosNegLabeld`.
+It uses `monai.data.DataLoader`, configures
+`RandCropByPosNegLabeld(num_samples=batch_size)`, and iterates explicit epochs
+instead of `itertools.cycle(loader)` so repeated samples are actually re-cropped
+rather than replayed from `cycle`'s internal cache.
 
 Install optional Python dependencies in your Python environment:
 
@@ -156,10 +160,10 @@ python crates/medkit-benchmarks/scripts/msd_spleen_workflow.py \
   --workers 8 \
   --monai-workers 0 \
   --batch-size 16 \
-  --medkit-torch-backend view-batch \
+  --medkit-torch-backend ffi-batch \
   --medkit-bin target/release/medkit \
   --python target/monai-baseline-venv/bin/python \
-  --out data/msd-spleen/subset-2-dataloader-win-4096.json
+  --out data/msd-spleen/subset-2-contiguous-ffi-batch-4096.json
 ```
 
 This is the current canonical real-data smoke benchmark. It uses a small
@@ -202,26 +206,26 @@ relative throughput ratios.
 
 Current two-case MSD Spleen result, 4096 patches, patch size `96,96,96`,
 cache shape `160,160,160`, chunk shape `96,96,96`, medkit workers `8`,
-MONAI workers `0`, DataLoader batch size `16`:
+MONAI workers `0`, effective DataLoader patch batch size `16`:
 
 | Metric | medkit-rs | MONAI | Result |
 |---|---:|---:|---:|
-| Cache/prep build | 1.45 s | 3.98 s | medkit 2.74x faster |
-| Sample plan throughput | 178,660 samples/s | 28,659 samples/s | medkit 6.23x faster |
-| Centered cold extraction throughput | 23,972 samples/s | 28,659 samples/s | medkit 0.84x MONAI |
-| Centered warm extraction throughput | 31,298 samples/s | 28,659 samples/s | medkit 1.09x faster |
-| JSONL-plan cold extraction throughput | 19,083 samples/s | 28,659 samples/s | medkit 0.67x MONAI |
-| JSONL-plan warm extraction throughput | 23,150 samples/s | 28,659 samples/s | medkit 0.81x MONAI |
-| PyTorch DataLoader view-batch throughput | 178,269 samples/s | 28,659 samples/s | medkit 6.22x faster |
+| Cache/prep build | 2.02 s | 6.17 s | medkit 3.06x faster |
+| Sample plan throughput | 121,523 samples/s | 828 samples/s | medkit 146.82x faster |
+| Centered cold extraction throughput | 19,002 samples/s | 828 samples/s | medkit 22.96x faster |
+| Centered warm extraction throughput | 13,741 samples/s | 828 samples/s | medkit 16.60x faster |
+| JSONL-plan cold extraction throughput | 10,010 samples/s | 828 samples/s | medkit 12.09x faster |
+| JSONL-plan warm extraction throughput | 12,002 samples/s | 828 samples/s | medkit 14.50x faster |
+| PyTorch DataLoader contiguous `ffi-batch` throughput | 5,009 samples/s | 828 samples/s | medkit 6.05x faster |
 
 Report path:
-`data/msd-spleen/subset-2-dataloader-win-4096.json`.
+`data/msd-spleen/subset-2-contiguous-ffi-batch-4096.json`.
 
-The PyTorch DataLoader row uses the `view-batch` backend. It yields batches as
-lists of no-copy tensor views and verifies label occupancy through the persisted
-foreground prefix. This is a real `torch.utils.data.DataLoader` path and it
-beats the MONAI DataLoader timing on this benchmark, but it is not the final
-contiguous tensor-batch design needed for normal model training loops.
+The PyTorch DataLoader row now uses the `ffi-batch` backend. It asks the Rust
+FFI bridge to fill standard contiguous `[B, C, Z, Y, X]` CPU tensors directly
+from the medkit cache and sampled patch plan. The older `view-batch` result is
+still useful as a zero-copy ceiling, but the contiguous path is the relevant
+training-loop target.
 
 An additional same-worker-count run is also useful when evaluating how the
 pipeline behaves under process/thread orchestration overhead:

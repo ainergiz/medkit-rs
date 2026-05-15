@@ -165,11 +165,13 @@ class MedkitFfiBatchIterableDataset(_IterableDatasetBase):
             start = worker.id * self.batch_size
             step = worker.num_workers * self.batch_size
         index = start
+        z, y, x = self._patch[2], self._patch[1], self._patch[0]
+        image_buffer = torch.empty((self.batch_size, 1, z, y, x), dtype=torch.float32)
+        label_buffer = torch.empty_like(image_buffer)
         while index < length:
             current = min(self.batch_size, length - index)
-            z, y, x = self._patch[2], self._patch[1], self._patch[0]
-            image = np.empty((current, 1, z, y, x), dtype=np.float32)
-            label = np.empty((current, 1, z, y, x), dtype=np.float32)
+            image = image_buffer if current == self.batch_size else image_buffer[:current]
+            label = label_buffer if current == self.batch_size else label_buffer[:current]
             written = ffi.fill_batch(self._handle, index % self._records, current, image, label)
             if written <= 0:
                 raise RuntimeError("medkit FFI returned no samples")
@@ -177,8 +179,8 @@ class MedkitFfiBatchIterableDataset(_IterableDatasetBase):
                 image = image[:written]
                 label = label[:written]
             yield {
-                "image": torch.from_numpy(image),
-                "label": torch.from_numpy(label),
+                "image": image,
+                "label": label,
             }
             index += step
 
@@ -366,18 +368,20 @@ class _MedkitFfi:
         handle: int | None,
         start: int,
         batch_size: int,
-        image: np.ndarray,
-        label: np.ndarray,
+        image: Any,
+        label: Any,
     ) -> int:
         if handle is None:
             raise RuntimeError("medkit FFI dataset is not open")
+        image_ptr = _writable_pointer(image)
+        label_ptr = _writable_pointer(label)
         return int(
             self.lib.medkit_dataset_fill_batch_f32_labels(
                 ctypes.c_void_p(handle),
                 start,
                 batch_size,
-                image.ctypes.data_as(ctypes.c_void_p),
-                label.ctypes.data_as(ctypes.c_void_p),
+                image_ptr,
+                label_ptr,
             )
         )
 
@@ -423,6 +427,14 @@ def _prefix_count(
         - int(prefix[z, y, x])
     )
     return value
+
+
+def _writable_pointer(value: Any) -> ctypes.c_void_p:
+    if hasattr(value, "data_ptr"):
+        if not value.is_contiguous():
+            raise ValueError("FFI batch tensors must be contiguous")
+        return ctypes.c_void_p(int(value.data_ptr()))
+    return value.ctypes.data_as(ctypes.c_void_p)
 
 
 def _torch():

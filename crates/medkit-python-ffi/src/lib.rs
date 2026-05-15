@@ -3,10 +3,11 @@ use std::{
     ffi::{c_char, CStr},
     fs,
     path::{Path, PathBuf},
-    ptr,
+    ptr, slice,
 };
 
 use medkit_cache::{read_cache_manifest, CachedCase};
+use rayon::prelude::*;
 use serde::Deserialize;
 
 #[derive(Debug)]
@@ -21,7 +22,7 @@ struct LoadedCase {
     case_id: String,
     shape: [usize; 3],
     image: Vec<f32>,
-    label: Vec<u16>,
+    label_f32: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -171,18 +172,27 @@ pub unsafe extern "C" fn medkit_dataset_fill_batch_f32_labels(
     if image_out.is_null() || label_out.is_null() || dataset.records.is_empty() {
         return 0;
     }
-    for batch_index in 0..batch_size {
-        let record = dataset.records[(start_index + batch_index) % dataset.records.len()];
-        let case = &dataset.cases[record.case_index];
-        copy_patch_f32_labels(
-            case,
-            record.start,
-            dataset.patch_size,
-            image_out,
-            label_out,
-            batch_index,
-        );
-    }
+    let patch_voxels = dataset.patch_size[0] * dataset.patch_size[1] * dataset.patch_size[2];
+    let Some(total_values) = patch_voxels.checked_mul(batch_size) else {
+        return 0;
+    };
+    let image_out = slice::from_raw_parts_mut(image_out, total_values);
+    let label_out = slice::from_raw_parts_mut(label_out, total_values);
+    image_out
+        .par_chunks_mut(patch_voxels)
+        .zip(label_out.par_chunks_mut(patch_voxels))
+        .enumerate()
+        .for_each(|(batch_index, (image_patch, label_patch))| {
+            let record = dataset.records[(start_index + batch_index) % dataset.records.len()];
+            let case = &dataset.cases[record.case_index];
+            copy_patch_f32_labels(
+                case,
+                record.start,
+                dataset.patch_size,
+                image_patch,
+                label_patch,
+            );
+        });
     batch_size
 }
 
@@ -230,7 +240,7 @@ fn load_case(case: &CachedCase) -> Result<LoadedCase, String> {
         case_id: case.case_id.clone(),
         shape: case.shape,
         image: read_f32_volume(Path::new(&case.image_cache_path), case.shape)?,
-        label: read_u16_volume(Path::new(&case.label_cache_path), case.shape)?,
+        label_f32: read_u16_volume_as_f32(Path::new(&case.label_cache_path), case.shape)?,
     })
 }
 
@@ -258,7 +268,7 @@ fn read_f32_volume(path: &Path, shape: [usize; 3]) -> Result<Vec<f32>, String> {
         .collect())
 }
 
-fn read_u16_volume(path: &Path, shape: [usize; 3]) -> Result<Vec<u16>, String> {
+fn read_u16_volume_as_f32(path: &Path, shape: [usize; 3]) -> Result<Vec<f32>, String> {
     let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let expected = shape[0] * shape[1] * shape[2] * 2;
     if bytes.len() != expected {
@@ -270,7 +280,7 @@ fn read_u16_volume(path: &Path, shape: [usize; 3]) -> Result<Vec<u16>, String> {
     }
     Ok(bytes
         .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes(chunk.try_into().expect("chunk length")))
+        .map(|chunk| f32::from(u16::from_le_bytes(chunk.try_into().expect("chunk length"))))
         .collect())
 }
 
@@ -296,41 +306,33 @@ unsafe fn copy_patch(
                 image_out.add(destination_start),
                 patch_size[0],
             );
-            ptr::copy_nonoverlapping(
-                case.label.as_ptr().add(source_start),
-                label_out.add(destination_start),
-                patch_size[0],
-            );
+            let label_row = &case.label_f32[source_start..source_start + patch_size[0]];
+            for (offset, value) in label_row.iter().enumerate() {
+                *label_out.add(destination_start + offset) = *value as u16;
+            }
         }
     }
 }
 
-unsafe fn copy_patch_f32_labels(
+fn copy_patch_f32_labels(
     case: &LoadedCase,
     start: [usize; 3],
     patch_size: [usize; 3],
-    image_out: *mut f32,
-    label_out: *mut f32,
-    batch_index: usize,
+    image_out: &mut [f32],
+    label_out: &mut [f32],
 ) {
-    let patch_voxels = patch_size[0] * patch_size[1] * patch_size[2];
-    let batch_offset = batch_index * patch_voxels;
     for local_z in 0..patch_size[2] {
         let z = start[2] + local_z;
         for local_y in 0..patch_size[1] {
             let y = start[1] + local_y;
             let source_start = start[0] + case.shape[0] * (y + case.shape[1] * z);
-            let destination_start =
-                batch_offset + patch_size[0] * (local_y + patch_size[1] * local_z);
-            ptr::copy_nonoverlapping(
-                case.image.as_ptr().add(source_start),
-                image_out.add(destination_start),
-                patch_size[0],
-            );
-            let label_row = &case.label[source_start..source_start + patch_size[0]];
-            for (offset, value) in label_row.iter().enumerate() {
-                *label_out.add(destination_start + offset) = f32::from(*value);
-            }
+            let destination_start = patch_size[0] * (local_y + patch_size[1] * local_z);
+            let destination_end = destination_start + patch_size[0];
+            let source_end = source_start + patch_size[0];
+            image_out[destination_start..destination_end]
+                .copy_from_slice(&case.image[source_start..source_end]);
+            label_out[destination_start..destination_end]
+                .copy_from_slice(&case.label_f32[source_start..source_end]);
         }
     }
 }

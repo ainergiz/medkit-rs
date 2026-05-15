@@ -10,3 +10,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Local reference checkouts used while studying upstream implementations.
+/references/

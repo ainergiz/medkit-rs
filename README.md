@@ -210,9 +210,16 @@ extraction commands, runs a medkit PyTorch `Dataset` adapter over the sampled
 patch plan, then runs a comparable MONAI `CacheDataset` plus
 `RandCropByPosNegLabeld` baseline.
 
-The latest local DataLoader comparison uses medkit's lazy `view-batch` adapter
-and beats MONAI on the two-case MSD Spleen smoke benchmark. The next target is
-to make the same win hold for standard contiguous tensor batches.
+The latest local DataLoader comparison uses medkit's Rust-backed `ffi-batch`
+adapter and beats a corrected MONAI baseline on the two-case MSD Spleen smoke
+benchmark while yielding standard contiguous `[B, C, Z, Y, X]` tensors. The
+next target is making that win survive the full MSD Spleen training split,
+additional modalities, and a production PyO3/DLPack bridge.
+
+For local implementation research, MONAI is cloned into the gitignored
+`references/MONAI` directory. Treat that checkout as read-only reference
+material while iterating on medkit-rs cache, crop, transform, and DataLoader
+paths; do not vendor it into this repository.
 
 See [docs/benchmarks.md](docs/benchmarks.md) for fixture, microbenchmark,
 macrobenchmark, real MSD Spleen workflow, and MONAI baseline details. See

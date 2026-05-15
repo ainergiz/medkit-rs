@@ -427,6 +427,7 @@ name = "medkit-python-ffi"
 version = "0.1.0"
 dependencies = [
  "medkit-cache",
+ "rayon",
  "serde",
  "serde_json",
 ]

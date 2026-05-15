@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MONAI baseline for the synthetic medkit benchmark fixtures.
+"""MONAI baseline for medkit benchmark fixtures and real MSD workflows.
 
 The script intentionally imports MONAI and PyTorch only when `run` is invoked so
 `python -m py_compile` can validate syntax in environments without ML packages.
@@ -8,7 +8,6 @@ The script intentionally imports MONAI and PyTorch only when `run` is invoked so
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import sys
 import time
@@ -45,7 +44,7 @@ def main() -> int:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     monai = import_monai()
-    torch = import_torch()
+    import_torch()
     patch = parse_int3(args.patch, "--patch")
     spacing = parse_float3(args.spacing, "--spacing")
     cases = discover_cases(args.data_root)
@@ -87,7 +86,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 spatial_size=patch,
                 pos=1.0,
                 neg=1.0,
-                num_samples=1,
+                num_samples=args.batch_size,
             ),
         ]
     )
@@ -101,24 +100,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     cache_elapsed = time.perf_counter() - cache_start
 
-    loader = torch.utils.data.DataLoader(
+    loader = monai.data.DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         num_workers=args.workers,
         shuffle=False,
     )
     sample_start = time.perf_counter()
     checksum = 0
     samples_seen = 0
-    iterator = itertools.cycle(loader)
     while samples_seen < args.samples:
-        batch = next(iterator)
-        label = first_label_tensor(batch)
-        current = min(int(label.shape[0]), args.samples - samples_seen)
-        if current != int(label.shape[0]):
-            label = label[:current]
-        checksum += int(label.sum().item())
-        samples_seen += current
+        for batch in loader:
+            label = first_label_tensor(batch)
+            current = min(int(label.shape[0]), args.samples - samples_seen)
+            if current != int(label.shape[0]):
+                label = label[:current]
+            checksum += int(label.sum().item())
+            samples_seen += current
+            if samples_seen >= args.samples:
+                break
     sample_elapsed = time.perf_counter() - sample_start
 
     bytes_per_patch = patch[0] * patch[1] * patch[2] * (4 + 2)
@@ -130,6 +130,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "samples": args.samples,
         "workers": args.workers,
         "batch_size": args.batch_size,
+        "case_batch_size": 1,
+        "crops_per_case": args.batch_size,
+        "effective_patch_batch_size": args.batch_size,
         "cache_build_ms": cache_elapsed * 1000.0,
         "sample_iter_ms": sample_elapsed * 1000.0,
         "samples_per_second": args.samples / max(sample_elapsed, sys.float_info.epsilon),

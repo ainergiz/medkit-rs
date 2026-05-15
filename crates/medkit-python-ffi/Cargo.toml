@@ -14,5 +14,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 medkit-cache = { path = "../medkit-cache" }
+rayon = "1.10"
 serde.workspace = true
 serde_json.workspace = true
