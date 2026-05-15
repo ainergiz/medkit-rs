@@ -1,0 +1,12 @@
+/target/
+*.profraw
+*.profdata
+
+# Local datasets, generated benchmark reports, and downloaded archives.
+/data/
+
+# Python local state.
+__pycache__/
+*.py[cod]
+.venv/
+venv/

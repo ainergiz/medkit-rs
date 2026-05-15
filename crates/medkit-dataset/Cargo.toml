@@ -1,0 +1,22 @@
+[package]
+name = "medkit-dataset"
+version = "0.1.0"
+description = "Dataset scanning, pairing, validation, and manifests for medkit-rs."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "medkit_dataset"
+path = "src/lib.rs"
+
+[dependencies]
+medkit-core = { path = "../medkit-core" }
+medkit-io = { path = "../medkit-io" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+

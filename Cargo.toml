@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/medkit-bench",
+    "crates/medkit-benchmarks",
+    "crates/medkit-cache",
+    "crates/medkit-cli",
+    "crates/medkit-core",
+    "crates/medkit-dataset",
+    "crates/medkit-io",
+    "crates/medkit-sampler",
+    "crates/medkit-transform",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/ainergiz/medkit-rs"
+rust-version = "1.76"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+toml = "0.9"

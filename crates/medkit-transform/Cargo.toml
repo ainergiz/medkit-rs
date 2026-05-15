@@ -1,0 +1,19 @@
+[package]
+name = "medkit-transform"
+version = "0.1.0"
+description = "Lazy transform plans and deterministic preprocessing kernels for medkit-rs."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "medkit_transform"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+

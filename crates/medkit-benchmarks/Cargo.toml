@@ -1,0 +1,40 @@
+[package]
+name = "medkit-benchmarks"
+version = "0.1.0"
+description = "Benchmark fixtures, microbenchmarks, and macrobench runners for medkit-rs."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "medkit_benchmarks"
+path = "src/lib.rs"
+
+[[bin]]
+name = "medkit-benchmarks"
+path = "src/main.rs"
+
+[[bench]]
+name = "transform_micro"
+harness = false
+
+[[bench]]
+name = "sampler_micro"
+harness = false
+
+[[bench]]
+name = "cache_micro"
+harness = false
+
+[dependencies]
+medkit-bench = { path = "../medkit-bench" }
+medkit-cache = { path = "../medkit-cache" }
+medkit-dataset = { path = "../medkit-dataset" }
+medkit-sampler = { path = "../medkit-sampler" }
+medkit-transform = { path = "../medkit-transform" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"

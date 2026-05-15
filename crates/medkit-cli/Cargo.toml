@@ -1,0 +1,22 @@
+[package]
+name = "medkit-cli"
+version = "0.1.0"
+description = "Command-line workflows for medkit-rs."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "medkit"
+path = "src/main.rs"
+
+[dependencies]
+medkit-bench = { path = "../medkit-bench" }
+medkit-cache = { path = "../medkit-cache" }
+medkit-dataset = { path = "../medkit-dataset" }
+medkit-sampler = { path = "../medkit-sampler" }
+
+[dev-dependencies]
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+serde_json.workspace = true
