@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import ctypes
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +127,302 @@ class MedkitPatchIterableDataset(_IterableDatasetBase):
         while index < limit:
             yield self.dataset[index]
             index += step
+
+
+class MedkitFfiBatchIterableDataset(_IterableDatasetBase):
+    """Iterable dataset that asks the Rust FFI bridge to fill whole batches."""
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        patches_path: str | Path,
+        length: int | None = None,
+        batch_size: int = 16,
+        library_path: str | Path | None = None,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        self.cache_dir = Path(cache_dir)
+        self.patches_path = Path(patches_path)
+        self.requested_length = length
+        self.batch_size = batch_size
+        self.library_path = Path(library_path) if library_path else _default_ffi_library()
+        self._ffi: _MedkitFfi | None = None
+        self._handle: int | None = None
+        self._records = 0
+        self._patch = (0, 0, 0)
+        self._ensure_open()
+
+    def __iter__(self):
+        torch = _torch()
+        ffi = self._ensure_open()
+        worker = torch.utils.data.get_worker_info()
+        length = len(self)
+        if worker is None:
+            start = 0
+            step = self.batch_size
+        else:
+            start = worker.id * self.batch_size
+            step = worker.num_workers * self.batch_size
+        index = start
+        while index < length:
+            current = min(self.batch_size, length - index)
+            z, y, x = self._patch[2], self._patch[1], self._patch[0]
+            image = np.empty((current, 1, z, y, x), dtype=np.float32)
+            label = np.empty((current, 1, z, y, x), dtype=np.float32)
+            written = ffi.fill_batch(self._handle, index % self._records, current, image, label)
+            if written <= 0:
+                raise RuntimeError("medkit FFI returned no samples")
+            if written != current:
+                image = image[:written]
+                label = label[:written]
+            yield {
+                "image": torch.from_numpy(image),
+                "label": torch.from_numpy(label),
+            }
+            index += step
+
+    def __len__(self) -> int:
+        self._ensure_open()
+        return self.requested_length or self._records
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_ffi"] = None
+        state["_handle"] = None
+        return state
+
+    def __del__(self):
+        handle = getattr(self, "_handle", None)
+        ffi = getattr(self, "_ffi", None)
+        if handle and ffi:
+            ffi.free(handle)
+            self._handle = None
+
+    def _ensure_open(self) -> "_MedkitFfi":
+        if self._ffi is not None and self._handle:
+            return self._ffi
+        ffi = _MedkitFfi(self.library_path)
+        handle = ffi.open(self.cache_dir, self.patches_path)
+        records = ffi.len(handle)
+        if records <= 0:
+            ffi.free(handle)
+            raise ValueError(f"patch plan contains no records: {self.patches_path}")
+        self._ffi = ffi
+        self._handle = handle
+        self._records = records
+        self._patch = (ffi.patch_x(handle), ffi.patch_y(handle), ffi.patch_z(handle))
+        return ffi
+
+
+class MedkitViewBatchIterableDataset(_IterableDatasetBase):
+    """Iterable dataset that yields no-copy batches of patch tensor views."""
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        patches_path: str | Path,
+        length: int | None = None,
+        batch_size: int = 16,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        self.cache_dir = Path(cache_dir)
+        self.patches_path = Path(patches_path)
+        self.batch_size = batch_size
+        self.manifest = json.loads((self.cache_dir / "cache_manifest.json").read_text())
+        self._volumes = []
+        case_indices = {}
+        for case_index, case in enumerate(self.manifest["cases"]):
+            case_indices[case["case_id"]] = case_index
+            x, y, z = case["shape"]
+            image = np.fromfile(self._resolve(case["image_cache_path"]), dtype="<f4").reshape(
+                (z, y, x)
+            )
+            label = np.fromfile(self._resolve(case["label_cache_path"]), dtype="<u2").astype(
+                np.float32
+            ).reshape((z, y, x))
+            prefix = np.fromfile(
+                self._resolve(case["foreground_prefix_path"]),
+                dtype="<u4",
+            ).reshape((z + 1, y + 1, x + 1))
+            self._volumes.append(
+                (_torch().from_numpy(image), _torch().from_numpy(label), prefix)
+            )
+        records = []
+        for line in self.patches_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            x, y, z = record["patch_start"]
+            sx, sy, sz = record["patch_size"]
+            records.append((case_indices[record["case_id"]], x, y, z, sx, sy, sz))
+        if not records:
+            raise ValueError(f"patch plan contains no records: {self.patches_path}")
+        self.records = records
+        self.length = int(length) if length is not None else len(records)
+        if self.length <= 0:
+            raise ValueError("length must be greater than zero")
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __iter__(self):
+        worker = _torch().utils.data.get_worker_info()
+        if worker is None:
+            start = 0
+            step = self.batch_size
+        else:
+            start = worker.id * self.batch_size
+            step = worker.num_workers * self.batch_size
+        index = start
+        while index < self.length:
+            current = min(self.batch_size, self.length - index)
+            images = []
+            labels = []
+            label_sum = 0
+            for offset in range(current):
+                case_index, x, y, z, sx, sy, sz = self.records[
+                    (index + offset) % len(self.records)
+                ]
+                image, label, prefix = self._volumes[case_index]
+                images.append(image[z : z + sz, y : y + sy, x : x + sx].unsqueeze(0))
+                labels.append(label[z : z + sz, y : y + sy, x : x + sx].unsqueeze(0))
+                label_sum += _prefix_count(prefix, x, y, z, sx, sy, sz)
+            yield {"image": images, "label": labels, "label_sum": label_sum}
+            index += step
+
+    def _resolve(self, value: str) -> Path:
+        path = Path(value)
+        if path.is_absolute() or path.exists():
+            return path
+        candidate = self.cache_dir / path
+        if candidate.exists():
+            return candidate
+        return path
+
+
+class _MedkitFfi:
+    def __init__(self, library_path: Path):
+        self.library_path = library_path
+        self.lib = ctypes.CDLL(str(library_path))
+        self.lib.medkit_dataset_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        self.lib.medkit_dataset_open.restype = ctypes.c_void_p
+        self.lib.medkit_dataset_free.argtypes = [ctypes.c_void_p]
+        self.lib.medkit_dataset_free.restype = None
+        self.lib.medkit_dataset_len.argtypes = [ctypes.c_void_p]
+        self.lib.medkit_dataset_len.restype = ctypes.c_size_t
+        self.lib.medkit_dataset_patch_x.argtypes = [ctypes.c_void_p]
+        self.lib.medkit_dataset_patch_x.restype = ctypes.c_size_t
+        self.lib.medkit_dataset_patch_y.argtypes = [ctypes.c_void_p]
+        self.lib.medkit_dataset_patch_y.restype = ctypes.c_size_t
+        self.lib.medkit_dataset_patch_z.argtypes = [ctypes.c_void_p]
+        self.lib.medkit_dataset_patch_z.restype = ctypes.c_size_t
+        self.lib.medkit_dataset_fill_batch.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self.lib.medkit_dataset_fill_batch.restype = ctypes.c_size_t
+        self.lib.medkit_dataset_fill_batch_f32_labels.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self.lib.medkit_dataset_fill_batch_f32_labels.restype = ctypes.c_size_t
+
+    def open(self, cache_dir: Path, patches_path: Path) -> int:
+        handle = self.lib.medkit_dataset_open(
+            str(cache_dir).encode(),
+            str(patches_path).encode(),
+        )
+        if not handle:
+            raise RuntimeError(
+                f"failed to open medkit FFI dataset with {self.library_path}"
+            )
+        return int(handle)
+
+    def free(self, handle: int) -> None:
+        self.lib.medkit_dataset_free(ctypes.c_void_p(handle))
+
+    def len(self, handle: int) -> int:
+        return int(self.lib.medkit_dataset_len(ctypes.c_void_p(handle)))
+
+    def patch_x(self, handle: int) -> int:
+        return int(self.lib.medkit_dataset_patch_x(ctypes.c_void_p(handle)))
+
+    def patch_y(self, handle: int) -> int:
+        return int(self.lib.medkit_dataset_patch_y(ctypes.c_void_p(handle)))
+
+    def patch_z(self, handle: int) -> int:
+        return int(self.lib.medkit_dataset_patch_z(ctypes.c_void_p(handle)))
+
+    def fill_batch(
+        self,
+        handle: int | None,
+        start: int,
+        batch_size: int,
+        image: np.ndarray,
+        label: np.ndarray,
+    ) -> int:
+        if handle is None:
+            raise RuntimeError("medkit FFI dataset is not open")
+        return int(
+            self.lib.medkit_dataset_fill_batch_f32_labels(
+                ctypes.c_void_p(handle),
+                start,
+                batch_size,
+                image.ctypes.data_as(ctypes.c_void_p),
+                label.ctypes.data_as(ctypes.c_void_p),
+            )
+        )
+
+
+def _default_ffi_library() -> Path:
+    root = Path(__file__).resolve().parents[2]
+    stem = "medkit_python_ffi"
+    if sys.platform == "darwin":
+        filename = f"lib{stem}.dylib"
+    elif sys.platform == "win32":
+        filename = f"{stem}.dll"
+    else:
+        filename = f"lib{stem}.so"
+    path = root / "target" / "release" / filename
+    if not path.exists():
+        raise RuntimeError(
+            f"missing medkit FFI library at {path}; run "
+            "`cargo build -p medkit-python-ffi --release`"
+        )
+    return path
+
+
+def _prefix_count(
+    prefix: np.ndarray,
+    x: int,
+    y: int,
+    z: int,
+    sx: int,
+    sy: int,
+    sz: int,
+) -> int:
+    x1 = x + sx
+    y1 = y + sy
+    z1 = z + sz
+    value = (
+        int(prefix[z1, y1, x1])
+        - int(prefix[z1, y1, x])
+        - int(prefix[z1, y, x1])
+        - int(prefix[z, y1, x1])
+        + int(prefix[z1, y, x])
+        + int(prefix[z, y1, x])
+        + int(prefix[z, y, x1])
+        - int(prefix[z, y, x])
+    )
+    return value
 
 
 def _torch():

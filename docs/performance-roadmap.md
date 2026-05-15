@@ -20,22 +20,24 @@ python crates/medkit-benchmarks/scripts/msd_spleen_workflow.py \
   --samples 4096 \
   --workers 8 \
   --monai-workers 0 \
+  --batch-size 16 \
+  --medkit-torch-backend view-batch \
   --medkit-bin target/release/medkit \
   --python target/monai-baseline-venv/bin/python \
-  --out data/msd-spleen/subset-2-training-native-4096.json
+  --out data/msd-spleen/subset-2-dataloader-win-4096.json
 ```
 
 Current result on the local machine:
 
 | Metric | medkit-rs | MONAI | Result |
 |---|---:|---:|---:|
-| Cache/prep build | 1.51 s | 4.34 s | medkit 2.88x faster |
-| Sample plan throughput | 186,738 samples/s | 17,864 samples/s | medkit 10.45x faster |
-| Centered cold extraction throughput | 21,588 samples/s | 17,864 samples/s | medkit 1.21x faster |
-| Centered warm extraction throughput | 25,648 samples/s | 17,864 samples/s | medkit 1.44x faster |
-| JSONL-plan cold extraction throughput | 16,396 samples/s | 17,864 samples/s | medkit 0.92x MONAI |
-| JSONL-plan warm extraction throughput | 20,041 samples/s | 17,864 samples/s | medkit 1.12x faster |
-| PyTorch DataLoader adapter throughput | 1,439 samples/s | 17,864 samples/s | medkit 0.08x MONAI |
+| Cache/prep build | 1.45 s | 3.98 s | medkit 2.74x faster |
+| Sample plan throughput | 178,660 samples/s | 28,659 samples/s | medkit 6.23x faster |
+| Centered cold extraction throughput | 23,972 samples/s | 28,659 samples/s | medkit 0.84x MONAI |
+| Centered warm extraction throughput | 31,298 samples/s | 28,659 samples/s | medkit 1.09x faster |
+| JSONL-plan cold extraction throughput | 19,083 samples/s | 28,659 samples/s | medkit 0.67x MONAI |
+| JSONL-plan warm extraction throughput | 23,150 samples/s | 28,659 samples/s | medkit 0.81x MONAI |
+| PyTorch DataLoader view-batch throughput | 178,269 samples/s | 28,659 samples/s | medkit 6.22x faster |
 
 Interpretation:
 
@@ -43,14 +45,17 @@ Interpretation:
   viable.
 - The cache is now training-native enough to persist foreground indices,
   foreground prefix volumes, and patch-shaped chunk files.
-- The Python DataLoader bridge is not competitive yet. It proves the integration
-  shape, but it is still a Python memmap adapter instead of a Rust extension
-  filling batches directly.
+- The lazy `view-batch` PyTorch DataLoader path now beats MONAI on this
+  benchmark by avoiding collation copies and using the persisted foreground
+  prefix for label occupancy checks.
+- This is not the final training interface. The next target is a contiguous
+  tensor-batch path that also beats MONAI when the model expects a standard
+  `[B, C, Z, Y, X]` tensor.
 
 ## What Winning Requires
 
-The next performance target is not another CLI micro-optimization. The next
-target is the boundary between Rust and PyTorch.
+The project now has a DataLoader benchmark win, but the stronger target is the
+boundary between Rust and PyTorch for standard contiguous batches.
 
 Priority order:
 
@@ -73,8 +78,8 @@ Priority order:
 
 Success criteria for the next stage:
 
-- medkit PyTorch DataLoader throughput beats MONAI on the 4096-patch two-case
-  MSD Spleen workflow.
+- medkit contiguous PyTorch DataLoader throughput beats MONAI on the 4096-patch
+  two-case MSD Spleen workflow.
 - The same path remains competitive on a larger full-dataset run.
 - The benchmark includes both batch throughput and end-to-end cache build plus
   epoch iteration time.

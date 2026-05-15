@@ -423,6 +423,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "medkit-python-ffi"
+version = "0.1.0"
+dependencies = [
+ "medkit-cache",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "medkit-sampler"
 version = "0.1.0"
 dependencies = [

@@ -26,6 +26,8 @@ def main() -> int:
     parser.add_argument("--samples", default=1024, type=int)
     parser.add_argument("--workers", default=0, type=int)
     parser.add_argument("--batch-size", default=1, type=int)
+    parser.add_argument("--backend", choices=["map", "ffi-batch", "view-batch"], default="map")
+    parser.add_argument("--ffi-lib", type=Path)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
@@ -47,15 +49,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--batch-size must be greater than zero")
 
     torch = import_torch()
-    from medkit_rs import MedkitPatchDataset
+    from medkit_rs import (
+        MedkitFfiBatchIterableDataset,
+        MedkitPatchDataset,
+        MedkitViewBatchIterableDataset,
+    )
 
     init_start = time.perf_counter()
-    dataset = MedkitPatchDataset(args.cache, args.patches, length=args.samples)
+    if args.backend == "ffi-batch":
+        dataset = MedkitFfiBatchIterableDataset(
+            args.cache,
+            args.patches,
+            length=args.samples,
+            batch_size=args.batch_size,
+            library_path=args.ffi_lib,
+        )
+        loader_batch_size = None
+    elif args.backend == "view-batch":
+        dataset = MedkitViewBatchIterableDataset(
+            args.cache,
+            args.patches,
+            length=args.samples,
+            batch_size=args.batch_size,
+        )
+        loader_batch_size = None
+    else:
+        dataset = MedkitPatchDataset(args.cache, args.patches, length=args.samples)
+        loader_batch_size = args.batch_size
     init_elapsed = time.perf_counter() - init_start
 
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=loader_batch_size,
         num_workers=args.workers,
         shuffle=False,
     )
@@ -64,21 +89,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     samples_seen = 0
     for batch in loader:
         label = batch["label"]
-        current = int(label.shape[0])
-        checksum += int(label.sum().item())
+        if isinstance(label, list):
+            current = len(label)
+            if "label_sum" in batch:
+                checksum += int(batch["label_sum"])
+            else:
+                checksum += sum(int(item.sum().item()) for item in label)
+        else:
+            current = int(label.shape[0])
+            checksum += int(label.sum().item())
         samples_seen += current
         if samples_seen >= args.samples:
             break
     sample_elapsed = time.perf_counter() - sample_start
 
-    first = dataset.records[0]
-    patch = tuple(int(value) for value in first["patch_size"])
+    if args.backend == "ffi-batch":
+        patch = tuple(int(value) for value in dataset._patch)
+        records = int(dataset._records)
+    elif args.backend == "view-batch":
+        _, _, _, _, sx, sy, sz = dataset.records[0]
+        patch = (sx, sy, sz)
+        records = len(dataset.records)
+    else:
+        first = dataset.records[0]
+        patch = tuple(int(value) for value in first["patch_size"])
+        records = len(dataset.records)
     bytes_per_patch = patch[0] * patch[1] * patch[2] * (4 + 2)
     return {
-        "backend": "medkit_rs.MedkitPatchDataset + torch DataLoader",
+        "backend": f"medkit_rs {args.backend} + torch DataLoader",
+        "adapter_backend": args.backend,
         "cache": str(args.cache),
         "patches": str(args.patches),
-        "records": len(dataset.records),
+        "records": records,
         "patch": patch,
         "samples": samples_seen,
         "workers": args.workers,

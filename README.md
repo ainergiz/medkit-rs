@@ -92,6 +92,7 @@ The workspace currently contains:
 - `medkit-sampler`: deterministic foreground-balanced patch planning and aligned image/label patch extraction.
 - `medkit-bench`: cold/warm cache loading and patch extraction throughput metrics.
 - `medkit-benchmarks`: synthetic/cached fixtures, Criterion microbenchmarks, CLI macrobenchmarks, and a Python MONAI baseline script.
+- `medkit-python-ffi`: a C-ABI Rust bridge used by Python experiments for batch extraction.
 - `medkit-cli`: command-line workflows exposed through the `medkit` binary.
 
 The first IO adapter is a NIfTI-1 metadata reader for `.nii`, `.nii.gz`, and `.hdr` files. It reads only the header, maps shape/dtype/spacing/origin/direction into `ImageSpec`, and handles sform/qform geometry without loading pixel arrays.
@@ -208,6 +209,10 @@ NIfTI image/label cases, runs the medkit validation, cache, sampling, and
 extraction commands, runs a medkit PyTorch `Dataset` adapter over the sampled
 patch plan, then runs a comparable MONAI `CacheDataset` plus
 `RandCropByPosNegLabeld` baseline.
+
+The latest local DataLoader comparison uses medkit's lazy `view-batch` adapter
+and beats MONAI on the two-case MSD Spleen smoke benchmark. The next target is
+to make the same win hold for standard contiguous tensor batches.
 
 See [docs/benchmarks.md](docs/benchmarks.md) for fixture, microbenchmark,
 macrobenchmark, real MSD Spleen workflow, and MONAI baseline details. See

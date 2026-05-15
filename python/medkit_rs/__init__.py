@@ -1,5 +1,15 @@
 """Python training-data adapters for medkit-rs caches."""
 
-from .dataset import MedkitPatchDataset, MedkitPatchIterableDataset
+from .dataset import (
+    MedkitFfiBatchIterableDataset,
+    MedkitPatchDataset,
+    MedkitPatchIterableDataset,
+    MedkitViewBatchIterableDataset,
+)
 
-__all__ = ["MedkitPatchDataset", "MedkitPatchIterableDataset"]
+__all__ = [
+    "MedkitFfiBatchIterableDataset",
+    "MedkitPatchDataset",
+    "MedkitPatchIterableDataset",
+    "MedkitViewBatchIterableDataset",
+]

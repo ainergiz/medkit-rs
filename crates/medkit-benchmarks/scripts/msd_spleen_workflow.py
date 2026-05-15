@@ -37,6 +37,12 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--monai-workers", type=int, default=0)
     parser.add_argument("--medkit-torch-workers", type=int)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--medkit-torch-backend",
+        choices=["map", "ffi-batch", "view-batch"],
+        default="map",
+    )
     parser.add_argument("--medkit-bin", type=Path, default=Path("target/release/medkit"))
     parser.add_argument(
         "--python",
@@ -72,6 +78,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     medkit_torch_workers = args.monai_workers if args.medkit_torch_workers is None else args.medkit_torch_workers
     if medkit_torch_workers < 0:
         raise ValueError("--medkit-torch-workers must be >= 0")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
     patch = parse_int3(args.patch, "--patch")
     cache_shape = parse_int3(args.cache_shape, "--cache-shape")
     chunk_shape = parse_int3(args.chunk or args.patch, "--chunk")
@@ -196,6 +204,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 str(args.samples),
                 "--workers",
                 str(args.monai_workers),
+                "--batch-size",
+                str(args.batch_size),
                 "--spacing",
                 args.spacing,
                 "--out",
@@ -220,6 +230,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 str(args.samples),
                 "--workers",
                 str(medkit_torch_workers),
+                "--batch-size",
+                str(args.batch_size),
+                "--backend",
+                args.medkit_torch_backend,
                 "--out",
                 str(medkit_torch_report_path),
             ],
@@ -240,6 +254,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "workers": args.workers,
         "monai_workers": args.monai_workers,
         "medkit_torch_workers": medkit_torch_workers,
+        "batch_size": args.batch_size,
+        "medkit_torch_backend": args.medkit_torch_backend,
         "medkit": medkit_summary,
         "monai": monai_report,
         "medkit_torch": medkit_torch_report,

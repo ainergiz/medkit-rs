@@ -24,6 +24,7 @@ def main() -> int:
     parser.add_argument("--patch", default="96,96,96")
     parser.add_argument("--samples", default=1024, type=int)
     parser.add_argument("--workers", default=0, type=int)
+    parser.add_argument("--batch-size", default=1, type=int)
     parser.add_argument("--spacing", default="1.0,1.0,1.0")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
@@ -54,6 +55,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--samples must be greater than zero")
     if args.workers < 0:
         raise ValueError("--workers must be non-negative")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be greater than zero")
 
     transforms = monai.transforms.Compose(
         [
@@ -100,17 +103,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=args.batch_size,
         num_workers=args.workers,
         shuffle=False,
     )
     sample_start = time.perf_counter()
     checksum = 0
+    samples_seen = 0
     iterator = itertools.cycle(loader)
-    for _ in range(args.samples):
+    while samples_seen < args.samples:
         batch = next(iterator)
         label = first_label_tensor(batch)
+        current = min(int(label.shape[0]), args.samples - samples_seen)
+        if current != int(label.shape[0]):
+            label = label[:current]
         checksum += int(label.sum().item())
+        samples_seen += current
     sample_elapsed = time.perf_counter() - sample_start
 
     bytes_per_patch = patch[0] * patch[1] * patch[2] * (4 + 2)
@@ -121,6 +129,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "patch": patch,
         "samples": args.samples,
         "workers": args.workers,
+        "batch_size": args.batch_size,
         "cache_build_ms": cache_elapsed * 1000.0,
         "sample_iter_ms": sample_elapsed * 1000.0,
         "samples_per_second": args.samples / max(sample_elapsed, sys.float_info.epsilon),
