@@ -141,6 +141,213 @@ fn prepare_sample_and_bench_workflow_runs_end_to_end() {
     assert!(plan_bench.contains("Records: 10"));
 }
 
+#[test]
+fn runtime_commands_report_parse_and_legacy_alias_errors() {
+    let no_command = run_fail([]);
+    assert!(no_command.stderr.contains("Usage:"));
+
+    let unknown_command = run_fail(["unknown"]);
+    assert!(unknown_command.stderr.contains("Usage:"));
+
+    let prepare_missing_manifest = run_fail(["prepare", "."]);
+    assert!(prepare_missing_manifest
+        .stderr
+        .contains("missing --manifest"));
+    assert!(prepare_missing_manifest.stderr.contains("Usage:"));
+
+    let prepare_no_args = run_fail(["prepare"]);
+    assert!(prepare_no_args.stderr.contains("Usage:"));
+
+    let prepare_bad_chunk = run_fail([
+        "prepare",
+        ".",
+        "--manifest",
+        "manifest.json",
+        "--plan",
+        "plan.toml",
+        "--cache",
+        "cache",
+        "--chunk",
+        "8,8",
+    ]);
+    assert!(prepare_bad_chunk
+        .stderr
+        .contains("patch must be formatted as x,y,z"));
+
+    let prepare_unknown_arg = run_fail(["prepare", ".", "--unknown"]);
+    assert!(prepare_unknown_arg
+        .stderr
+        .contains("unknown argument: --unknown"));
+
+    let prepare_help = run_fail(["prepare", ".", "--help"]);
+    assert!(prepare_help.stderr.contains("Usage:"));
+
+    let prepare_missing_flag_value = run_fail(["prepare", ".", "--manifest"]);
+    assert!(prepare_missing_flag_value
+        .stderr
+        .contains("missing value for --manifest"));
+
+    let prepare_cache_error = run_fail([
+        "prepare",
+        ".",
+        "--manifest",
+        "missing-manifest.json",
+        "--plan",
+        "missing-plan.toml",
+        "--cache",
+        "cache",
+    ]);
+    assert!(!prepare_cache_error.stderr.trim().is_empty());
+
+    let sample_no_args = run_fail(["sample"]);
+    assert!(sample_no_args.stderr.contains("Usage:"));
+
+    let sample_missing_patch = run_fail(["sample", "cache", "--count", "1", "--out", "patches"]);
+    assert!(sample_missing_patch.stderr.contains("missing --patch"));
+
+    let sample_missing_count = run_fail([
+        "sample",
+        "cache",
+        "--patch",
+        "8,8,8",
+        "--out",
+        "patches.jsonl",
+    ]);
+    assert!(sample_missing_count.stderr.contains("missing --count"));
+
+    let sample_missing_out = run_fail([
+        "sample",
+        "cache",
+        "--patch",
+        "8,8,8",
+        "--strategy",
+        "foreground_balanced",
+        "--count",
+        "1",
+    ]);
+    assert!(sample_missing_out.stderr.contains("missing --out"));
+
+    let sample_unknown_strategy = run_fail([
+        "sample",
+        "cache",
+        "--patch",
+        "8,8,8",
+        "--strategy",
+        "random",
+        "--count",
+        "1",
+        "--out",
+        "patches.jsonl",
+    ]);
+    assert!(sample_unknown_strategy
+        .stderr
+        .contains("unsupported sampling strategy: random"));
+
+    let sample_unknown_arg = run_fail(["sample", "cache", "--unknown"]);
+    assert!(sample_unknown_arg
+        .stderr
+        .contains("unknown argument: --unknown"));
+
+    let sample_help = run_fail(["sample", "cache", "--help"]);
+    assert!(sample_help.stderr.contains("Usage:"));
+
+    let sample_bad_count = run_fail([
+        "sample",
+        "cache",
+        "--patch",
+        "8,8,8",
+        "--count",
+        "many",
+        "--out",
+        "patches.jsonl",
+    ]);
+    assert!(sample_bad_count
+        .stderr
+        .contains("invalid integer for --count: many"));
+
+    let sample_cache_error = run_fail([
+        "sample",
+        "missing-cache",
+        "--patch",
+        "8,8,8",
+        "--count",
+        "1",
+        "--out",
+        "patches.jsonl",
+    ]);
+    assert!(!sample_cache_error.stderr.trim().is_empty());
+
+    let bench_no_args = run_fail(["bench"]);
+    assert!(bench_no_args.stderr.contains("Usage:"));
+
+    let bench_missing_patch = run_fail(["bench", "cache"]);
+    assert!(bench_missing_patch.stderr.contains("missing --patch"));
+
+    let bench_bad_workers = run_fail(["bench", "cache", "--patch", "8,8,8", "--workers", "two"]);
+    assert!(bench_bad_workers
+        .stderr
+        .contains("invalid integer for --workers: two"));
+
+    let bench_bad_samples = run_fail(["bench", "cache", "--patch", "8,8,8", "--samples", "many"]);
+    assert!(bench_bad_samples
+        .stderr
+        .contains("invalid integer for --samples: many"));
+
+    let bench_unknown_arg = run_fail(["bench", "cache", "--unknown"]);
+    assert!(bench_unknown_arg
+        .stderr
+        .contains("unknown argument: --unknown"));
+
+    let bench_help = run_fail(["bench", "cache", "--help"]);
+    assert!(bench_help.stderr.contains("Usage:"));
+
+    let bench_cache_error = run_fail(["bench", "missing-cache", "--patch", "8,8,8"]);
+    assert!(!bench_cache_error.stderr.trim().is_empty());
+
+    let bench_plan_no_args = run_fail(["bench-plan"]);
+    assert!(bench_plan_no_args.stderr.contains("Usage:"));
+
+    let bench_plan_missing_patches = run_fail(["bench-plan", "cache"]);
+    assert!(bench_plan_missing_patches
+        .stderr
+        .contains("missing --patches"));
+
+    let bench_plan_bad_workers = run_fail([
+        "bench-plan",
+        "cache",
+        "--patches",
+        "patches.jsonl",
+        "--workers",
+        "two",
+    ]);
+    assert!(bench_plan_bad_workers
+        .stderr
+        .contains("invalid integer for --workers: two"));
+
+    let bench_plan_bad_samples = run_fail([
+        "bench-plan",
+        "cache",
+        "--patches",
+        "patches.jsonl",
+        "--samples",
+        "many",
+    ]);
+    assert!(bench_plan_bad_samples
+        .stderr
+        .contains("invalid integer for --samples: many"));
+
+    let bench_plan_unknown_arg = run_fail(["bench-plan", "cache", "--unknown"]);
+    assert!(bench_plan_unknown_arg
+        .stderr
+        .contains("unknown argument: --unknown"));
+
+    let bench_plan_help = run_fail(["bench-plan", "cache", "--help"]);
+    assert!(bench_plan_help.stderr.contains("Usage:"));
+
+    let bench_plan_error = run_fail(["bench-plan", "missing-cache", "--patches", "missing.jsonl"]);
+    assert!(!bench_plan_error.stderr.trim().is_empty());
+}
+
 fn run_ok(command: &mut Command) -> String {
     let output = command.output().unwrap();
     assert!(
@@ -150,6 +357,28 @@ fn run_ok(command: &mut Command) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+struct FailedCommand {
+    stderr: String,
+}
+
+fn run_fail<const N: usize>(args: [&str; N]) -> FailedCommand {
+    let output = Command::new(env!("CARGO_BIN_EXE_medkit"))
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "medkit {:?} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(2));
+    FailedCommand {
+        stderr: String::from_utf8(output.stderr).unwrap(),
+    }
 }
 
 fn temp_case_dir(case: &str) -> PathBuf {

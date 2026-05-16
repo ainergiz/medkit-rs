@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Real-data MSD Task09 Spleen workflow for medkit-vs-MONAI benchmarking."""
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--medkit-torch-backend",
-        choices=["map", "ffi-batch", "view-batch"],
+        choices=["map", "ffi-batch", "native-batch", "native-chunk-batch", "view-batch"],
         default="map",
     )
     parser.add_argument("--medkit-bin", type=Path, default=Path("target/release/medkit"))

@@ -363,3 +363,372 @@ fn f64_from(bytes: &[u8], endian: Endian) -> f64 {
         Endian::Big => f64::from_be_bytes(value),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        io::Write,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use flate2::{write::GzEncoder, Compression};
+
+    use super::*;
+
+    const VOX_OFFSET: usize = 352;
+
+    #[derive(Debug, Clone)]
+    struct NiftiFixture {
+        bytes: Vec<u8>,
+        endian: Endian,
+    }
+
+    impl NiftiFixture {
+        fn new(endian: Endian, dims: &[i16], datatype: i16, pixdim: &[f32]) -> Self {
+            let mut fixture = Self {
+                bytes: vec![0; VOX_OFFSET],
+                endian,
+            };
+            fixture.put_i32(0, 348);
+            fixture.put_i16(40, i16::try_from(dims.len()).unwrap());
+            for (index, dim) in dims.iter().enumerate() {
+                fixture.put_i16(42 + index * 2, *dim);
+            }
+            fixture.put_i16(70, datatype);
+            fixture.put_i16(72, bitpix_for(datatype));
+            fixture.put_f32(76, 1.0);
+            for (index, spacing) in pixdim.iter().enumerate() {
+                fixture.put_f32(80 + index * 4, *spacing);
+            }
+            fixture.put_f32(108, VOX_OFFSET as f32);
+            fixture.bytes[344..348].copy_from_slice(b"n+1\0");
+            fixture
+        }
+
+        fn with_sizeof_hdr(mut self, sizeof_hdr: i32) -> Self {
+            self.put_i32(0, sizeof_hdr);
+            self
+        }
+
+        fn with_rank(mut self, rank: i16) -> Self {
+            self.put_i16(40, rank);
+            self
+        }
+
+        fn with_dim(mut self, axis: usize, dim: i16) -> Self {
+            self.put_i16(42 + axis * 2, dim);
+            self
+        }
+
+        fn with_pixdim(mut self, index: usize, value: f32) -> Self {
+            self.put_f32(76 + index * 4, value);
+            self
+        }
+
+        fn with_sform(mut self, rows: [[f32; 4]; 3]) -> Self {
+            self.put_i16(254, 1);
+            for (offset, row) in [(280, rows[0]), (296, rows[1]), (312, rows[2])] {
+                for (index, value) in row.into_iter().enumerate() {
+                    self.put_f32(offset + index * 4, value);
+                }
+            }
+            self
+        }
+
+        fn with_qform(mut self, quatern: [f32; 3], offsets: [f32; 3], qfac: f32) -> Self {
+            self.put_i16(252, 1);
+            self.put_f32(76, qfac);
+            self.put_f32(256, quatern[0]);
+            self.put_f32(260, quatern[1]);
+            self.put_f32(264, quatern[2]);
+            self.put_f32(268, offsets[0]);
+            self.put_f32(272, offsets[1]);
+            self.put_f32(276, offsets[2]);
+            self
+        }
+
+        fn append_f32_pixels(mut self, values: &[f32]) -> Vec<u8> {
+            for value in values {
+                let bytes = match self.endian {
+                    Endian::Little => value.to_le_bytes(),
+                    Endian::Big => value.to_be_bytes(),
+                };
+                self.bytes.extend_from_slice(&bytes);
+            }
+            self.bytes
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.bytes.clone()
+        }
+
+        fn put_i32(&mut self, offset: usize, value: i32) {
+            let bytes = match self.endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            };
+            self.bytes[offset..offset + 4].copy_from_slice(&bytes);
+        }
+
+        fn put_i16(&mut self, offset: usize, value: i16) {
+            let bytes = match self.endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            };
+            self.bytes[offset..offset + 2].copy_from_slice(&bytes);
+        }
+
+        fn put_f32(&mut self, offset: usize, value: f32) {
+            let bytes = match self.endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            };
+            self.bytes[offset..offset + 4].copy_from_slice(&bytes);
+        }
+    }
+
+    #[test]
+    fn loads_gzipped_image_and_converts_label_values() {
+        let dir = temp_dir("load-pixels");
+        let image_path = dir.join("image.NII.GZ");
+        let label_path = dir.join("label.nii");
+        write_gzip(
+            &image_path,
+            &NiftiFixture::new(Endian::Little, &[2, 2, 1], 16, &[1.5, 2.5, 3.5])
+                .append_f32_pixels(&[1.25, -2.5, 3.0, 4.5]),
+        );
+        fs::write(
+            &label_path,
+            NiftiFixture::new(Endian::Little, &[2, 2, 1], 16, &[1.5, 2.5, 3.5])
+                .append_f32_pixels(&[-1.0, 1.2, 1.6, 2.5]),
+        )
+        .unwrap();
+        let big_image_path = dir.join("big-image.nii");
+        fs::write(
+            &big_image_path,
+            NiftiFixture::new(Endian::Big, &[1, 1, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[7.5]),
+        )
+        .unwrap();
+
+        let image = load_image_f32(&image_path).unwrap();
+        assert_eq!(image.volume.shape, [2, 2, 1]);
+        assert_eq!(image.volume.data, vec![1.25, -2.5, 3.0, 4.5]);
+        assert_eq!(image.geometry.spacing, [1.5, 2.5, 3.5]);
+
+        let label = load_label_u16(&label_path).unwrap();
+        assert_eq!(label.volume.shape, [2, 2, 1]);
+        assert_eq!(label.volume.data, vec![0, 1, 2, 3]);
+        assert!(image.geometry.approximately_eq(&label.geometry, 1e-6));
+
+        let big_image = load_image_f32(&big_image_path).unwrap();
+        assert_eq!(big_image.volume.data, vec![7.5]);
+    }
+
+    #[test]
+    fn parses_big_endian_sform_and_little_endian_qform_geometry() {
+        let sform_fixture = NiftiFixture::new(Endian::Big, &[2, 3, 4], 512, &[1.0, 1.0, 1.0])
+            .with_sform([
+                [2.0, 0.0, 0.0, 10.0],
+                [0.0, 3.0, 0.0, 20.0],
+                [0.0, 0.0, -4.0, 30.0],
+            ]);
+        let sform = parse_header(Path::new("sform.nii"), &sform_fixture.bytes()).unwrap();
+        assert_eq!(sform.endian, Endian::Big);
+        assert_eq!(sform.shape, [2, 3, 4]);
+        assert_eq!(sform.datatype, PixelKind::U16);
+        assert_eq!(sform.geometry.spacing, [2.0, 3.0, 4.0]);
+        assert_eq!(sform.geometry.origin, [10.0, 20.0, 30.0]);
+        assert_close(sform.geometry.direction[2][2], -1.0);
+
+        let qform_fixture = NiftiFixture::new(Endian::Little, &[2, 2, 2], 2, &[1.0, 2.0, 3.0])
+            .with_qform([0.0, 0.0, 0.0], [10.0, 20.0, -5.0], -1.0);
+        let qform = parse_header(Path::new("qform.nii"), &qform_fixture.bytes()).unwrap();
+        assert_eq!(qform.geometry.spacing, [1.0, 2.0, 3.0]);
+        assert_eq!(qform.geometry.origin, [10.0, 20.0, -5.0]);
+        assert_close(qform.geometry.direction[2][2], -1.0);
+    }
+
+    #[test]
+    fn rejects_invalid_headers_with_specific_reasons() {
+        let path = Path::new("bad.nii");
+        let err = parse_header(path, &[0; 16]).unwrap_err();
+        assert!(err.to_string().contains("shorter than a NIfTI-1 header"));
+
+        assert_nifti_error(
+            NiftiFixture::new(Endian::Little, &[2, 2, 2], 16, &[1.0, 1.0, 1.0])
+                .with_sizeof_hdr(123)
+                .bytes(),
+            "sizeof_hdr must be 348",
+        );
+        assert_nifti_error(
+            NiftiFixture::new(Endian::Little, &[2, 2, 2], 16, &[1.0, 1.0, 1.0])
+                .with_rank(0)
+                .bytes(),
+            "rank must be between 1 and 7",
+        );
+        assert_nifti_error(
+            NiftiFixture::new(Endian::Little, &[2, 2, 2], 16, &[1.0, 1.0, 1.0])
+                .with_dim(1, 0)
+                .bytes(),
+            "dimension 2 must be positive",
+        );
+        assert_nifti_error(
+            NiftiFixture::new(Endian::Little, &[2, 2, 2], 16, &[1.0, 1.0, 1.0])
+                .with_pixdim(2, f32::NAN)
+                .bytes(),
+            "pixdim[2] must be finite and positive",
+        );
+        assert_nifti_error(
+            NiftiFixture::new(Endian::Little, &[2, 2, 2], 128, &[1.0, 1.0, 1.0]).bytes(),
+            "unsupported datatype code 128",
+        );
+        assert_nifti_error(
+            NiftiFixture::new(Endian::Little, &[2, 2, 2], 16, &[1.0, 1.0, 1.0])
+                .with_qform([1.0, 1.0, 0.0], [0.0, 0.0, 0.0], 1.0)
+                .bytes(),
+            "qform quaternion has magnitude greater than one",
+        );
+        assert_nifti_error(
+            NiftiFixture::new(Endian::Little, &[2, 2, 2], 16, &[1.0, 1.0, 1.0])
+                .with_sform([[0.0; 4]; 3])
+                .bytes(),
+            "affine column 0 has invalid norm",
+        );
+    }
+
+    #[test]
+    fn decodes_datatypes_and_rejects_truncated_pixel_data() {
+        for (datatype_code, expected) in [
+            (4, PixelKind::I16),
+            (8, PixelKind::I32),
+            (64, PixelKind::F64),
+            (256, PixelKind::I8),
+            (768, PixelKind::U32),
+        ] {
+            let header = parse_header(
+                Path::new("datatype.nii"),
+                &NiftiFixture::new(Endian::Little, &[1, 1, 1], datatype_code, &[1.0, 1.0, 1.0])
+                    .bytes(),
+            )
+            .unwrap();
+            assert_eq!(header.datatype, expected);
+        }
+
+        assert_eq!(bytes_per_value(PixelKind::U8), 1);
+        assert_eq!(bytes_per_value(PixelKind::I16), 2);
+        assert_eq!(bytes_per_value(PixelKind::I32), 4);
+        assert_eq!(bytes_per_value(PixelKind::F64), 8);
+
+        assert_eq!(read_value(&[255], PixelKind::U8, Endian::Little), 255.0);
+        assert_eq!(read_value(&[254], PixelKind::I8, Endian::Little), -2.0);
+        assert_eq!(
+            read_value(&(-1234_i16).to_be_bytes(), PixelKind::I16, Endian::Big),
+            -1234.0
+        );
+        assert_eq!(
+            read_value(&54321_u16.to_le_bytes(), PixelKind::U16, Endian::Little),
+            54321.0
+        );
+        assert_eq!(
+            read_value(&12345_u16.to_be_bytes(), PixelKind::U16, Endian::Big),
+            12345.0
+        );
+        assert_eq!(
+            read_value(&(-123456_i32).to_le_bytes(), PixelKind::I32, Endian::Little),
+            -123456.0
+        );
+        assert_eq!(
+            read_value(&123456_u32.to_le_bytes(), PixelKind::U32, Endian::Little),
+            123456.0
+        );
+        assert_eq!(
+            read_value(&123456_u32.to_be_bytes(), PixelKind::U32, Endian::Big),
+            123456.0
+        );
+        assert_close(
+            read_value(&1.25_f32.to_be_bytes(), PixelKind::F32, Endian::Big),
+            1.25,
+        );
+        assert_close(
+            read_value(&(-2.5_f64).to_le_bytes(), PixelKind::F64, Endian::Little),
+            -2.5,
+        );
+        assert_close(
+            read_value(&3.5_f64.to_be_bytes(), PixelKind::F64, Endian::Big),
+            3.5,
+        );
+
+        let header = Header {
+            endian: Endian::Little,
+            shape: [2, 1, 1],
+            datatype: PixelKind::U16,
+            vox_offset: VOX_OFFSET,
+            geometry: VolumeGeometry::identity([2, 1, 1], [1.0, 1.0, 1.0]).unwrap(),
+        };
+        let err = read_pixels(
+            Path::new("truncated.nii"),
+            &[0; VOX_OFFSET + 1],
+            &header,
+            |v| v,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pixel data ends at byte 356"));
+    }
+
+    #[test]
+    fn read_all_reports_file_and_gzip_io_errors() {
+        let dir = temp_dir("read-errors");
+        let missing = dir.join("missing.nii");
+        let err = read_all(&missing).unwrap_err();
+        assert!(matches!(err, CacheError::Io { path, .. } if path == missing));
+
+        let bad_gzip = dir.join("bad.nii.gz");
+        fs::write(&bad_gzip, b"not gzip").unwrap();
+        let err = read_all(&bad_gzip).unwrap_err();
+        assert!(matches!(err, CacheError::Io { path, .. } if path == bad_gzip));
+    }
+
+    fn assert_nifti_error(bytes: Vec<u8>, expected: &str) {
+        let err = parse_header(Path::new("bad.nii"), &bytes).unwrap_err();
+        assert!(
+            err.to_string().contains(expected),
+            "expected {expected:?}, got {err}"
+        );
+    }
+
+    fn bitpix_for(datatype: i16) -> i16 {
+        match datatype {
+            2 | 256 => 8,
+            4 | 512 => 16,
+            8 | 16 | 768 => 32,
+            64 => 64,
+            _ => 0,
+        }
+    }
+
+    fn temp_dir(case: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "medkit-cache-nifti-{case}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_gzip(path: &Path, bytes: &[u8]) {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        fs::write(path, encoder.finish().unwrap()).unwrap();
+    }
+
+    fn assert_close(left: f64, right: f64) {
+        assert!((left - right).abs() < 1e-6, "{left} != {right}");
+    }
+}

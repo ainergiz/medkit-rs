@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "medkit-rs"
+version = "0.1.0"
+description = "Rust-first medical imaging data loading and training utilities."
+requires-python = ">=3.11"
+
+[dependency-groups]
+dev = [
+    "maturin>=1.7,<2",
+    "numpy>=1.26",
+    "pytest>=8",
+]
+
+[tool.maturin]
+manifest-path = "crates/medkit-python/Cargo.toml"
+python-source = "python"
+module-name = "medkit_rs._native"
+features = ["extension-module"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = [
+    "-ra",
+    "--strict-config",
+    "--strict-markers",
+]
+pythonpath = ["python"]
+testpaths = ["tests/python"]
+markers = [
+    "cxr_fixture: requires a CLI-produced CXR cache fixture",
+]

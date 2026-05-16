@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust-tests:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+  python-contract:
+    name: Python import and API contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Sync package
+        run: |
+          uv sync --dev
+      - name: Check public Python API contract
+        run: |
+          uv run python - <<'PY'
+          import inspect
+          import medkit_rs as medkit
+
+          assert hasattr(medkit, "cxr")
+          assert hasattr(medkit.cxr, "Dataset")
+          assert hasattr(medkit.cxr, "DataLoader")
+          assert hasattr(medkit.cxr, "datasets")
+
+          dataset_sig = inspect.signature(medkit.cxr.Dataset)
+          loader_sig = inspect.signature(medkit.cxr.DataLoader)
+          for name in ("cache_dir", "split", "batch_size", "shuffle", "pin_memory", "prefetch"):
+              assert name in dataset_sig.parameters, name
+          for name in ("dataset", "batch_size", "shuffle", "num_workers", "pin_memory", "drop_last"):
+              assert name in loader_sig.parameters, name
+
+          print("medkit_rs.cxr public API contract ok")
+          PY
+      - name: Compile Python files
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          import py_compile
+
+          roots = [
+              Path("python"),
+              Path("examples"),
+              Path("crates/medkit-benchmarks/scripts"),
+          ]
+          paths = sorted(
+              path
+              for root in roots
+              if root.exists()
+              for path in root.rglob("*.py")
+          )
+          for path in paths:
+              py_compile.compile(str(path), doraise=True)
+          print(f"compiled {len(paths)} Python files")
+          PY
+      - name: Run Python API tests
+        run: |
+          uv run pytest tests/python -q

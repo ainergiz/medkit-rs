@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Benchmark medkit-rs cache consumption inside a PyTorch DataLoader."""
 
 from __future__ import annotations
@@ -26,7 +25,11 @@ def main() -> int:
     parser.add_argument("--samples", default=1024, type=int)
     parser.add_argument("--workers", default=0, type=int)
     parser.add_argument("--batch-size", default=1, type=int)
-    parser.add_argument("--backend", choices=["map", "ffi-batch", "view-batch"], default="map")
+    parser.add_argument(
+        "--backend",
+        choices=["map", "ffi-batch", "native-batch", "native-chunk-batch", "view-batch"],
+        default="map",
+    )
     parser.add_argument("--ffi-lib", type=Path)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
@@ -51,6 +54,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     torch = import_torch()
     from medkit_rs import (
         MedkitFfiBatchIterableDataset,
+        MedkitNativeBatchIterableDataset,
         MedkitPatchDataset,
         MedkitViewBatchIterableDataset,
     )
@@ -63,6 +67,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             length=args.samples,
             batch_size=args.batch_size,
             library_path=args.ffi_lib,
+        )
+        loader_batch_size = None
+    elif args.backend in {"native-batch", "native-chunk-batch"}:
+        dataset = MedkitNativeBatchIterableDataset(
+            args.cache,
+            args.patches,
+            length=args.samples,
+            batch_size=args.batch_size,
+            storage="chunked" if args.backend == "native-chunk-batch" else "resident",
         )
         loader_batch_size = None
     elif args.backend == "view-batch":
@@ -103,7 +116,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             break
     sample_elapsed = time.perf_counter() - sample_start
 
-    if args.backend == "ffi-batch":
+    if args.backend in {"ffi-batch", "native-batch", "native-chunk-batch"}:
         patch = tuple(int(value) for value in dataset._patch)
         records = int(dataset._records)
     elif args.backend == "view-batch":

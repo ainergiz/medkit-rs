@@ -63,9 +63,7 @@ impl TransformPlan {
 
     /// Serializes the plan to stable JSON for hashing and cache provenance.
     pub fn canonical_json(&self) -> Result<String> {
-        serde_json::to_string(self).map_err(|error| TransformError::PlanSerialize {
-            message: error.to_string(),
-        })
+        Ok(serde_json::to_string(self).expect("transform plans contain only serializable fields"))
     }
 
     /// Returns a content hash for the transform plan.
@@ -141,18 +139,20 @@ impl TransformPlan {
                 }
                 TransformOp::Resample { spacing } => {
                     let target_geometry = geometry.resampled_to_spacing(spacing)?;
-                    image = resample_f32(
+                    let next_image = resample_f32(
                         &image,
                         &geometry,
                         &target_geometry,
                         self.image_interpolation,
-                    )?;
-                    label = resample_u16(
+                    );
+                    let next_label = resample_u16(
                         &label,
                         &geometry,
                         &target_geometry,
                         self.label_interpolation,
-                    )?;
+                    );
+                    image = next_image?;
+                    label = next_label?;
                     geometry = target_geometry;
                     applied.push("resample".to_string());
                 }

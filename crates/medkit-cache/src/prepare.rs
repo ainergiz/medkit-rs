@@ -475,3 +475,458 @@ fn cache_key(case_id: &str, source_hash: &str, plan_hash: &str) -> String {
     hasher.update(plan_hash.as_bytes());
     format!("{}-{:x}", case_id, hasher.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use medkit_dataset::{CaseManifest, CaseStatus, DatasetManifest, ValidationSummary};
+    use medkit_transform::Volume3D;
+
+    use super::*;
+
+    const VOX_OFFSET: usize = 352;
+
+    #[derive(Debug, Clone)]
+    struct NiftiFixture {
+        bytes: Vec<u8>,
+    }
+
+    impl NiftiFixture {
+        fn new(dims: &[i16], datatype: i16, pixdim: &[f32]) -> Self {
+            let mut fixture = Self {
+                bytes: vec![0; VOX_OFFSET],
+            };
+            fixture.put_i32(0, 348);
+            fixture.put_i16(40, i16::try_from(dims.len()).unwrap());
+            for (index, dim) in dims.iter().enumerate() {
+                fixture.put_i16(42 + index * 2, *dim);
+            }
+            fixture.put_i16(70, datatype);
+            fixture.put_i16(72, bitpix_for(datatype));
+            fixture.put_f32(76, 1.0);
+            for (index, spacing) in pixdim.iter().enumerate() {
+                fixture.put_f32(80 + index * 4, *spacing);
+            }
+            fixture.put_f32(108, VOX_OFFSET as f32);
+            fixture.bytes[344..348].copy_from_slice(b"n+1\0");
+            fixture
+        }
+
+        fn append_f32_pixels(mut self, values: &[f32]) -> Vec<u8> {
+            for value in values {
+                self.bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            self.bytes
+        }
+
+        fn append_u16_pixels(mut self, values: &[u16]) -> Vec<u8> {
+            for value in values {
+                self.bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            self.bytes
+        }
+
+        fn put_i32(&mut self, offset: usize, value: i32) {
+            self.bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn put_i16(&mut self, offset: usize, value: i16) {
+            self.bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn put_f32(&mut self, offset: usize, value: f32) {
+            self.bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn prepare_cache_writes_content_addressed_case_artifacts() {
+        let root = temp_dir("prepare-success");
+        let image_path = root.join("case_a_0000.nii");
+        let label_path = root.join("case_a.nii");
+        let mismatch_label_path = root.join("case_mismatch.nii");
+        let manifest_path = root.join("manifest.json");
+        let plan_path = root.join("plan.toml");
+        let cache_dir = root.join("cache");
+
+        fs::write(
+            &image_path,
+            NiftiFixture::new(&[3, 2, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        fs::write(
+            &label_path,
+            NiftiFixture::new(&[3, 2, 1], 512, &[1.0, 1.0, 1.0])
+                .append_u16_pixels(&[0, 1, 0, 2, 0, 3]),
+        )
+        .unwrap();
+        fs::write(
+            &mismatch_label_path,
+            NiftiFixture::new(&[3, 2, 1], 512, &[2.0, 1.0, 1.0])
+                .append_u16_pixels(&[0, 1, 0, 2, 0, 3]),
+        )
+        .unwrap();
+        write_plan(&plan_path, identity_plan());
+        write_manifest(
+            &manifest_path,
+            &root,
+            vec![
+                valid_case("case_a", Some(&image_path), Some(&label_path)),
+                valid_case("missing_image_path", None, Some(&label_path)),
+                valid_case("missing_label_path", Some(&image_path), None),
+                valid_case(
+                    "geometry_mismatch",
+                    Some(&image_path),
+                    Some(&mismatch_label_path),
+                ),
+                invalid_case("skipped_invalid"),
+            ],
+        );
+
+        let manifest = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path: manifest_path.clone(),
+            plan_path: plan_path.clone(),
+            cache_dir: cache_dir.clone(),
+            chunk_shape: Some([2, 2, 2]),
+        })
+        .unwrap();
+
+        assert_eq!(
+            manifest.summary,
+            CacheSummary {
+                input_cases: 4,
+                cached_cases: 1,
+                failed_cases: 3,
+                foreground_voxels: 3,
+                bytes_written: 204,
+            }
+        );
+        assert_eq!(manifest.cases.len(), 1);
+        let cached = &manifest.cases[0];
+        assert_eq!(cached.case_id, "case_a");
+        assert!(cached.cache_key.starts_with("case_a-"));
+        assert_eq!(cached.source_metadata_hash.len(), 64);
+        assert_eq!(cached.transform_plan_hash, manifest.transform_plan_hash);
+        assert_eq!(cached.transform_plan_hash.len(), 64);
+        assert_eq!(cached.image_path, path_text(&image_path));
+        assert_eq!(cached.label_path, path_text(&label_path));
+        assert_eq!(cached.source_geometry.spacing, [1.0, 1.0, 1.0]);
+        assert!(cached
+            .source_geometry
+            .approximately_eq(&cached.output_geometry, 1e-6));
+        assert_eq!(cached.shape, [3, 2, 1]);
+        assert_eq!(cached.chunk_shape, [2, 2, 1]);
+        assert_eq!(cached.chunk_grid, Some([2, 1, 1]));
+        assert_eq!(cached.crop_origin, [0, 0, 0]);
+        assert!(cached.applied_operations.is_empty());
+        assert_eq!(cached.foreground_voxels, 3);
+        assert_eq!(cached.bytes_written, 204);
+
+        assert_eq!(
+            read_f32_values(Path::new(&cached.image_cache_path)),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+        assert_eq!(
+            read_u16_values(Path::new(&cached.label_cache_path)),
+            vec![0, 1, 0, 2, 0, 3]
+        );
+        assert_eq!(
+            read_u64_values(Path::new(cached.foreground_indices_path.as_ref().unwrap())),
+            vec![1, 3, 5]
+        );
+        let prefix = read_u32_values(Path::new(cached.foreground_prefix_path.as_ref().unwrap()));
+        assert_eq!(cached.foreground_prefix_shape, Some([4, 3, 2]));
+        assert_eq!(prefix.len(), 24);
+        assert_eq!(prefix.last().copied(), Some(3));
+        assert_eq!(
+            read_f32_values(Path::new(cached.image_chunk_cache_path.as_ref().unwrap())),
+            vec![1.0, 2.0, 4.0, 5.0, 3.0, 0.0, 6.0, 0.0]
+        );
+        assert_eq!(
+            read_u16_values(Path::new(cached.label_chunk_cache_path.as_ref().unwrap())),
+            vec![0, 1, 2, 0, 0, 0, 3, 0]
+        );
+
+        let loaded_manifest = read_cache_manifest(&cache_dir).unwrap();
+        assert_eq!(loaded_manifest, manifest);
+        let case_json = Path::new(&cached.image_cache_path)
+            .parent()
+            .unwrap()
+            .join("case.json");
+        let loaded_case: CachedCase =
+            serde_json::from_str(&fs::read_to_string(case_json).unwrap()).unwrap();
+        assert_eq!(loaded_case, *cached);
+    }
+
+    #[test]
+    fn prepare_cache_reports_manifest_plan_cache_dir_and_read_errors() {
+        let root = temp_dir("prepare-errors");
+        let manifest_path = root.join("manifest.json");
+        let plan_path = root.join("plan.toml");
+        let cache_dir = root.join("cache");
+
+        let missing_manifest = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path: root.join("missing-manifest.json"),
+            plan_path: plan_path.clone(),
+            cache_dir: cache_dir.clone(),
+            chunk_shape: None,
+        })
+        .unwrap_err();
+        assert!(matches!(missing_manifest, CacheError::Io { .. }));
+
+        fs::write(&manifest_path, "{").unwrap();
+        let invalid_manifest = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path: manifest_path.clone(),
+            plan_path: plan_path.clone(),
+            cache_dir: cache_dir.clone(),
+            chunk_shape: None,
+        })
+        .unwrap_err();
+        assert!(matches!(invalid_manifest, CacheError::Json { .. }));
+
+        write_manifest(&manifest_path, &root, Vec::new());
+        fs::write(&plan_path, "not valid toml").unwrap();
+        let invalid_plan = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path: manifest_path.clone(),
+            plan_path: plan_path.clone(),
+            cache_dir: cache_dir.clone(),
+            chunk_shape: None,
+        })
+        .unwrap_err();
+        assert!(matches!(invalid_plan, CacheError::Transform(_)));
+
+        write_plan(&plan_path, identity_plan());
+        let file_cache_dir = root.join("cache-file");
+        fs::write(&file_cache_dir, b"not a directory").unwrap();
+        let cache_dir_error = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path: manifest_path.clone(),
+            plan_path: plan_path.clone(),
+            cache_dir: file_cache_dir,
+            chunk_shape: None,
+        })
+        .unwrap_err();
+        assert!(matches!(cache_dir_error, CacheError::Io { .. }));
+
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join(CACHE_MANIFEST), "{").unwrap();
+        let read_error = read_cache_manifest(&cache_dir).unwrap_err();
+        assert!(matches!(read_error, CacheError::Json { .. }));
+    }
+
+    #[test]
+    fn prepare_case_without_chunks_uses_volume_shape_and_omits_chunk_paths() {
+        let root = temp_dir("prepare-no-chunks");
+        let image_path = root.join("case_b_0000.nii");
+        let label_path = root.join("case_b.nii");
+        let cache_dir = root.join("cache");
+        fs::write(
+            &image_path,
+            NiftiFixture::new(&[1, 1, 1], 16, &[1.0, 1.0, 1.0]).append_f32_pixels(&[2.0]),
+        )
+        .unwrap();
+        fs::write(
+            &label_path,
+            NiftiFixture::new(&[1, 1, 1], 512, &[1.0, 1.0, 1.0]).append_u16_pixels(&[1]),
+        )
+        .unwrap();
+        let plan = TransformPlan::from_toml_str(identity_plan()).unwrap();
+        let plan_hash = plan.plan_hash().unwrap();
+
+        let cached = prepare_case(
+            &valid_case("case_b", Some(&image_path), Some(&label_path)),
+            &plan,
+            &plan_hash,
+            &cache_dir,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cached.shape, [1, 1, 1]);
+        assert_eq!(cached.chunk_shape, [1, 1, 1]);
+        assert_eq!(cached.chunk_grid, None);
+        assert_eq!(cached.image_chunk_cache_path, None);
+        assert_eq!(cached.label_chunk_cache_path, None);
+        assert_eq!(cached.foreground_voxels, 1);
+        assert_eq!(cached.bytes_written, 46);
+    }
+
+    #[test]
+    fn foreground_prefix_values_count_3d_regions() {
+        let label = Volume3D::new([2, 2, 2], vec![1, 0, 0, 1, 0, 1, 1, 0]).unwrap();
+        let prefix = foreground_prefix_values(&label);
+        let index = |x: usize, y: usize, z: usize| x + 3 * (y + 3 * z);
+
+        assert_eq!(prefix[index(0, 0, 0)], 0);
+        assert_eq!(prefix[index(1, 1, 1)], 1);
+        assert_eq!(prefix[index(2, 1, 2)], 2);
+        assert_eq!(prefix[index(1, 2, 2)], 2);
+        assert_eq!(prefix[index(2, 2, 2)], 4);
+    }
+
+    #[test]
+    fn chunk_helpers_clamp_shape_compute_grid_and_pad_partial_chunks() {
+        assert_eq!(valid_chunk_shape([0, 99, 1], [3, 2, 1]), [1, 2, 1]);
+        assert_eq!(chunk_grid([5, 4, 3], [2, 3, 2]), [3, 2, 2]);
+        assert_eq!(chunked_value_count([5, 4, 3], [2, 3, 2]), 144);
+        assert_eq!(bitpix_for(2), 8);
+        assert_eq!(bitpix_for(64), 64);
+        assert_eq!(bitpix_for(999), 0);
+
+        let volume = Volume3D::new([3, 2, 1], vec![1_u16, 2, 3, 4, 5, 6]).unwrap();
+        let mut bytes = Vec::new();
+        write_chunked_values(
+            &volume,
+            [2, 2, 1],
+            0,
+            |value, out| out.extend_from_slice(&value.to_le_bytes()),
+            &mut bytes,
+        );
+        assert_eq!(decode_u16(&bytes), vec![1, 2, 4, 5, 3, 0, 6, 0]);
+    }
+
+    #[test]
+    fn cache_key_is_stable_and_prefixed_by_case_id() {
+        let first = cache_key("case_a", "source", "plan");
+        let second = cache_key("case_a", "source", "plan");
+        let different_plan = cache_key("case_a", "source", "other-plan");
+
+        assert_eq!(first, second);
+        assert_ne!(first, different_plan);
+        assert!(first.starts_with("case_a-"));
+        assert_eq!(first.len(), "case_a-".len() + 64);
+    }
+
+    fn valid_case(
+        case_id: &str,
+        image_path: Option<&Path>,
+        label_path: Option<&Path>,
+    ) -> CaseManifest {
+        CaseManifest {
+            case_id: case_id.to_string(),
+            status: CaseStatus::Valid,
+            image_path: image_path.map(path_text),
+            label_path: label_path.map(path_text),
+            image: None,
+            label: None,
+            problems: Vec::new(),
+        }
+    }
+
+    fn invalid_case(case_id: &str) -> CaseManifest {
+        CaseManifest {
+            case_id: case_id.to_string(),
+            status: CaseStatus::Invalid,
+            image_path: None,
+            label_path: None,
+            image: None,
+            label: None,
+            problems: Vec::new(),
+        }
+    }
+
+    fn write_manifest(path: &Path, root: &Path, cases: Vec<CaseManifest>) {
+        let valid_cases = cases
+            .iter()
+            .filter(|case| case.status == CaseStatus::Valid)
+            .count();
+        let manifest = DatasetManifest {
+            dataset_root: path_text(root),
+            images_dir: path_text(root),
+            labels_dir: path_text(root),
+            summary: ValidationSummary {
+                total_cases: cases.len(),
+                valid_cases,
+                invalid_cases: cases.len() - valid_cases,
+                ..ValidationSummary::default()
+            },
+            cases,
+        };
+        fs::write(path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+    }
+
+    fn identity_plan() -> &'static str {
+        r#"
+name = "identity"
+operations = []
+image_interpolation = "linear"
+label_interpolation = "nearest"
+"#
+    }
+
+    fn write_plan(path: &Path, text: &str) {
+        fs::write(path, text).unwrap();
+    }
+
+    fn path_text(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    fn read_f32_values(path: &Path) -> Vec<f32> {
+        fs::read(path)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    fn read_u16_values(path: &Path) -> Vec<u16> {
+        decode_u16(&fs::read(path).unwrap())
+    }
+
+    fn decode_u16(bytes: &[u8]) -> Vec<u16> {
+        bytes
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    fn read_u32_values(path: &Path) -> Vec<u32> {
+        fs::read(path)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    fn read_u64_values(path: &Path) -> Vec<u64> {
+        fs::read(path)
+            .unwrap()
+            .chunks_exact(8)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    fn bitpix_for(datatype: i16) -> i16 {
+        match datatype {
+            2 | 256 => 8,
+            4 | 512 => 16,
+            8 | 16 | 768 => 32,
+            64 => 64,
+            _ => 0,
+        }
+    }
+
+    fn temp_dir(case: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "medkit-cache-prepare-{case}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}

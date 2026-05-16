@@ -14,9 +14,11 @@ path = "src/main.rs"
 [dependencies]
 medkit-bench = { path = "../medkit-bench" }
 medkit-cache = { path = "../medkit-cache" }
+medkit-cxr = { path = "../medkit-cxr" }
 medkit-dataset = { path = "../medkit-dataset" }
 medkit-sampler = { path = "../medkit-sampler" }
 
 [dev-dependencies]
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+image.workspace = true
 serde_json.workspace = true

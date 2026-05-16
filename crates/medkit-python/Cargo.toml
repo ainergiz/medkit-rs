@@ -1,0 +1,22 @@
+[package]
+name = "medkit-python"
+version = "0.1.0"
+description = "PyO3 native Python extension for medkit-rs training data loading."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "medkit_rs_native"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+medkit-cxr = { path = "../medkit-cxr" }
+medkit-python-ffi = { path = "../medkit-python-ffi" }
+pyo3 = { version = "0.22.6", features = ["abi3-py311"] }

@@ -111,10 +111,11 @@ pub fn validate_dataset(config: &ValidationConfig) -> Result<DatasetManifest> {
 /// Writes a pretty JSON dataset manifest.
 pub fn write_manifest_json(manifest: &DatasetManifest, path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|source| DatasetError::io(parent, source))?;
-        }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| DatasetError::io(parent, source))?;
     }
     let json = serde_json::to_string_pretty(manifest)
         .map_err(|source| DatasetError::json(path, source))?;
@@ -124,10 +125,11 @@ pub fn write_manifest_json(manifest: &DatasetManifest, path: impl AsRef<Path>) -
 /// Writes a human-readable validation report.
 pub fn write_report(manifest: &DatasetManifest, path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|source| DatasetError::io(parent, source))?;
-        }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| DatasetError::io(parent, source))?;
     }
     fs::write(path, render_report(manifest)).map_err(|source| DatasetError::io(path, source))
 }
@@ -275,5 +277,34 @@ impl IndexedPaths {
 
     fn has_duplicates(&self) -> bool {
         self.paths.len() > 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn collect_index_skips_paths_without_case_ids() {
+        let dir = temp_dir("collect-index-skip");
+        fs::write(dir.join("image.nii"), b"").unwrap();
+
+        let index = collect_index(&dir, |_| None).unwrap();
+
+        assert!(index.is_empty());
+    }
+
+    fn temp_dir(case: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "medkit-dataset-{case}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

@@ -138,10 +138,12 @@ pub fn sample_cache(config: &SampleConfig) -> Result<SampleSummary> {
     if cases.is_empty() {
         return Err(SamplerError::invalid_input("cache contains no cases"));
     }
-    if let Some(parent) = config.out_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|source| SamplerError::io(parent, source))?;
-        }
+    if let Some(parent) = config
+        .out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| SamplerError::io(parent, source))?;
     }
     let mut text = String::new();
     let mut summary = SampleSummary {
@@ -196,12 +198,14 @@ pub fn extract_patch_pair(
     let mut label = vec![0; voxels];
     let has_foreground = extract_patch_pair_into(case, start, patch_size, &mut image, &mut label)?;
     Ok(CachedPatch {
-        image: Volume3D::new(patch_size, image).map_err(|error| {
-            SamplerError::invalid_input(format!("invalid extracted image patch: {error}"))
-        })?,
-        label: Volume3D::new(patch_size, label).map_err(|error| {
-            SamplerError::invalid_input(format!("invalid extracted label patch: {error}"))
-        })?,
+        image: Volume3D {
+            shape: patch_size,
+            data: image,
+        },
+        label: Volume3D {
+            shape: patch_size,
+            data: label,
+        },
         has_foreground,
     })
 }

@@ -76,3 +76,14 @@ impl std::error::Error for DatasetError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_constructor_is_covered() {
+        let source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let _ = DatasetError::json("manifest.json", source);
+    }
+}

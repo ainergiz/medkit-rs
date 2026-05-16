@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import ctypes
 import sys
+import random
 from pathlib import Path
 from typing import Any
 
@@ -215,6 +216,286 @@ class MedkitFfiBatchIterableDataset(_IterableDatasetBase):
         self._records = records
         self._patch = (ffi.patch_x(handle), ffi.patch_y(handle), ffi.patch_z(handle))
         return ffi
+
+
+class MedkitNativeBatchIterableDataset(_IterableDatasetBase):
+    """Iterable dataset that fills whole batches through the PyO3 native module."""
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        patches_path: str | Path,
+        length: int | None = None,
+        batch_size: int = 16,
+        storage: str = "resident",
+        pin_memory: bool = False,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        if storage not in {"resident", "chunked"}:
+            raise ValueError("storage must be 'resident' or 'chunked'")
+        self.cache_dir = Path(cache_dir)
+        self.patches_path = Path(patches_path)
+        self.requested_length = length
+        self.batch_size = batch_size
+        self.storage = storage
+        self.pin_memory = pin_memory
+        self._handle = None
+        self._records = 0
+        self._patch = (0, 0, 0)
+        self._ensure_open()
+
+    def __iter__(self):
+        torch = _torch()
+        handle = self._ensure_open()
+        worker = torch.utils.data.get_worker_info()
+        length = len(self)
+        if worker is None:
+            start = 0
+            step = self.batch_size
+        else:
+            start = worker.id * self.batch_size
+            step = worker.num_workers * self.batch_size
+        index = start
+        buffer = handle.allocate_batch(self.batch_size, pin_memory=self.pin_memory)
+        while index < length:
+            current = min(self.batch_size, length - index)
+            yield handle.fill_batch_buffer(buffer, index % self._records, current)
+            index += step
+
+    def __len__(self) -> int:
+        self._ensure_open()
+        return self.requested_length or self._records
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_handle"] = None
+        return state
+
+    def _ensure_open(self):
+        if self._handle is not None:
+            return self._handle
+        native = _native_module()
+        handle = native.DatasetHandle(self.cache_dir, self.patches_path, self.storage)
+        records = int(handle.records)
+        if records <= 0:
+            raise ValueError(f"patch plan contains no records: {self.patches_path}")
+        self._handle = handle
+        self._records = records
+        self._patch = (int(handle.patch_x), int(handle.patch_y), int(handle.patch_z))
+        return handle
+
+
+class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
+    """Iterable dataset that fills CXR batches through the PyO3 native module."""
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        split: str = "train",
+        length: int | None = None,
+        batch_size: int = 64,
+        pin_memory: bool = False,
+        shuffle: bool = False,
+        seed: int = 0,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        self.cache_dir = Path(cache_dir)
+        self.split = split
+        self.requested_length = length
+        self.batch_size = batch_size
+        self.pin_memory = pin_memory
+        self.shuffle = shuffle
+        self.seed = seed
+        self._handle = None
+        self._records = 0
+        self._targets: list[str] = []
+        self._image_shape = (0, 0, 0, 0)
+        self._ensure_open()
+
+    def __iter__(self):
+        torch = _torch()
+        handle = self._ensure_open()
+        worker = torch.utils.data.get_worker_info()
+        length = len(self)
+        if worker is None:
+            start = 0
+            step = self.batch_size
+        else:
+            start = worker.id * self.batch_size
+            step = worker.num_workers * self.batch_size
+        index = start
+        buffer = handle.allocate_cxr_batch(self.batch_size, pin_memory=self.pin_memory)
+        if self.shuffle:
+            order = list(range(length))
+            random.Random(self.seed).shuffle(order)
+            while index < length:
+                indices = order[index : min(index + self.batch_size, length)]
+                yield handle.fill_cxr_indices_buffer(buffer, indices)
+                index += step
+            return
+        while index < length:
+            start_index = index % self._records
+            current = min(self.batch_size, length - index, self._records - start_index)
+            yield handle.fill_cxr_batch_buffer(buffer, start_index, current)
+            index += step
+
+    def __len__(self) -> int:
+        self._ensure_open()
+        return self.requested_length or self._records
+
+    @property
+    def targets(self) -> list[str]:
+        self._ensure_open()
+        return list(self._targets)
+
+    @property
+    def image_shape(self) -> tuple[int, int, int, int]:
+        self._ensure_open()
+        return self._image_shape
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_handle"] = None
+        return state
+
+    def _ensure_open(self):
+        if self._handle is not None:
+            return self._handle
+        native = _native_module()
+        handle = native.CxrCacheHandle(self.cache_dir, self.split)
+        records = int(handle.records)
+        if records <= 0:
+            raise ValueError(f"CXR cache split contains no records: {self.split}")
+        if self.requested_length is not None and self.requested_length > records:
+            raise ValueError(
+                "length cannot exceed the CXR cache split size for the native "
+                "batch adapter"
+            )
+        self._handle = handle
+        self._records = records
+        self._targets = list(handle.targets())
+        self._image_shape = tuple(int(value) for value in handle.image_shape())
+        return handle
+
+
+class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
+    """Iterable dataset backed by a Rust-owned CXR batch prefetch thread."""
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        split: str = "train",
+        length: int | None = None,
+        batch_size: int = 64,
+        pin_memory: bool = False,
+        shuffle: bool = False,
+        seed: int = 0,
+        prefetch_depth: int = 3,
+        read_workers: int = 1,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        if prefetch_depth <= 0:
+            raise ValueError("prefetch_depth must be greater than zero")
+        if read_workers <= 0:
+            raise ValueError("read_workers must be greater than zero")
+        self.cache_dir = Path(cache_dir)
+        self.split = split
+        self.requested_length = length
+        self.batch_size = batch_size
+        self.pin_memory = pin_memory
+        self.shuffle = shuffle
+        self.seed = seed
+        self.prefetch_depth = prefetch_depth
+        self.read_workers = read_workers
+        self._handle = None
+        self._records = 0
+        self._targets: list[str] = []
+        self._image_shape = (0, 0, 0, 0)
+        self._ensure_open()
+
+    def __iter__(self):
+        torch = _torch()
+        worker = torch.utils.data.get_worker_info()
+        if worker is not None:
+            raise RuntimeError(
+                "MedkitCxrNativePrefetchDataset must be used with num_workers=0; "
+                "it manages native prefetch threads internally"
+            )
+        handle = self._ensure_open()
+        batches = self._batch_indices()
+        prefetcher = handle.create_cxr_prefetcher(
+            self.batch_size,
+            batches,
+            pin_memory=self.pin_memory,
+            prefetch_depth=self.prefetch_depth,
+            read_workers=self.read_workers,
+        )
+        leased_slot: int | None = None
+        try:
+            while True:
+                if leased_slot is not None:
+                    prefetcher.release(leased_slot)
+                    leased_slot = None
+                ready = prefetcher.next()
+                if ready is None:
+                    break
+                leased_slot, batch = ready
+                yield batch
+        finally:
+            if leased_slot is not None:
+                prefetcher.release(leased_slot)
+            prefetcher.close()
+
+    def __len__(self) -> int:
+        self._ensure_open()
+        return self.requested_length or self._records
+
+    @property
+    def targets(self) -> list[str]:
+        self._ensure_open()
+        return list(self._targets)
+
+    @property
+    def image_shape(self) -> tuple[int, int, int, int]:
+        self._ensure_open()
+        return self._image_shape
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_handle"] = None
+        return state
+
+    def _batch_indices(self) -> list[list[int]]:
+        length = len(self)
+        order = list(range(length))
+        if self.shuffle:
+            random.Random(self.seed).shuffle(order)
+        return [
+            order[index : min(index + self.batch_size, length)]
+            for index in range(0, length, self.batch_size)
+        ]
+
+    def _ensure_open(self):
+        if self._handle is not None:
+            return self._handle
+        native = _native_module()
+        handle = native.CxrCacheHandle(self.cache_dir, self.split)
+        records = int(handle.records)
+        if records <= 0:
+            raise ValueError(f"CXR cache split contains no records: {self.split}")
+        if self.requested_length is not None and self.requested_length > records:
+            raise ValueError(
+                "length cannot exceed the CXR cache split size for the native "
+                "prefetch adapter"
+            )
+        self._handle = handle
+        self._records = records
+        self._targets = list(handle.targets())
+        self._image_shape = tuple(int(value) for value in handle.image_shape())
+        return handle
 
 
 class MedkitViewBatchIterableDataset(_IterableDatasetBase):
@@ -435,6 +716,18 @@ def _writable_pointer(value: Any) -> ctypes.c_void_p:
             raise ValueError("FFI batch tensors must be contiguous")
         return ctypes.c_void_p(int(value.data_ptr()))
     return value.ctypes.data_as(ctypes.c_void_p)
+
+
+def _native_module():
+    try:
+        from . import _native  # type: ignore
+    except ImportError as error:
+        raise RuntimeError(
+            "missing medkit_rs._native; build it with "
+            "`uv run maturin develop --release` or copy the release extension "
+            "into python/medkit_rs"
+        ) from error
+    return _native
 
 
 def _torch():

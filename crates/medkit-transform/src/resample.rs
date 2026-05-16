@@ -152,11 +152,7 @@ fn nearest_index(index: [f64; 3], shape: [usize; 3]) -> Option<[usize; 3]> {
     let index = normalized_index(index, shape)?;
     let mut out = [0_usize; 3];
     for axis in 0..3 {
-        let rounded = index[axis].round();
-        if rounded < 0.0 || rounded > (shape[axis] - 1) as f64 {
-            return None;
-        }
-        out[axis] = rounded as usize;
+        out[axis] = index[axis].round() as usize;
     }
     Some(out)
 }
@@ -221,4 +217,78 @@ fn value_or_fill_u16(volume: &Volume3D<u16>, index: [usize; 3], fill: u16) -> u1
         return fill;
     }
     *volume.get(index[0], index[1], index[2])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f32_volume() -> Volume3D<f32> {
+        Volume3D::new(
+            [2, 2, 2],
+            vec![0.0, 1.0, 10.0, 11.0, 100.0, 101.0, 110.0, 111.0],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn nearest_sampling_clamps_tiny_edge_drift_and_rejects_invalid_coordinates() {
+        let volume = f32_volume();
+
+        assert_eq!(
+            sample_nearest_f32(&volume, [-EDGE_EPSILON / 2.0, 0.0, 0.0], -1.0),
+            0.0
+        );
+        assert_eq!(
+            sample_nearest_f32(&volume, [1.0 + EDGE_EPSILON / 2.0, 0.0, 0.0], -1.0),
+            1.0
+        );
+        assert_eq!(
+            sample_nearest_f32(&volume, [-EDGE_EPSILON * 2.0, 0.0, 0.0], -1.0),
+            -1.0
+        );
+        assert_eq!(
+            sample_nearest_f32(&volume, [f64::INFINITY, 0.0, 0.0], -1.0),
+            -1.0
+        );
+    }
+
+    #[test]
+    fn linear_sampling_interpolates_rounds_u16_and_uses_fill_for_missing_neighbors() {
+        let image = Volume3D::new([2, 1, 1], vec![0.0, 4.0]).unwrap();
+        let label = Volume3D::new([2, 1, 1], vec![0_u16, 3]).unwrap();
+
+        assert_eq!(sample_linear_f32(&image, [0.25, 0.0, 0.0], -9.0), 1.0);
+        assert_eq!(sample_linear_u16(&label, [0.5, 0.0, 0.0], 0), 2);
+        assert_eq!(sample_linear_u16(&label, [2.0, 0.0, 0.0], 7), 7);
+        assert_eq!(sample_linear_f32(&image, [2.0, 0.0, 0.0], -9.0), -9.0);
+        assert_eq!(value_or_fill_f32(&image, [2, 0, 0], -9.0), -9.0);
+        assert_eq!(value_or_fill_u16(&label, [0, 1, 0], 7), 7);
+    }
+
+    #[test]
+    fn u16_nearest_sampling_uses_fill_for_out_of_bounds_indices() {
+        let label = Volume3D::new([2, 1, 1], vec![1_u16, 2]).unwrap();
+
+        assert_eq!(sample_nearest_u16(&label, [f64::NAN, 0.0, 0.0], 9), 9);
+        assert_eq!(sample_nearest_u16(&label, [2.0, 0.0, 0.0], 9), 9);
+    }
+
+    #[test]
+    fn resample_uses_target_origin_offset_for_fill_and_source_coordinates() {
+        let volume = Volume3D::new([2, 1, 1], vec![5.0, 9.0]).unwrap();
+        let source = VolumeGeometry::identity([2, 1, 1], [1.0, 1.0, 1.0]).unwrap();
+        let target = VolumeGeometry::new(
+            [3, 1, 1],
+            [1.0, 1.0, 1.0],
+            [-1.0, 0.0, 0.0],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        )
+        .unwrap();
+
+        let resampled = resample_f32(&volume, &source, &target, Interpolation::Nearest).unwrap();
+
+        assert_eq!(resampled.shape, [3, 1, 1]);
+        assert_eq!(resampled.data, vec![0.0, 5.0, 9.0]);
+    }
 }

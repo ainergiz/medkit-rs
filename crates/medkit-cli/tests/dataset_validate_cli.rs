@@ -86,6 +86,47 @@ fn dataset_validate_command_reports_usage_for_bad_arguments() {
     assert!(String::from_utf8(output.stderr).unwrap().contains("Usage:"));
 }
 
+#[test]
+fn dataset_validate_command_reports_parse_and_dataset_errors() {
+    let missing_action = run_fail(["dataset"]);
+    assert!(missing_action.stderr.contains("Usage:"));
+
+    let unknown_action = run_fail(["dataset", "check"]);
+    assert!(unknown_action.stderr.contains("Usage:"));
+
+    let missing_root = run_fail(["dataset", "validate"]);
+    assert!(missing_root.stderr.contains("Usage:"));
+
+    let unknown_flag = run_fail(["dataset", "validate", ".", "--bogus"]);
+    assert!(unknown_flag.stderr.contains("unknown argument: --bogus"));
+    assert!(unknown_flag.stderr.contains("Usage:"));
+
+    let root = temp_case_dir("dataset-error");
+    let dataset_error = run_fail(["dataset", "validate", root.to_str().unwrap()]);
+    assert!(dataset_error.stderr.contains("images"));
+}
+
+struct FailedCommand {
+    stderr: String,
+}
+
+fn run_fail<const N: usize>(args: [&str; N]) -> FailedCommand {
+    let output = Command::new(env!("CARGO_BIN_EXE_medkit"))
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(2));
+    FailedCommand {
+        stderr: String::from_utf8(output.stderr).unwrap(),
+    }
+}
+
 fn temp_case_dir(case: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

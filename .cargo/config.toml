@@ -1,0 +1,5 @@
+[env]
+# The PyO3 extension targets Python's stable ABI, so workspace Rust builds
+# should not inspect the local Python interpreter. The default Homebrew Python
+# on this machine is free-threaded, which PyO3 0.22 correctly rejects.
+PYO3_NO_PYTHON = "1"

@@ -74,3 +74,17 @@ impl From<serde_json::Error> for SamplerError {
         Self::Json(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_impls_are_covered() {
+        let _ = SamplerError::from(medkit_cache::CacheError::InvalidInput {
+            reason: "bad cache".to_string(),
+        });
+        let source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let _ = SamplerError::from(source);
+    }
+}

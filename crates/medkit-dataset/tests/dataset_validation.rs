@@ -23,6 +23,10 @@ fn derives_case_ids_from_regular_and_nnunet_file_names() {
         Some("liver_001")
     );
     assert_eq!(
+        case_id_from_image_path(Path::new("imagesTr/liver.nii")).as_deref(),
+        Some("liver")
+    );
+    assert_eq!(
         case_id_from_label_path(Path::new("labelsTr/liver_001.nii.gz")).as_deref(),
         Some("liver_001")
     );

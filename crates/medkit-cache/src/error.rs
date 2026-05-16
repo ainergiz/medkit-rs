@@ -103,3 +103,70 @@ impl From<medkit_transform::TransformError> for CacheError {
         Self::Transform(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        error::Error as _,
+        io::{self, ErrorKind},
+        path::PathBuf,
+    };
+
+    use medkit_transform::TransformError;
+
+    use super::*;
+
+    #[test]
+    fn display_messages_include_error_context() {
+        let io_error = CacheError::io("cache/out.raw", io::Error::new(ErrorKind::Other, "denied"));
+        assert_eq!(
+            io_error.to_string(),
+            "filesystem error at cache/out.raw: denied"
+        );
+
+        let json_source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let json_error = CacheError::json("cache/cache_manifest.json", json_source);
+        assert!(json_error
+            .to_string()
+            .contains("JSON error at cache/cache_manifest.json"));
+
+        let transform_error = CacheError::from(TransformError::InvalidSize { size: [0, 8, 8] });
+        assert_eq!(transform_error.to_string(), "invalid 3D size [0, 8, 8]");
+
+        let invalid_input = CacheError::invalid_input("case a has no label path");
+        assert_eq!(
+            invalid_input.to_string(),
+            "invalid cache input: case a has no label path"
+        );
+
+        let nifti_error = CacheError::nifti(PathBuf::from("image.nii.gz"), "bad header");
+        assert_eq!(
+            nifti_error.to_string(),
+            "failed to load NIfTI pixels from image.nii.gz: bad header"
+        );
+    }
+
+    #[test]
+    fn source_returns_wrapped_errors_when_available() {
+        let io_error = CacheError::io("cache", io::Error::new(ErrorKind::NotFound, "missing"));
+        assert_eq!(io_error.source().unwrap().to_string(), "missing");
+
+        let json_source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let json_error = CacheError::json("manifest.json", json_source);
+        assert!(json_error.source().is_some());
+
+        let transform_error = CacheError::from(TransformError::ShapeMismatch {
+            image: [1, 2, 3],
+            label: [1, 2, 4],
+        });
+        assert_eq!(
+            transform_error.source().unwrap().to_string(),
+            "image shape [1, 2, 3] does not match label shape [1, 2, 4]"
+        );
+
+        assert!(CacheError::invalid_input("bad input").source().is_none());
+        assert!(CacheError::nifti("image.nii", "bad pixels")
+            .source()
+            .is_none());
+    }
+}

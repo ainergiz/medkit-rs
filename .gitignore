@@ -4,12 +4,18 @@
 
 # Local datasets, generated benchmark reports, and downloaded archives.
 /data/
+/reports/
+
+# Internal planning, benchmark notes, and vision docs.
+/docs/
 
 # Python local state.
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+python/medkit_rs/_native*.so
+python/medkit_rs/_native*.pyd
 
 # Local reference checkouts used while studying upstream implementations.
 /references/

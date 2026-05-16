@@ -37,3 +37,15 @@ pub(crate) fn seed_for(base: u64, case_id: &str, epoch: u64, worker: u64, index:
     let digest = hasher.finalize();
     u64::from_le_bytes(digest[0..8].try_into().expect("digest slice length"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_usize_returns_zero_for_empty_upper_bound() {
+        let mut rng = SplitMix64::new(42);
+
+        assert_eq!(rng.next_usize(0), 0);
+    }
+}

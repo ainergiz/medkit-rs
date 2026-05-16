@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """MONAI baseline for medkit benchmark fixtures and real MSD workflows.
 
 The script intentionally imports MONAI and PyTorch only when `run` is invoked so
@@ -148,7 +147,8 @@ def import_monai():
     except ImportError as error:
         raise MissingDependency(
             "MONAI is required for this baseline. Install with: "
-            "python -m pip install monai nibabel"
+            "uv run --with monai --with nibabel "
+            "crates/medkit-benchmarks/scripts/monai_baseline.py ..."
         ) from error
     return monai
 
