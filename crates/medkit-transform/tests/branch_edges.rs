@@ -104,6 +104,14 @@ label_interpolation = "nearest"
 [[operations]]
 op = "flip"
 "#,
+        r#"
+name = "removed-normalize-op"
+image_interpolation = "linear"
+label_interpolation = "nearest"
+
+[[operations]]
+op = "normalize"
+"#,
     ] {
         assert!(matches!(
             TransformPlan::from_toml_str(input).unwrap_err(),
@@ -145,6 +153,23 @@ fn plan_validation_errors_surface_from_pad_crop_and_geometry_resample() {
         TransformError::InvalidSpacing { spacing }
             if spacing[0] == 1.0 && spacing[1].is_nan() && spacing[2] == 1.0
     ));
+
+    let image = Volume3D::new([2, 1, 1], vec![0.0, 1.0]).unwrap();
+    let label = Volume3D::new([2, 1, 1], vec![0_u16, 1]).unwrap();
+    let bad_percentile = TransformPlan {
+        name: "bad-percentile".to_string(),
+        operations: vec![TransformOp::PercentileClip {
+            lower: 90.0,
+            upper: 10.0,
+        }],
+        image_interpolation: Interpolation::Linear,
+        label_interpolation: Interpolation::Nearest,
+    };
+
+    assert!(matches!(
+        bad_percentile.apply_pair(image, label).unwrap_err(),
+        TransformError::InvalidIntensityTransform { .. }
+    ));
 }
 
 #[test]
@@ -152,6 +177,16 @@ fn default_plan_hash_lazy_graph_and_linear_label_resample_is_rejected() {
     let default_plan = TransformPlan::ct_segmentation_default();
     let graph = default_plan.lazy_graph();
     assert_eq!(graph.operations, default_plan.operations);
+    assert_eq!(
+        graph.operation_names(),
+        vec![
+            "resample",
+            "ct_window",
+            "min_max_normalize",
+            "crop_foreground",
+            "pad_crop"
+        ]
+    );
     assert_eq!(default_plan.plan_hash().unwrap().len(), 64);
     assert!(default_plan
         .canonical_json()

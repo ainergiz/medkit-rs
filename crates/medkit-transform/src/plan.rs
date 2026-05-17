@@ -33,19 +33,19 @@ impl TransformPlan {
         Self {
             name: "ct-segmentation".to_string(),
             operations: vec![
+                TransformOp::Resample {
+                    spacing: [1.0, 1.0, 1.0],
+                },
                 TransformOp::CtWindow {
                     min: -1000.0,
                     max: 1000.0,
                 },
-                TransformOp::Normalize {
-                    mean: 0.0,
-                    std: 1.0,
+                TransformOp::MinMaxNormalize {
+                    output_min: 0.0,
+                    output_max: 1.0,
                 },
                 TransformOp::CropForeground { margin: 2 },
                 TransformOp::PadCrop { size: [32, 32, 32] },
-                TransformOp::Resample {
-                    spacing: [1.0, 1.0, 1.0],
-                },
             ],
             image_interpolation: Interpolation::Linear,
             label_interpolation: Interpolation::Nearest,
@@ -119,14 +119,31 @@ impl TransformPlan {
         for operation in &self.operations {
             match *operation {
                 TransformOp::CtWindow { min, max } => {
+                    validate_window(min, max)?;
+                    ensure_finite_intensities(&image)?;
                     for value in &mut image.data {
                         *value = value.clamp(min, max);
                     }
                     applied.push("ct_window".to_string());
                 }
-                TransformOp::Normalize { mean, std } => {
-                    normalize(&mut image, mean, std);
-                    applied.push("normalize".to_string());
+                TransformOp::MinMaxNormalize {
+                    output_min,
+                    output_max,
+                } => {
+                    min_max_normalize(&mut image, output_min, output_max)?;
+                    applied.push("min_max_normalize".to_string());
+                }
+                TransformOp::ZScoreNormalize { epsilon } => {
+                    z_score_normalize(&mut image, epsilon)?;
+                    applied.push("z_score_normalize".to_string());
+                }
+                TransformOp::PercentileClip { lower, upper } => {
+                    percentile_clip(&mut image, lower, upper)?;
+                    applied.push("percentile_clip".to_string());
+                }
+                TransformOp::DatasetMeanStdNormalize { mean, std } => {
+                    dataset_mean_std_normalize(&mut image, mean, std)?;
+                    applied.push("dataset_mean_std_normalize".to_string());
                 }
                 TransformOp::CropForeground { margin } => {
                     if let Some(bbox) = foreground_bbox(&label, margin) {
@@ -187,25 +204,140 @@ pub struct PreparedPair {
     pub label: Volume3D<u16>,
     /// Physical geometry after preprocessing.
     pub geometry: VolumeGeometry,
-    /// Origin of the foreground crop in original voxel coordinates.
+    /// Origin of the foreground crop in the voxel frame where the crop ran.
     pub crop_origin: [usize; 3],
     /// Applied operation names.
     pub applied_operations: Vec<String>,
 }
 
-fn normalize(image: &mut Volume3D<f32>, mean: f32, std: f32) {
-    let (min, max) = image
+fn validate_window(min: f32, max: f32) -> Result<()> {
+    if !min.is_finite() || !max.is_finite() || min > max {
+        return Err(TransformError::InvalidIntensityTransform {
+            reason: format!("ct_window requires finite min <= max, got min={min} max={max}"),
+        });
+    }
+    Ok(())
+}
+
+fn min_max_normalize(image: &mut Volume3D<f32>, output_min: f32, output_max: f32) -> Result<()> {
+    if !output_min.is_finite() || !output_max.is_finite() || output_min >= output_max {
+        return Err(TransformError::InvalidIntensityTransform {
+            reason: format!(
+                "min_max_normalize requires finite output_min < output_max, got output_min={output_min} output_max={output_max}"
+            ),
+        });
+    }
+    let (min, max) = finite_min_max(image)?;
+    let range = max - min;
+    if range <= f32::EPSILON {
+        image.data.fill(output_min);
+        return Ok(());
+    }
+    let output_range = output_max - output_min;
+    for value in &mut image.data {
+        let unit = (*value - min) / range;
+        *value = output_min + unit * output_range;
+    }
+    Ok(())
+}
+
+fn z_score_normalize(image: &mut Volume3D<f32>, epsilon: f32) -> Result<()> {
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        return Err(TransformError::InvalidIntensityTransform {
+            reason: format!("z_score_normalize requires positive finite epsilon, got {epsilon}"),
+        });
+    }
+    ensure_finite_intensities(image)?;
+    let mean = image
+        .data
+        .iter()
+        .map(|value| f64::from(*value))
+        .sum::<f64>()
+        / image.data.len() as f64;
+    let variance = image
+        .data
+        .iter()
+        .map(|value| {
+            let delta = f64::from(*value) - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / image.data.len() as f64;
+    let std = (variance.sqrt() as f32).max(epsilon);
+    let mean = mean as f32;
+    for value in &mut image.data {
+        *value = (*value - mean) / std;
+    }
+    Ok(())
+}
+
+fn percentile_clip(image: &mut Volume3D<f32>, lower: f32, upper: f32) -> Result<()> {
+    if !lower.is_finite()
+        || !upper.is_finite()
+        || !(0.0..=100.0).contains(&lower)
+        || !(0.0..=100.0).contains(&upper)
+        || lower > upper
+    {
+        return Err(TransformError::InvalidIntensityTransform {
+            reason: format!(
+                "percentile_clip requires 0 <= lower <= upper <= 100, got lower={lower} upper={upper}"
+            ),
+        });
+    }
+    ensure_finite_intensities(image)?;
+    let mut sorted = image.data.clone();
+    sorted.sort_by(f32::total_cmp);
+    let low = percentile_value(&sorted, lower);
+    let high = percentile_value(&sorted, upper);
+    for value in &mut image.data {
+        *value = value.clamp(low, high);
+    }
+    Ok(())
+}
+
+fn dataset_mean_std_normalize(image: &mut Volume3D<f32>, mean: f32, std: f32) -> Result<()> {
+    if !mean.is_finite() || !std.is_finite() || std <= 0.0 {
+        return Err(TransformError::InvalidIntensityTransform {
+            reason: format!(
+                "dataset_mean_std_normalize requires finite mean and positive finite std, got mean={mean} std={std}"
+            ),
+        });
+    }
+    ensure_finite_intensities(image)?;
+    for value in &mut image.data {
+        *value = (*value - mean) / std;
+    }
+    Ok(())
+}
+
+fn finite_min_max(image: &Volume3D<f32>) -> Result<(f32, f32)> {
+    ensure_finite_intensities(image)?;
+    Ok(image
         .data
         .iter()
         .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), value| {
             (min.min(*value), max.max(*value))
+        }))
+}
+
+fn ensure_finite_intensities(image: &Volume3D<f32>) -> Result<()> {
+    if image.data.iter().any(|value| !value.is_finite()) {
+        return Err(TransformError::InvalidIntensityTransform {
+            reason: "image intensities must be finite".to_string(),
         });
-    let range = (max - min).max(f32::EPSILON);
-    let std = std.max(f32::EPSILON);
-    for value in &mut image.data {
-        let unit = (*value - min) / range;
-        *value = (unit - mean) / std;
     }
+    Ok(())
+}
+
+fn percentile_value(sorted: &[f32], percentile: f32) -> f32 {
+    let position = f64::from(percentile) / 100.0 * (sorted.len() - 1) as f64;
+    let low = position.floor() as usize;
+    let high = position.ceil() as usize;
+    if low == high {
+        return sorted[low];
+    }
+    let weight = (position - low as f64) as f32;
+    sorted[low] * (1.0 - weight) + sorted[high] * weight
 }
 
 fn foreground_bbox(label: &Volume3D<u16>, margin: usize) -> Option<BoundingBox3> {

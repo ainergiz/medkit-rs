@@ -355,14 +355,16 @@ image_interpolation = "linear"
 label_interpolation = "nearest"
 
 [[operations]]
+op = "resample"
+spacing = [{spacing[0]}, {spacing[1]}, {spacing[2]}]
+
+[[operations]]
 op = "ct_window"
 min = -57.0
 max = 164.0
 
 [[operations]]
-op = "normalize"
-mean = 0.0
-std = 1.0
+op = "min_max_normalize"
 
 [[operations]]
 op = "crop_foreground"
@@ -371,10 +373,6 @@ margin = 4
 [[operations]]
 op = "pad_crop"
 size = [{cache_shape[0]}, {cache_shape[1]}, {cache_shape[2]}]
-
-[[operations]]
-op = "resample"
-spacing = [{spacing[0]}, {spacing[1]}, {spacing[2]}]
 '''
     )
 

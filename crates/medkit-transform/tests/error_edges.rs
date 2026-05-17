@@ -66,6 +66,12 @@ fn transform_errors_have_stable_messages_and_no_sources() {
             },
             "invalid label interpolation: labels require nearest",
         ),
+        (
+            TransformError::InvalidIntensityTransform {
+                reason: "bad intensity params".to_string(),
+            },
+            "invalid intensity transform: bad intensity params",
+        ),
     ];
 
     for (error, expected) in errors {

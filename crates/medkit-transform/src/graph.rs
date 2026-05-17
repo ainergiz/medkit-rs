@@ -21,11 +21,33 @@ pub enum TransformOp {
         /// Maximum window value.
         max: f32,
     },
-    /// Normalize image intensities after deterministic preprocessing.
-    Normalize {
-        /// Output mean.
+    /// Linearly maps the per-volume intensity range into an output range.
+    MinMaxNormalize {
+        /// Output value for the minimum input intensity.
+        #[serde(default = "default_min_max_output_min")]
+        output_min: f32,
+        /// Output value for the maximum input intensity.
+        #[serde(default = "default_min_max_output_max")]
+        output_max: f32,
+    },
+    /// Normalizes each volume with its own mean and standard deviation.
+    ZScoreNormalize {
+        /// Minimum standard deviation used for nearly constant images.
+        #[serde(default = "default_normalize_epsilon")]
+        epsilon: f32,
+    },
+    /// Clips intensities to per-volume percentile bounds.
+    PercentileClip {
+        /// Lower percentile in `[0, 100]`.
+        lower: f32,
+        /// Upper percentile in `[0, 100]`.
+        upper: f32,
+    },
+    /// Normalizes with externally computed dataset-level mean and std.
+    DatasetMeanStdNormalize {
+        /// Dataset-level mean.
         mean: f32,
-        /// Output standard deviation.
+        /// Dataset-level standard deviation.
         std: f32,
     },
     /// Crop image and label to the foreground label bounding box.
@@ -63,11 +85,26 @@ impl LazyTransformGraph {
             .iter()
             .map(|operation| match operation {
                 TransformOp::CtWindow { .. } => "ct_window",
-                TransformOp::Normalize { .. } => "normalize",
+                TransformOp::MinMaxNormalize { .. } => "min_max_normalize",
+                TransformOp::ZScoreNormalize { .. } => "z_score_normalize",
+                TransformOp::PercentileClip { .. } => "percentile_clip",
+                TransformOp::DatasetMeanStdNormalize { .. } => "dataset_mean_std_normalize",
                 TransformOp::CropForeground { .. } => "crop_foreground",
                 TransformOp::PadCrop { .. } => "pad_crop",
                 TransformOp::Resample { .. } => "resample",
             })
             .collect()
     }
+}
+
+fn default_min_max_output_min() -> f32 {
+    0.0
+}
+
+fn default_min_max_output_max() -> f32 {
+    1.0
+}
+
+fn default_normalize_epsilon() -> f32 {
+    1.0e-6
 }

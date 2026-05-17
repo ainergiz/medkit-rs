@@ -62,6 +62,11 @@ pub enum TransformError {
         /// Human-readable reason.
         reason: String,
     },
+    /// Intensity transform parameters or inputs are invalid.
+    InvalidIntensityTransform {
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 impl fmt::Display for TransformError {
@@ -94,6 +99,9 @@ impl fmt::Display for TransformError {
             }
             Self::InvalidLabelInterpolation { reason } => {
                 write!(f, "invalid label interpolation: {reason}")
+            }
+            Self::InvalidIntensityTransform { reason } => {
+                write!(f, "invalid intensity transform: {reason}")
             }
         }
     }

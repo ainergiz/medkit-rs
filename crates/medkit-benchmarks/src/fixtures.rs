@@ -632,14 +632,16 @@ image_interpolation = "linear"
 label_interpolation = "nearest"
 
 [[operations]]
+op = "resample"
+spacing = [{:.8}, {:.8}, {:.8}]
+
+[[operations]]
 op = "ct_window"
 min = -1000.0
 max = 1000.0
 
 [[operations]]
-op = "normalize"
-mean = 0.0
-std = 1.0
+op = "min_max_normalize"
 
 [[operations]]
 op = "crop_foreground"
@@ -648,17 +650,13 @@ margin = 4
 [[operations]]
 op = "pad_crop"
 size = [{}, {}, {}]
-
-[[operations]]
-op = "resample"
-spacing = [{:.8}, {:.8}, {:.8}]
 "#,
-        config.cache_shape[0],
-        config.cache_shape[1],
-        config.cache_shape[2],
         config.resample_spacing[0],
         config.resample_spacing[1],
-        config.resample_spacing[2]
+        config.resample_spacing[2],
+        config.cache_shape[0],
+        config.cache_shape[1],
+        config.cache_shape[2]
     )
 }
 

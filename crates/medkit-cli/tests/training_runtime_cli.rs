@@ -54,7 +54,7 @@ fn prepare_sample_and_bench_workflow_runs_end_to_end() {
     assert_eq!(cache_manifest["summary"]["cached_cases"], 2);
     assert_eq!(
         cache_manifest["transform_plan"]["operations"][0]["op"],
-        "ct_window"
+        "resample"
     );
     assert_eq!(
         cache_manifest["cases"][0]["source_geometry"]["spacing"],
@@ -66,7 +66,7 @@ fn prepare_sample_and_bench_workflow_runs_end_to_end() {
     );
     assert_eq!(
         cache_manifest["cases"][0]["shape"],
-        serde_json::json!([31, 31, 31])
+        serde_json::json!([16, 16, 16])
     );
     assert_eq!(
         cache_manifest["cases"][0]["chunk_shape"],
@@ -74,7 +74,7 @@ fn prepare_sample_and_bench_workflow_runs_end_to_end() {
     );
     assert_eq!(
         cache_manifest["cases"][0]["chunk_grid"],
-        serde_json::json!([4, 4, 4])
+        serde_json::json!([2, 2, 2])
     );
     for key in [
         "foreground_indices_path",
@@ -425,14 +425,16 @@ image_interpolation = "linear"
 label_interpolation = "nearest"
 
 [[operations]]
+op = "resample"
+spacing = [1.0, 1.0, 1.0]
+
+[[operations]]
 op = "ct_window"
 min = -1000.0
 max = 1000.0
 
 [[operations]]
-op = "normalize"
-mean = 0.0
-std = 1.0
+op = "min_max_normalize"
 
 [[operations]]
 op = "crop_foreground"
@@ -441,10 +443,6 @@ margin = 2
 [[operations]]
 op = "pad_crop"
 size = [16, 16, 16]
-
-[[operations]]
-op = "resample"
-spacing = [1.0, 1.0, 1.0]
 "#
 }
 
