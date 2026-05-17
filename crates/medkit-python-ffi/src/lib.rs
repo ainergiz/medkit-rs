@@ -16,6 +16,7 @@ pub struct DatasetHandle {
     cases: Vec<LoadedCase>,
     records: Vec<ResolvedPatch>,
     patch_size: [usize; 3],
+    image_channel_count: usize,
 }
 
 impl DatasetHandle {
@@ -46,13 +47,18 @@ impl DatasetHandle {
         self.patch_size
     }
 
+    pub fn image_channel_count(&self) -> usize {
+        self.image_channel_count
+    }
+
     /// Fills caller-owned image and u16 label buffers with contiguous patches.
     ///
     /// # Safety
     ///
     /// `image_out` and `label_out` must be non-null and point to writable
-    /// buffers large enough for `batch_size * patch_x * patch_y * patch_z`
-    /// values of their respective element types.
+    /// buffers large enough for `batch_size * channels * patch_x * patch_y *
+    /// patch_z` image values and `batch_size * patch_x * patch_y * patch_z`
+    /// label values.
     pub unsafe fn fill_batch_u16_ptr(
         &self,
         start_index: usize,
@@ -102,13 +108,20 @@ impl DatasetHandle {
             return Err("patch plan contains no records".to_string());
         }
         let patch_voxels = self.patch_size[0] * self.patch_size[1] * self.patch_size[2];
-        let Some(total_values) = patch_voxels.checked_mul(batch_size) else {
+        let Some(total_image_values) = patch_voxels
+            .checked_mul(self.image_channel_count)
+            .and_then(|value| value.checked_mul(batch_size))
+        else {
             return Err("batch output size overflow".to_string());
         };
-        let image_out = slice::from_raw_parts_mut(image_out, total_values);
-        let label_out = slice::from_raw_parts_mut(label_out, total_values);
+        let Some(total_label_values) = patch_voxels.checked_mul(batch_size) else {
+            return Err("batch output size overflow".to_string());
+        };
+        let image_out = slice::from_raw_parts_mut(image_out, total_image_values);
+        let label_out = slice::from_raw_parts_mut(label_out, total_label_values);
+        let image_values_per_sample = patch_voxels * self.image_channel_count;
         image_out
-            .par_chunks_mut(patch_voxels)
+            .par_chunks_mut(image_values_per_sample)
             .zip(label_out.par_chunks_mut(patch_voxels))
             .enumerate()
             .try_for_each(|(batch_index, (image_patch, label_patch))| {
@@ -130,12 +143,14 @@ impl DatasetHandle {
 struct LoadedCase {
     case_id: String,
     shape: [usize; 3],
+    image_channel_count: usize,
     storage: CaseStorage,
 }
 
 #[derive(Clone, Copy)]
 struct PatchCopySpec {
     shape: [usize; 3],
+    image_channel_count: usize,
     start: [usize; 3],
     patch_size: [usize; 3],
 }
@@ -152,6 +167,8 @@ struct ChunkOverlap<'a> {
     shape: [usize; 3],
     chunk_shape: [usize; 3],
     chunk_index: [usize; 3],
+    image_channel: usize,
+    copy_label: bool,
     patch_start: [usize; 3],
     patch_size: [usize; 3],
     image_chunk: &'a [f32],
@@ -273,14 +290,27 @@ pub unsafe extern "C" fn medkit_dataset_patch_z(handle: *const DatasetHandle) ->
 }
 
 #[no_mangle]
+/// Returns the number of image channels for an opened dataset.
+///
+/// # Safety
+///
+/// `handle` must be null or a live pointer returned by `medkit_dataset_open`.
+pub unsafe extern "C" fn medkit_dataset_image_channels(handle: *const DatasetHandle) -> usize {
+    handle
+        .as_ref()
+        .map_or(0, DatasetHandle::image_channel_count)
+}
+
+#[no_mangle]
 /// Fills caller-owned contiguous image and u16 label batch buffers.
 ///
 /// # Safety
 ///
 /// `handle` must be a live pointer returned by `medkit_dataset_open`.
-/// `image_out` and `label_out` must point to writable buffers large enough for
-/// `batch_size * patch_x * patch_y * patch_z` values of their respective
-/// element types.
+/// `image_out` must point to a writable buffer large enough for `batch_size *
+/// channels * patch_x * patch_y * patch_z` f32 values. `label_out` must point
+/// to a writable buffer large enough for `batch_size * patch_x * patch_y *
+/// patch_z` u16 values.
 pub unsafe extern "C" fn medkit_dataset_fill_batch(
     handle: *const DatasetHandle,
     start_index: usize,
@@ -302,8 +332,10 @@ pub unsafe extern "C" fn medkit_dataset_fill_batch(
 /// # Safety
 ///
 /// `handle` must be a live pointer returned by `medkit_dataset_open`.
-/// `image_out` and `label_out` must point to writable buffers large enough for
-/// `batch_size * patch_x * patch_y * patch_z` `f32` values.
+/// `image_out` must point to a writable buffer large enough for `batch_size *
+/// channels * patch_x * patch_y * patch_z` f32 values. `label_out` must point
+/// to a writable buffer large enough for `batch_size * patch_x * patch_y *
+/// patch_z` f32 values.
 pub unsafe extern "C" fn medkit_dataset_fill_batch_f32_labels(
     handle: *const DatasetHandle,
     start_index: usize,
@@ -328,6 +360,18 @@ fn load_dataset(
     let mut cases = Vec::with_capacity(manifest.cases.len());
     for case in &manifest.cases {
         cases.push(load_case(case, storage)?);
+    }
+    let image_channel_count = cases
+        .first()
+        .map(|case| case.image_channel_count)
+        .unwrap_or(1);
+    for case in &cases {
+        if case.image_channel_count != image_channel_count {
+            return Err(format!(
+                "mixed image channel counts are not supported: {} has {}, expected {}",
+                case.case_id, case.image_channel_count, image_channel_count
+            ));
+        }
     }
     let case_indices = cases
         .iter()
@@ -359,13 +403,19 @@ fn load_dataset(
         cases,
         records: resolved,
         patch_size,
+        image_channel_count,
     })
 }
 
 fn load_case(case: &CachedCase, storage: StorageMode) -> Result<LoadedCase, String> {
+    let image_channel_count = case.image_channel_count.max(1);
     let storage = match storage {
         StorageMode::Resident => CaseStorage::Resident {
-            image: read_f32_volume(Path::new(&case.image_cache_path), case.shape)?,
+            image: read_f32_volume(
+                Path::new(&case.image_cache_path),
+                case.shape,
+                image_channel_count,
+            )?,
             label_f32: read_u16_volume_as_f32(Path::new(&case.label_cache_path), case.shape)?,
         },
         StorageMode::Chunked => {
@@ -391,6 +441,7 @@ fn load_case(case: &CachedCase, storage: StorageMode) -> Result<LoadedCase, Stri
     Ok(LoadedCase {
         case_id: case.case_id.clone(),
         shape: case.shape,
+        image_channel_count,
         storage,
     })
 }
@@ -403,9 +454,18 @@ fn read_patch_records(path: &Path) -> Result<Vec<PatchRecord>, String> {
         .collect()
 }
 
-fn read_f32_volume(path: &Path, shape: [usize; 3]) -> Result<Vec<f32>, String> {
+fn read_f32_volume(
+    path: &Path,
+    shape: [usize; 3],
+    image_channel_count: usize,
+) -> Result<Vec<f32>, String> {
     let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let expected = shape[0] * shape[1] * shape[2] * 4;
+    let expected = shape[0]
+        .checked_mul(shape[1])
+        .and_then(|value| value.checked_mul(shape[2]))
+        .and_then(|value| value.checked_mul(image_channel_count.max(1)))
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| "resident image byte size overflow".to_string())?;
     if bytes.len() != expected {
         return Err(format!(
             "{} has {} bytes, expected {expected}",
@@ -445,22 +505,28 @@ unsafe fn copy_patch_u16(
 ) -> Result<(), String> {
     let (image, label_f32) = resident_case(case)?;
     let patch_voxels = patch_size[0] * patch_size[1] * patch_size[2];
-    let batch_offset = batch_index * patch_voxels;
+    let shape_voxels = case.shape[0] * case.shape[1] * case.shape[2];
+    let image_batch_offset = batch_index * case.image_channel_count * patch_voxels;
+    let label_batch_offset = batch_index * patch_voxels;
     for local_z in 0..patch_size[2] {
         let z = start[2] + local_z;
         for local_y in 0..patch_size[1] {
             let y = start[1] + local_y;
             let source_start = start[0] + case.shape[0] * (y + case.shape[1] * z);
-            let destination_start =
-                batch_offset + patch_size[0] * (local_y + patch_size[1] * local_z);
-            ptr::copy_nonoverlapping(
-                image.as_ptr().add(source_start),
-                image_out.add(destination_start),
-                patch_size[0],
-            );
+            let patch_row_start = patch_size[0] * (local_y + patch_size[1] * local_z);
+            for channel in 0..case.image_channel_count {
+                let destination_start =
+                    image_batch_offset + channel * patch_voxels + patch_row_start;
+                ptr::copy_nonoverlapping(
+                    image.as_ptr().add(channel * shape_voxels + source_start),
+                    image_out.add(destination_start),
+                    patch_size[0],
+                );
+            }
+            let label_destination_start = label_batch_offset + patch_row_start;
             let label_row = &label_f32[source_start..source_start + patch_size[0]];
             for (offset, value) in label_row.iter().enumerate() {
-                *label_out.add(destination_start + offset) = *value as u16;
+                *label_out.add(label_destination_start + offset) = *value as u16;
             }
         }
     }
@@ -477,7 +543,14 @@ fn copy_patch_f32_labels(
     match &case.storage {
         CaseStorage::Resident { image, label_f32 } => {
             copy_patch_f32_labels_resident(
-                case.shape, image, label_f32, start, patch_size, image_out, label_out,
+                case.shape,
+                case.image_channel_count,
+                image,
+                label_f32,
+                start,
+                patch_size,
+                image_out,
+                label_out,
             );
             Ok(())
         }
@@ -490,6 +563,7 @@ fn copy_patch_f32_labels(
             ChunkedPatchCopy {
                 spec: PatchCopySpec {
                     shape: case.shape,
+                    image_channel_count: case.image_channel_count,
                     start,
                     patch_size,
                 },
@@ -508,6 +582,7 @@ fn copy_patch_f32_labels(
 
 fn copy_patch_f32_labels_resident(
     shape: [usize; 3],
+    image_channel_count: usize,
     image: &[f32],
     label_f32: &[f32],
     start: [usize; 3],
@@ -515,6 +590,8 @@ fn copy_patch_f32_labels_resident(
     image_out: &mut [f32],
     label_out: &mut [f32],
 ) {
+    let shape_voxels = shape[0] * shape[1] * shape[2];
+    let patch_voxels = patch_size[0] * patch_size[1] * patch_size[2];
     for local_z in 0..patch_size[2] {
         let z = start[2] + local_z;
         for local_y in 0..patch_size[1] {
@@ -523,8 +600,14 @@ fn copy_patch_f32_labels_resident(
             let destination_start = patch_size[0] * (local_y + patch_size[1] * local_z);
             let destination_end = destination_start + patch_size[0];
             let source_end = source_start + patch_size[0];
-            image_out[destination_start..destination_end]
-                .copy_from_slice(&image[source_start..source_end]);
+            for channel in 0..image_channel_count {
+                let source_channel_start = channel * shape_voxels + source_start;
+                let source_channel_end = channel * shape_voxels + source_end;
+                let destination_channel_start = channel * patch_voxels + destination_start;
+                let destination_channel_end = channel * patch_voxels + destination_end;
+                image_out[destination_channel_start..destination_channel_end]
+                    .copy_from_slice(&image[source_channel_start..source_channel_end]);
+            }
             label_out[destination_start..destination_end]
                 .copy_from_slice(&label_f32[source_start..source_end]);
         }
@@ -539,6 +622,7 @@ fn copy_patch_f32_labels_chunked(
     outputs.label.fill(0.0);
     let PatchCopySpec {
         shape,
+        image_channel_count,
         start,
         patch_size,
     } = request.spec;
@@ -558,28 +642,37 @@ fn copy_patch_f32_labels_chunked(
         (end[2] - 1) / request.chunk_shape[2],
     ];
     let chunk_voxels = request.chunk_shape[0] * request.chunk_shape[1] * request.chunk_shape[2];
+    let chunks = request.chunk_grid[0] * request.chunk_grid[1] * request.chunk_grid[2];
+    let image_values_per_channel = chunks * chunk_voxels;
     for chunk_z in chunk_min[2]..=chunk_max[2] {
         for chunk_y in chunk_min[1]..=chunk_max[1] {
             for chunk_x in chunk_min[0]..=chunk_max[0] {
                 let chunk_index =
                     chunk_x + request.chunk_grid[0] * (chunk_y + request.chunk_grid[1] * chunk_z);
                 let chunk_value_offset = chunk_index * chunk_voxels;
-                let image_chunk =
-                    f32_mmap_values(request.image_mmap, chunk_value_offset, chunk_voxels)?;
                 let label_chunk =
                     u16_mmap_values(request.label_mmap, chunk_value_offset, chunk_voxels)?;
-                copy_chunk_overlap(
-                    ChunkOverlap {
-                        shape,
-                        chunk_shape: request.chunk_shape,
-                        chunk_index: [chunk_x, chunk_y, chunk_z],
-                        patch_start: start,
-                        patch_size,
-                        image_chunk,
-                        label_chunk,
-                    },
-                    &mut outputs,
-                );
+                for channel in 0..image_channel_count {
+                    let image_chunk = f32_mmap_values(
+                        request.image_mmap,
+                        channel * image_values_per_channel + chunk_value_offset,
+                        chunk_voxels,
+                    )?;
+                    copy_chunk_overlap(
+                        ChunkOverlap {
+                            shape,
+                            chunk_shape: request.chunk_shape,
+                            chunk_index: [chunk_x, chunk_y, chunk_z],
+                            image_channel: channel,
+                            copy_label: channel == 0,
+                            patch_start: start,
+                            patch_size,
+                            image_chunk,
+                            label_chunk,
+                        },
+                        &mut outputs,
+                    );
+                }
             }
         }
     }
@@ -591,6 +684,8 @@ fn copy_chunk_overlap(overlap: ChunkOverlap<'_>, outputs: &mut PatchOutputs<'_>)
         shape,
         chunk_shape,
         chunk_index,
+        image_channel,
+        copy_label,
         patch_start,
         patch_size,
         image_chunk,
@@ -623,16 +718,21 @@ fn copy_chunk_overlap(overlap: ChunkOverlap<'_>, outputs: &mut PatchOutputs<'_>)
         return;
     }
     let row = overlap_end[0] - overlap_start[0];
+    let patch_voxels = patch_size[0] * patch_size[1] * patch_size[2];
     for z in overlap_start[2]..overlap_end[2] {
         for y in overlap_start[1]..overlap_end[1] {
             let chunk_source = (overlap_start[0] - chunk_start[0])
                 + chunk_shape[0] * ((y - chunk_start[1]) + chunk_shape[1] * (z - chunk_start[2]));
             let patch_dest = (overlap_start[0] - patch_start[0])
                 + patch_size[0] * ((y - patch_start[1]) + patch_size[1] * (z - patch_start[2]));
-            outputs.image[patch_dest..patch_dest + row]
+            let image_dest = image_channel * patch_voxels + patch_dest;
+            outputs.image[image_dest..image_dest + row]
                 .copy_from_slice(&image_chunk[chunk_source..chunk_source + row]);
-            for offset in 0..row {
-                outputs.label[patch_dest + offset] = f32::from(label_chunk[chunk_source + offset]);
+            if copy_label {
+                for offset in 0..row {
+                    outputs.label[patch_dest + offset] =
+                        f32::from(label_chunk[chunk_source + offset]);
+                }
             }
         }
     }
@@ -713,6 +813,7 @@ mod tests {
             cases: Vec::new(),
             records: Vec::new(),
             patch_size: [1, 1, 1],
+            image_channel_count: 1,
         };
         let mut image = [0.0_f32; 1];
         let mut label_u16 = [0_u16; 1];
@@ -741,6 +842,8 @@ mod tests {
                 shape: [2, 1, 1],
                 chunk_shape: [1, 1, 1],
                 chunk_index: [0, 0, 0],
+                image_channel: 0,
+                copy_label: true,
                 patch_start: [1, 0, 0],
                 patch_size: [1, 1, 1],
                 image_chunk: &image_chunk,

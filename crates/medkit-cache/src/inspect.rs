@@ -27,6 +27,8 @@ pub struct CacheCaseInspection {
     pub cache_key: String,
     /// Cached shape in x, y, z order.
     pub shape: [usize; 3],
+    /// Number of cached image channels.
+    pub image_channel_count: usize,
     /// Storage kind.
     pub storage: CacheStorageKind,
     /// Chunk shape in x, y, z order when chunked storage exists.
@@ -112,9 +114,17 @@ fn inspect_case(case: &CachedCase, strict_hashes: bool) -> CacheCaseInspection {
     let mut errors = Vec::new();
     let mut bytes = 0_u64;
     let voxels = value_count(case.shape);
+    let image_channels = case.image_channel_count.max(1);
     bytes += check_file_bytes(
         &case.image_cache_path,
-        voxels.clone().map(|count| count * 4),
+        voxels
+            .clone()
+            .and_then(|count| {
+                count
+                    .checked_mul(image_channels)
+                    .ok_or_else(|| "image channel value count overflow".to_string())
+            })
+            .map(|count| count * 4),
         "image cache",
         &mut errors,
     );
@@ -183,6 +193,7 @@ fn inspect_case(case: &CachedCase, strict_hashes: bool) -> CacheCaseInspection {
         case_id: case.case_id.clone(),
         cache_key: case.cache_key.clone(),
         shape: case.shape,
+        image_channel_count: image_channels,
         storage,
         chunk_shape: case.chunk_grid.map(|_| case.chunk_shape),
         chunk_grid: case.chunk_grid,
@@ -208,11 +219,16 @@ fn inspect_chunked_case(
                 .ok_or_else(|| "chunked value count overflow".to_string())
         })
     });
+    let image_chunk_values = chunk_values.clone().and_then(|count| {
+        count
+            .checked_mul(case.image_channel_count.max(1))
+            .ok_or_else(|| "chunked image channel value count overflow".to_string())
+    });
     match &case.image_chunk_cache_path {
         Some(path) => {
             *bytes += check_file_bytes(
                 path,
-                chunk_values.clone().map(|count| count * 4),
+                image_chunk_values.map(|count| count * 4),
                 "image chunk cache",
                 errors,
             );

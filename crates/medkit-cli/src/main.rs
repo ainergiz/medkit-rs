@@ -28,9 +28,10 @@ use medkit_dataset::{
     ValidationConfig,
 };
 use medkit_dicom::{
-    browse_dicom, explain_pixels, inspect_dicom_file, render_unicode, scan_dicom,
-    scan_dicom_with_workers, write_scan_outputs, DicomBrowseConfig, DicomFileConfig,
-    DicomGraphSummary, DicomScanConfig, DicomScanSummary, DicomViewConfig, RenderOptions,
+    browse_dicom, inspect_dicom_file, present_dicom_pixels_with_options, render_unicode,
+    scan_dicom, scan_dicom_with_workers, write_scan_outputs, DicomBrowseConfig,
+    DicomDecoderSelection, DicomFileConfig, DicomGraphSummary, DicomPresentationOptions,
+    DicomScanConfig, DicomScanSummary, DicomViewConfig, RenderOptions,
 };
 use medkit_sampler::{sample_cache, SampleConfig, SampleSummary, SamplingStrategy};
 
@@ -321,9 +322,19 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        Command::DicomPixelsExplain { path } => {
+        Command::DicomPixelsExplain {
+            path,
+            decoder_backend,
+        } => {
             let config = DicomFileConfig { path };
-            let explanation = explain_pixels(&config.path)?;
+            let image = present_dicom_pixels_with_options(
+                &config.path,
+                DicomPresentationOptions {
+                    decoder: decoder_backend,
+                    ..DicomPresentationOptions::default()
+                },
+            )?;
+            let explanation = image.explanation;
             println!("{}", serde_json::to_string_pretty(&explanation)?);
             Ok(())
         }
@@ -457,6 +468,7 @@ enum Command {
     },
     DicomPixelsExplain {
         path: PathBuf,
+        decoder_backend: DicomDecoderSelection,
     },
     DicomView {
         path: PathBuf,
@@ -674,9 +686,26 @@ fn parse_dicom_pixels_command(
     let Some(path) = args.next() else {
         return Err(CliError::usage());
     };
-    reject_trailing_args(args, "dicom pixels --explain")?;
+    let mut decoder_backend = DicomDecoderSelection::Native;
+    let mut rest = args.peekable();
+    while let Some(flag) = rest.next() {
+        match flag.to_string_lossy().as_ref() {
+            "--decoder-backend" => {
+                decoder_backend =
+                    parse_dicom_decoder_backend(&next_string(&mut rest, "--decoder-backend")?)?
+            }
+            "--help" | "-h" => return Err(CliError::usage()),
+            other => {
+                return Err(CliError::Message(format!(
+                    "unknown argument: {other}\n\n{}",
+                    usage()
+                )))
+            }
+        }
+    }
     Ok(Command::DicomPixelsExplain {
         path: PathBuf::from(path),
+        decoder_backend,
     })
 }
 
@@ -1034,6 +1063,13 @@ fn parse_cxr_cache_command(mut args: impl Iterator<Item = OsString>) -> Result<C
             }
             "--dicom-output" => {
                 options.dicom_presentation_policy.output = next_string(&mut rest, "--dicom-output")?
+            }
+            "--dicom-decoder-backend" => {
+                options.dicom_presentation_policy.decoder_backend = parse_dicom_decoder_backend(
+                    &next_string(&mut rest, "--dicom-decoder-backend")?,
+                )?
+                .as_str()
+                .to_string()
             }
             "--allow-transfer-syntaxes" => {
                 options.transfer_syntax_policy.allow_transfer_syntaxes =
@@ -1514,6 +1550,12 @@ fn parse_transfer_syntax_action(value: &str) -> Result<String, CliError> {
     }
 }
 
+fn parse_dicom_decoder_backend(value: &str) -> Result<DicomDecoderSelection, CliError> {
+    value
+        .parse::<DicomDecoderSelection>()
+        .map_err(CliError::Message)
+}
+
 fn print_summary(manifest: &DatasetManifest, manifest_path: &Path, report_path: &Path) {
     println!("Dataset: {}", manifest.dataset_root);
     println!("Layout: {}", manifest.layout.as_str());
@@ -1942,14 +1984,14 @@ fn usage() -> String {
         "  medkit cxr index --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl",
         "  medkit cxr validate <manifest.jsonl> [--require-frontal] [--check-patient-leakage] [--check-duplicates] --report validation.md",
         "  medkit cxr split <manifest.jsonl> --by patient_id --train 0.8 --val 0.1 --test 0.1 [--stratify Pneumonia,view_position] [--seed 0] --out splits.json",
-        "  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache [--targets Pneumonia,No Finding] [--uncertain ignore] [--missing ignore] [--dicom-apply-rescale true] [--dicom-voi auto] [--dicom-invert-monochrome1 true] [--allow-transfer-syntaxes uid,uid] [--unsupported-transfer-syntax fail]",
+        "  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache [--targets Pneumonia,No Finding] [--uncertain ignore] [--missing ignore] [--dicom-apply-rescale true] [--dicom-voi auto] [--dicom-invert-monochrome1 true] [--dicom-decoder-backend medkit-native] [--allow-transfer-syntaxes uid,uid] [--unsupported-transfer-syntax fail]",
         "  medkit cxr validate-cache <cache> [--split train] [--targets Pneumonia] [--image-shape n,c,h,w] [--plan cxr-512.toml] [--report cache-validation.md] [--json cache-validation.json]",
         "  medkit cxr ingest <raw-dicom> --recipe cxr-dicom-512.toml --labels labels.csv --cache .medkit/cxr-cache --workdir .medkit/cxr-ingest --report ingestion-report.md [--dry-run] [--workers 4]",
         "  medkit cxr benchmark [--manifest manifest.jsonl] [--splits splits.json] [--plan cxr-512.toml] [--targets Pneumonia] [--baselines pytorch_raw,monai_raw,medkit_cached_mmap] [--batch-sizes 64,128] [--workers 8,16] [--device cuda:0] [--out benchmark.json]",
         "  medkit dicom scan <root> --out inventory.jsonl --report dicom-report.md [--workers 4]",
         "  medkit dicom browse <root> --group patient,study,series --out graph.json --report graph-report.md [--workers 4]",
         "  medkit dicom inspect <file.dcm>",
-        "  medkit dicom pixels --explain <file.dcm>",
+        "  medkit dicom pixels --explain <file.dcm> [--decoder-backend medkit-native]",
         "  medkit dicom view <file.dcm> [--width 80]",
     ]
     .join("\n")
@@ -2062,6 +2104,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Usage:"));
+        assert!(matches!(
+            parse(&[
+                "medkit",
+                "dicom",
+                "pixels",
+                "--explain",
+                "file.dcm",
+                "--decoder-backend",
+                "auto",
+            ])
+            .unwrap(),
+            Command::DicomPixelsExplain {
+                decoder_backend: DicomDecoderSelection::Auto,
+                ..
+            }
+        ));
         assert!(parse(&["medkit", "dicom", "view"])
             .unwrap_err()
             .to_string()

@@ -8,8 +8,8 @@ use std::{
 
 use medkit_python_ffi::{
     medkit_dataset_fill_batch, medkit_dataset_fill_batch_f32_labels, medkit_dataset_free,
-    medkit_dataset_len, medkit_dataset_open, medkit_dataset_patch_x, medkit_dataset_patch_y,
-    medkit_dataset_patch_z, DatasetHandle, StorageMode,
+    medkit_dataset_image_channels, medkit_dataset_len, medkit_dataset_open, medkit_dataset_patch_x,
+    medkit_dataset_patch_y, medkit_dataset_patch_z, DatasetHandle, StorageMode,
 };
 
 const CASE_ID: &str = "case_a";
@@ -68,6 +68,7 @@ fn resident_storage_fills_u16_and_f32_batches() {
     assert_eq!(dataset.len(), 2);
     assert!(!dataset.is_empty());
     assert_eq!(dataset.patch_size(), PATCH_SIZE);
+    assert_eq!(dataset.image_channel_count(), 1);
 
     let patch_voxels = volume_len(PATCH_SIZE);
     let mut image = vec![0.0; patch_voxels * 2];
@@ -130,6 +131,51 @@ fn chunked_storage_fills_patch_across_chunk_boundaries() {
         err.contains("u16 pointer fill is not implemented for chunked storage"),
         "{err}"
     );
+}
+
+#[test]
+fn resident_and_chunked_storage_fill_multichannel_batches() {
+    let fixture = TinyCache::new_with_channels("multichannel-fill", 2);
+    let patch_voxels = volume_len(PATCH_SIZE);
+
+    let resident = DatasetHandle::open_with_storage(
+        &fixture.cache_dir,
+        &fixture.patches_path,
+        StorageMode::Resident,
+    )
+    .unwrap();
+    assert_eq!(resident.image_channel_count(), 2);
+    let mut image = vec![0.0; patch_voxels * 2];
+    let mut label = vec![0.0; patch_voxels];
+    unsafe {
+        resident
+            .fill_batch_f32_ptr(0, 1, image.as_mut_ptr(), label.as_mut_ptr())
+            .unwrap();
+    }
+    assert_eq!(
+        image,
+        expected_multichannel_image_patch(FIRST_PATCH_START, 2)
+    );
+    assert_eq!(label, expected_label_patch_f32(FIRST_PATCH_START));
+
+    let chunked = DatasetHandle::open_with_storage(
+        &fixture.cache_dir,
+        &fixture.patches_path,
+        StorageMode::Chunked,
+    )
+    .unwrap();
+    image.fill(0.0);
+    label.fill(0.0);
+    unsafe {
+        chunked
+            .fill_batch_f32_ptr(0, 1, image.as_mut_ptr(), label.as_mut_ptr())
+            .unwrap();
+    }
+    assert_eq!(
+        image,
+        expected_multichannel_image_patch(FIRST_PATCH_START, 2)
+    );
+    assert_eq!(label, expected_label_patch_f32(FIRST_PATCH_START));
 }
 
 #[test]
@@ -244,6 +290,7 @@ fn c_abi_opens_reports_shape_fills_and_frees() {
     assert_eq!(unsafe { medkit_dataset_patch_x(handle) }, PATCH_SIZE[0]);
     assert_eq!(unsafe { medkit_dataset_patch_y(handle) }, PATCH_SIZE[1]);
     assert_eq!(unsafe { medkit_dataset_patch_z(handle) }, PATCH_SIZE[2]);
+    assert_eq!(unsafe { medkit_dataset_image_channels(handle) }, 1);
 
     let patch_voxels = volume_len(PATCH_SIZE);
     let mut image = vec![0.0; patch_voxels];
@@ -288,6 +335,10 @@ struct TinyCache {
 
 impl TinyCache {
     fn new(name: &str) -> Self {
+        Self::new_with_channels(name, 1)
+    }
+
+    fn new_with_channels(name: &str, image_channel_count: usize) -> Self {
         let root = TempDir::new(name);
         let cache_dir = root.path().join("cache");
         let case_dir = cache_dir.join("case-a-key");
@@ -297,14 +348,15 @@ impl TinyCache {
         let label_path = case_dir.join("label.u16.raw");
         let image_chunk_path = case_dir.join("image.chunks.f32.raw");
         let label_chunk_path = case_dir.join("label.chunks.u16.raw");
-        let image_values = image_values();
+        let image_values = image_values_for_channels(image_channel_count);
         let label_values = label_values();
         write_f32_raw(&image_path, &image_values);
         write_u16_raw(&label_path, &label_values);
-        write_f32_raw(
-            &image_chunk_path,
-            &chunked_values(&image_values, SHAPE, CHUNK_SHAPE, 0.0),
-        );
+        let image_chunk_values = image_values
+            .chunks_exact(volume_len(SHAPE))
+            .flat_map(|values| chunked_values(values, SHAPE, CHUNK_SHAPE, 0.0))
+            .collect::<Vec<_>>();
+        write_f32_raw(&image_chunk_path, &image_chunk_values);
         write_u16_raw(
             &label_chunk_path,
             &chunked_values(&label_values, SHAPE, CHUNK_SHAPE, 0),
@@ -334,6 +386,10 @@ impl TinyCache {
                 "source_metadata_hash": "source-hash",
                 "transform_plan_hash": "test-plan-hash",
                 "image_path": path_string(&root.path().join("source-image.nii")),
+                "image_paths": (0..image_channel_count)
+                    .map(|channel| path_string(&root.path().join(format!("source-image-{channel}.nii"))))
+                    .collect::<Vec<_>>(),
+                "image_channel_count": image_channel_count,
                 "label_path": path_string(&root.path().join("source-label.nii")),
                 "source_geometry": geometry_json(),
                 "output_geometry": geometry_json(),
@@ -420,6 +476,16 @@ fn expected_image_patch(start: [usize; 3]) -> Vec<f32> {
     expected_patch(start, |index| index as f32 + 0.25)
 }
 
+fn expected_multichannel_image_patch(start: [usize; 3], channels: usize) -> Vec<f32> {
+    (0..channels)
+        .flat_map(|channel| {
+            expected_patch(start, move |index| {
+                index as f32 + 0.25 + channel as f32 * 100.0
+            })
+        })
+        .collect()
+}
+
 fn expected_label_patch_f32(start: [usize; 3]) -> Vec<f32> {
     expected_patch(start, |index| f32::from(label_value(index)))
 }
@@ -446,9 +512,11 @@ fn expected_patch<T>(start: [usize; 3], value: impl Fn(usize) -> T) -> Vec<T> {
     out
 }
 
-fn image_values() -> Vec<f32> {
-    (0..volume_len(SHAPE))
-        .map(|index| index as f32 + 0.25)
+fn image_values_for_channels(channels: usize) -> Vec<f32> {
+    (0..channels)
+        .flat_map(|channel| {
+            (0..volume_len(SHAPE)).map(move |index| index as f32 + 0.25 + channel as f32 * 100.0)
+        })
         .collect()
 }
 

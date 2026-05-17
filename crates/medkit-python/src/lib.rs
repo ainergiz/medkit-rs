@@ -131,6 +131,11 @@ impl DatasetHandle {
         self.inner.patch_size()[2]
     }
 
+    #[getter]
+    fn image_channels(&self) -> usize {
+        self.inner.image_channel_count()
+    }
+
     fn patch_size(&self) -> (usize, usize, usize) {
         let [x, y, z] = self.inner.patch_size();
         (x, y, z)
@@ -177,9 +182,10 @@ impl DatasetHandle {
         if pin_memory {
             kwargs.set_item("pin_memory", true)?;
         }
-        let shape = (batch_size, 1_usize, z, y, x);
-        let image = torch.call_method("empty", (shape,), Some(&kwargs))?;
-        let label = torch.call_method1("empty_like", (&image,))?;
+        let image_shape = (batch_size, self.inner.image_channel_count(), z, y, x);
+        let label_shape = (batch_size, 1_usize, z, y, x);
+        let image = torch.call_method("empty", (image_shape,), Some(&kwargs))?;
+        let label = torch.call_method("empty", (label_shape,), Some(&kwargs))?;
         let image_ptr = image.call_method0("data_ptr")?.extract::<usize>()?;
         let label_ptr = label.call_method0("data_ptr")?.extract::<usize>()?;
         Ok(BatchBuffer {
@@ -234,11 +240,12 @@ impl DatasetHandle {
     fn __repr__(&self) -> String {
         let [x, y, z] = self.inner.patch_size();
         format!(
-            "DatasetHandle(records={}, patch_size=({}, {}, {}))",
+            "DatasetHandle(records={}, patch_size=({}, {}, {}), image_channels={})",
             self.inner.len(),
             x,
             y,
-            z
+            z,
+            self.inner.image_channel_count()
         )
     }
 }
@@ -1484,10 +1491,11 @@ def empty_like(tensor):
             assert_eq!(dataset.patch_x(), 2);
             assert_eq!(dataset.patch_y(), 2);
             assert_eq!(dataset.patch_z(), 2);
+            assert_eq!(dataset.image_channels(), 1);
             assert_eq!(dataset.patch_size(), (2, 2, 2));
             assert_eq!(
                 dataset.__repr__(),
-                "DatasetHandle(records=2, patch_size=(2, 2, 2))"
+                "DatasetHandle(records=2, patch_size=(2, 2, 2), image_channels=1)"
             );
 
             let mut image = vec![0.0f32; volume_len(PATCH_SIZE)];

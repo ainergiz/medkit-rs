@@ -3,13 +3,19 @@ name = "medkit-cli"
 version = "0.1.0"
 description = "Command-line workflows for medkit-rs."
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
 name = "medkit"
 path = "src/main.rs"
+
+[features]
+default = []
+dicom-rs-codecs = ["medkit-cxr/dicom-rs-codecs", "medkit-dicom/dicom-rs-codecs"]
 
 [dependencies]
 medkit-bench = { path = "../medkit-bench" }

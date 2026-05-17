@@ -8,7 +8,8 @@ use std::{
 use medkit_cache::{CacheError, CacheManifest, CacheSummary, CachedCase};
 use medkit_sampler::{
     extract_patch_pair, extract_patch_pair_into, load_cached_cases, plan_batches, sample_cache,
-    ForegroundPrefix, LoadedCachedCase, PatchRecord, SampleConfig, SamplerError, SamplingStrategy,
+    CachedImageVolume, ForegroundPrefix, LoadedCachedCase, PatchRecord, SampleConfig, SamplerError,
+    SamplingStrategy,
 };
 use medkit_transform::{TransformPlan, Volume3D, VolumeGeometry};
 
@@ -368,7 +369,8 @@ fn sample_cache_rejects_malformed_foreground_artifacts() {
 }
 
 fn loaded_case() -> LoadedCachedCase {
-    let image = Volume3D::new([4, 4, 4], (0..64).map(|value| value as f32).collect()).unwrap();
+    let image =
+        CachedImageVolume::new([4, 4, 4], 1, (0..64).map(|value| value as f32).collect()).unwrap();
     let mut label_values = vec![0_u16; 64];
     label_values[21] = 1;
     let label = Volume3D::new([4, 4, 4], label_values).unwrap();
@@ -451,6 +453,8 @@ fn cached_case(cache_dir: &Path, shape: [usize; 3]) -> CachedCase {
         source_metadata_hash: "source".to_string(),
         transform_plan_hash: "plan".to_string(),
         image_path: "image.nii".to_string(),
+        image_paths: vec!["image.nii".to_string()],
+        image_channel_count: 1,
         label_path: "label.nii".to_string(),
         source_geometry: geometry,
         output_geometry: geometry,

@@ -88,19 +88,52 @@ impl TransformPlan {
     /// Applies deterministic preprocessing with an explicit physical geometry.
     pub fn apply_pair_with_geometry(
         &self,
-        mut image: Volume3D<f32>,
+        image: Volume3D<f32>,
+        label: Volume3D<u16>,
+        geometry: VolumeGeometry,
+    ) -> Result<PreparedPair> {
+        let prepared = self.apply_channels_with_geometry(vec![image], label, geometry)?;
+        let image = prepared
+            .images
+            .into_iter()
+            .next()
+            .expect("single image channel was provided");
+        Ok(PreparedPair {
+            image,
+            label: prepared.label,
+            geometry: prepared.geometry,
+            crop_origin: prepared.crop_origin,
+            applied_operations: prepared.applied_operations,
+        })
+    }
+
+    /// Applies deterministic preprocessing to image channels and one label map.
+    ///
+    /// Spatial operations are shared across all channels. Intensity operations
+    /// are applied independently per channel.
+    pub fn apply_channels_with_geometry(
+        &self,
+        mut images: Vec<Volume3D<f32>>,
         mut label: Volume3D<u16>,
         mut geometry: VolumeGeometry,
-    ) -> Result<PreparedPair> {
-        if image.shape != label.shape {
-            return Err(TransformError::ShapeMismatch {
-                image: image.shape,
-                label: label.shape,
+    ) -> Result<PreparedChannels> {
+        if images.is_empty() {
+            return Err(TransformError::InvalidVolume {
+                shape: label.shape,
+                len: 0,
             });
         }
-        if image.shape != geometry.shape {
+        for image in &images {
+            if image.shape != label.shape {
+                return Err(TransformError::ShapeMismatch {
+                    image: image.shape,
+                    label: label.shape,
+                });
+            }
+        }
+        if label.shape != geometry.shape {
             return Err(TransformError::GeometryShapeMismatch {
-                volume: image.shape,
+                volume: label.shape,
                 geometry: geometry.shape,
             });
         }
@@ -120,9 +153,11 @@ impl TransformPlan {
             match *operation {
                 TransformOp::CtWindow { min, max } => {
                     validate_window(min, max)?;
-                    ensure_finite_intensities(&image)?;
-                    for value in &mut image.data {
-                        *value = value.clamp(min, max);
+                    for image in &mut images {
+                        ensure_finite_intensities(image)?;
+                        for value in &mut image.data {
+                            *value = value.clamp(min, max);
+                        }
                     }
                     applied.push("ct_window".to_string());
                 }
@@ -130,19 +165,27 @@ impl TransformPlan {
                     output_min,
                     output_max,
                 } => {
-                    min_max_normalize(&mut image, output_min, output_max)?;
+                    for image in &mut images {
+                        min_max_normalize(image, output_min, output_max)?;
+                    }
                     applied.push("min_max_normalize".to_string());
                 }
                 TransformOp::ZScoreNormalize { epsilon } => {
-                    z_score_normalize(&mut image, epsilon)?;
+                    for image in &mut images {
+                        z_score_normalize(image, epsilon)?;
+                    }
                     applied.push("z_score_normalize".to_string());
                 }
                 TransformOp::PercentileClip { lower, upper } => {
-                    percentile_clip(&mut image, lower, upper)?;
+                    for image in &mut images {
+                        percentile_clip(image, lower, upper)?;
+                    }
                     applied.push("percentile_clip".to_string());
                 }
                 TransformOp::DatasetMeanStdNormalize { mean, std } => {
-                    dataset_mean_std_normalize(&mut image, mean, std)?;
+                    for image in &mut images {
+                        dataset_mean_std_normalize(image, mean, std)?;
+                    }
                     applied.push("dataset_mean_std_normalize".to_string());
                 }
                 TransformOp::CropForeground { margin } => {
@@ -152,47 +195,73 @@ impl TransformPlan {
                             crop_origin[1] + bbox.start[1],
                             crop_origin[2] + bbox.start[2],
                         ];
-                        image = image.crop(bbox)?;
+                        images = images
+                            .into_iter()
+                            .map(|image| image.crop(bbox))
+                            .collect::<Result<Vec<_>>>()?;
                         label = label.crop(bbox)?;
                         geometry = geometry.crop(bbox)?;
                     }
                     applied.push("crop_foreground".to_string());
                 }
                 TransformOp::PadCrop { size } => {
-                    image = image.pad_crop_center(size, 0.0)?;
+                    images = images
+                        .into_iter()
+                        .map(|image| image.pad_crop_center(size, 0.0))
+                        .collect::<Result<Vec<_>>>()?;
                     label = label.pad_crop_center(size, 0)?;
                     geometry = geometry.pad_crop_center(size)?;
                     applied.push("pad_crop".to_string());
                 }
                 TransformOp::Resample { spacing } => {
                     let target_geometry = geometry.resampled_to_spacing(spacing)?;
-                    let next_image = resample_f32(
-                        &image,
-                        &geometry,
-                        &target_geometry,
-                        self.image_interpolation,
-                    );
+                    let next_images = images
+                        .iter()
+                        .map(|image| {
+                            resample_f32(
+                                image,
+                                &geometry,
+                                &target_geometry,
+                                self.image_interpolation,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>();
                     let next_label = resample_u16(
                         &label,
                         &geometry,
                         &target_geometry,
                         self.label_interpolation,
                     );
-                    image = next_image?;
+                    images = next_images?;
                     label = next_label?;
                     geometry = target_geometry;
                     applied.push("resample".to_string());
                 }
             }
         }
-        Ok(PreparedPair {
-            image,
+        Ok(PreparedChannels {
+            images,
             label,
             geometry,
             crop_origin,
             applied_operations: applied,
         })
     }
+}
+
+/// Result of applying deterministic preprocessing to image channels and a label map.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedChannels {
+    /// Preprocessed scalar image channels.
+    pub images: Vec<Volume3D<f32>>,
+    /// Preprocessed label map.
+    pub label: Volume3D<u16>,
+    /// Physical geometry after preprocessing.
+    pub geometry: VolumeGeometry,
+    /// Origin of the foreground crop in the voxel frame where the crop ran.
+    pub crop_origin: [usize; 3],
+    /// Applied operation names.
+    pub applied_operations: Vec<String>,
 }
 
 /// Result of applying deterministic preprocessing to an image/label pair.

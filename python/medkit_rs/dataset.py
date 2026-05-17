@@ -61,10 +61,10 @@ class MedkitPatchDataset(_MapDatasetBase):
         image, label = self._volumes_for_case(case)
         x, y, z = record["patch_start"]
         sx, sy, sz = record["patch_size"]
-        image_patch = image[z : z + sz, y : y + sy, x : x + sx]
+        image_patch = image[:, z : z + sz, y : y + sy, x : x + sx]
         label_patch = label[z : z + sz, y : y + sy, x : x + sx]
         sample = {
-            "image": torch.from_numpy(image_patch[None, ...]),
+            "image": torch.from_numpy(image_patch),
             "label": torch.from_numpy(label_patch[None, ...]),
         }
         if self.include_metadata:
@@ -82,11 +82,12 @@ class MedkitPatchDataset(_MapDatasetBase):
         if case_id in self._volumes:
             return self._volumes[case_id]
         x, y, z = case["shape"]
+        channels = int(case.get("image_channel_count", 1) or 1)
         image = np.memmap(
             self._resolve(case["image_cache_path"]),
             dtype="<f4",
             mode="c",
-            shape=(z, y, x),
+            shape=(channels, z, y, x),
         )
         label = np.memmap(
             self._resolve(case["label_cache_path"]),
@@ -152,6 +153,7 @@ class MedkitFfiBatchIterableDataset(_IterableDatasetBase):
         self._handle: int | None = None
         self._records = 0
         self._patch = (0, 0, 0)
+        self._channels = 1
         self._ensure_open()
 
     def __iter__(self):
@@ -167,8 +169,10 @@ class MedkitFfiBatchIterableDataset(_IterableDatasetBase):
             step = worker.num_workers * self.batch_size
         index = start
         z, y, x = self._patch[2], self._patch[1], self._patch[0]
-        image_buffer = torch.empty((self.batch_size, 1, z, y, x), dtype=torch.float32)
-        label_buffer = torch.empty_like(image_buffer)
+        image_buffer = torch.empty(
+            (self.batch_size, self._channels, z, y, x), dtype=torch.float32
+        )
+        label_buffer = torch.empty((self.batch_size, 1, z, y, x), dtype=torch.float32)
         while index < length:
             current = min(self.batch_size, length - index)
             image = image_buffer if current == self.batch_size else image_buffer[:current]
@@ -215,6 +219,7 @@ class MedkitFfiBatchIterableDataset(_IterableDatasetBase):
         self._handle = handle
         self._records = records
         self._patch = (ffi.patch_x(handle), ffi.patch_y(handle), ffi.patch_z(handle))
+        self._channels = ffi.image_channels(handle)
         return ffi
 
 
@@ -601,6 +606,8 @@ class _MedkitFfi:
         self.lib.medkit_dataset_patch_y.restype = ctypes.c_size_t
         self.lib.medkit_dataset_patch_z.argtypes = [ctypes.c_void_p]
         self.lib.medkit_dataset_patch_z.restype = ctypes.c_size_t
+        self.lib.medkit_dataset_image_channels.argtypes = [ctypes.c_void_p]
+        self.lib.medkit_dataset_image_channels.restype = ctypes.c_size_t
         self.lib.medkit_dataset_fill_batch.argtypes = [
             ctypes.c_void_p,
             ctypes.c_size_t,
@@ -643,6 +650,9 @@ class _MedkitFfi:
 
     def patch_z(self, handle: int) -> int:
         return int(self.lib.medkit_dataset_patch_z(ctypes.c_void_p(handle)))
+
+    def image_channels(self, handle: int) -> int:
+        return int(self.lib.medkit_dataset_image_channels(ctypes.c_void_p(handle)))
 
     def fill_batch(
         self,

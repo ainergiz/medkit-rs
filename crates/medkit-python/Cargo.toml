@@ -3,7 +3,9 @@ name = "medkit-python"
 version = "0.1.0"
 description = "PyO3 native Python extension for medkit-rs training data loading."
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 

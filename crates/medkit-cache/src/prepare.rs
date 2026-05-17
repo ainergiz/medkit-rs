@@ -16,6 +16,10 @@ const CACHE_MANIFEST: &str = "cache_manifest.json";
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const CACHE_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn default_image_channel_count() -> usize {
+    1
+}
+
 /// Configuration for deterministic cache preparation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareConfig {
@@ -78,6 +82,12 @@ pub struct CachedCase {
     pub transform_plan_hash: String,
     /// Source image path.
     pub image_path: String,
+    /// Source image channel paths in cache channel order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_paths: Vec<String>,
+    /// Number of source image channels stacked into the cached image artifact.
+    #[serde(default = "default_image_channel_count")]
+    pub image_channel_count: usize,
     /// Source label path.
     pub label_path: String,
     /// Source image geometry.
@@ -292,6 +302,22 @@ fn validate_existing_case_dir(final_case_dir: &Path, case: &CachedCase) -> Resul
     Ok(())
 }
 
+#[derive(Debug)]
+struct SourceImage {
+    path: PathBuf,
+    path_text: String,
+    channel_index: Option<u16>,
+}
+
+#[derive(Debug)]
+struct LoadedImageChannel {
+    path_text: String,
+    channel_index: Option<u16>,
+    volume: Volume3D<f32>,
+    geometry: VolumeGeometry,
+    source_content_hash: String,
+}
+
 fn prepare_case(
     case: &medkit_dataset::CaseManifest,
     dataset_root: &Path,
@@ -301,27 +327,64 @@ fn prepare_case(
     final_cache_dir: &Path,
     chunk_shape: Option<[usize; 3]>,
 ) -> Result<CachedCase> {
-    let image_path = case.image_path.as_ref().ok_or_else(|| {
-        CacheError::invalid_input(format!("case {} has no image path", case.case_id))
-    })?;
+    let image_sources = image_sources_for_case(case, dataset_root)?;
     let label_path = case.label_path.as_ref().ok_or_else(|| {
         CacheError::invalid_input(format!("case {} has no label path", case.case_id))
     })?;
-    let image_path = resolve_manifest_source_path(dataset_root, image_path);
     let label_path = resolve_manifest_source_path(dataset_root, label_path);
-    let image_path_text = image_path.to_string_lossy().into_owned();
     let label_path_text = label_path.to_string_lossy().into_owned();
-    let image = nifti_pixels::load_image_f32(&image_path)?;
     let label = nifti_pixels::load_label_u16(&label_path)?;
-    if !image.geometry.approximately_eq(&label.geometry, 1e-6) {
-        return Err(CacheError::invalid_input(format!(
-            "case {} image and label source geometry differ",
-            case.case_id
-        )));
+    let mut image_channels = Vec::with_capacity(image_sources.len());
+    for source in image_sources {
+        let image = nifti_pixels::load_image_f32(&source.path)?;
+        image_channels.push(LoadedImageChannel {
+            path_text: source.path_text,
+            channel_index: source.channel_index,
+            volume: image.volume,
+            geometry: image.geometry,
+            source_content_hash: image.source_content_hash,
+        });
     }
-    let source_geometry = image.geometry;
+    let source_geometry = image_channels
+        .first()
+        .map(|channel| channel.geometry)
+        .ok_or_else(|| {
+            CacheError::invalid_input(format!("case {} has no image channels", case.case_id))
+        })?;
+    for channel in &image_channels {
+        if !channel.geometry.approximately_eq(&source_geometry, 1e-6) {
+            return Err(CacheError::invalid_input(format!(
+                "case {} image channel {} geometry differs from the first image channel",
+                case.case_id, channel.path_text
+            )));
+        }
+        if !channel.geometry.approximately_eq(&label.geometry, 1e-6) {
+            return Err(CacheError::invalid_input(format!(
+                "case {} image and label source geometry differ for channel {}",
+                case.case_id, channel.path_text
+            )));
+        }
+    }
     let label_geometry = label.geometry;
-    let prepared = plan.apply_pair_with_geometry(image.volume, label.volume, source_geometry)?;
+    let image_path_texts = image_channels
+        .iter()
+        .map(|channel| channel.path_text.clone())
+        .collect::<Vec<_>>();
+    let image_channel_indices = image_channels
+        .iter()
+        .map(|channel| channel.channel_index)
+        .collect::<Vec<_>>();
+    let image_content_hashes = image_channels
+        .iter()
+        .map(|channel| channel.source_content_hash.clone())
+        .collect::<Vec<_>>();
+    let image_volumes = image_channels
+        .into_iter()
+        .map(|channel| channel.volume)
+        .collect::<Vec<_>>();
+    let prepared =
+        plan.apply_channels_with_geometry(image_volumes, label.volume, source_geometry)?;
+    let image_channel_count = prepared.images.len();
     let foreground_indices = prepared
         .label
         .data
@@ -330,18 +393,17 @@ fn prepare_case(
         .filter_map(|(index, value)| (*value != 0).then_some(index))
         .collect::<Vec<_>>();
     let foreground_voxels = foreground_indices.len();
-    let mut source_case = case.clone();
-    source_case.image_path = Some(image_path_text.clone());
-    source_case.label_path = Some(label_path_text.clone());
     let source_metadata_hash = source_hash(
-        &source_case,
+        case,
+        &image_path_texts,
+        &image_channel_indices,
         &source_geometry,
         &label_geometry,
-        &image.source_content_hash,
+        &image_content_hashes,
         &label.source_content_hash,
     )?;
     let effective_chunk_shape =
-        chunk_shape.map(|shape| valid_chunk_shape(shape, prepared.image.shape));
+        chunk_shape.map(|shape| valid_chunk_shape(shape, prepared.label.shape));
     let storage_layout = if effective_chunk_shape.is_some() {
         "chunked"
     } else {
@@ -368,7 +430,7 @@ fn prepare_case(
     let label_cache_path = final_case_dir.join("label.u16.raw");
     let foreground_indices_path = final_case_dir.join("foreground_indices.u64.raw");
     let foreground_prefix_path = final_case_dir.join("foreground_prefix.u32.raw");
-    write_f32_volume(&prepared.image, &staging_image_cache_path)?;
+    write_f32_channels(&prepared.images, &staging_image_cache_path)?;
     write_u16_volume(&prepared.label, &staging_label_cache_path)?;
     write_u64_indices(&foreground_indices, &staging_foreground_indices_path)?;
     let image_cache_sha256 = sha256_file(&staging_image_cache_path)?;
@@ -387,8 +449,8 @@ fn prepare_case(
         let staging_label_chunk_cache_path = staging_case_dir.join("label.chunks.u16.raw");
         let image_chunk_cache_path = final_case_dir.join("image.chunks.f32.raw");
         let label_chunk_cache_path = final_case_dir.join("label.chunks.u16.raw");
-        write_chunked_volume_f32(
-            &prepared.image,
+        write_chunked_channels_f32(
+            &prepared.images,
             chunk_shape,
             &staging_image_chunk_cache_path,
         )?;
@@ -399,7 +461,7 @@ fn prepare_case(
         )?;
         let image_chunk_cache_sha256 = sha256_file(&staging_image_chunk_cache_path)?;
         let label_chunk_cache_sha256 = sha256_file(&staging_label_chunk_cache_path)?;
-        let chunk_grid = chunk_grid(prepared.image.shape, chunk_shape);
+        let chunk_grid = chunk_grid(prepared.label.shape, chunk_shape);
         Some((
             chunk_shape,
             chunk_grid,
@@ -411,14 +473,19 @@ fn prepare_case(
     } else {
         None
     };
-    let mut bytes_written = prepared.image.data.len() * 4
+    let image_value_count = prepared
+        .images
+        .iter()
+        .map(|image| image.data.len())
+        .sum::<usize>();
+    let mut bytes_written = image_value_count * 4
         + prepared.label.data.len() * 2
         + foreground_indices.len() * 8
         + foreground_prefix.len() * 4;
     if let Some((chunk_shape, chunk_grid, _, _, _, _)) = &chunk_paths {
         let chunk_voxels = chunk_shape[0] * chunk_shape[1] * chunk_shape[2];
         let chunks = chunk_grid[0] * chunk_grid[1] * chunk_grid[2];
-        bytes_written += chunks * chunk_voxels * (4 + 2);
+        bytes_written += chunks * chunk_voxels * (image_channel_count * 4 + 2);
     }
     let (
         chunk_shape_out,
@@ -439,14 +506,16 @@ fn prepare_case(
             Some(label_hash),
         )
     } else {
-        (prepared.image.shape, None, None, None, None, None)
+        (prepared.label.shape, None, None, None, None, None)
     };
     let cached = CachedCase {
         case_id: case.case_id.clone(),
         cache_key,
         source_metadata_hash,
         transform_plan_hash: plan_hash.to_string(),
-        image_path: image_path_text,
+        image_path: image_path_texts[0].clone(),
+        image_paths: image_path_texts,
+        image_channel_count,
         label_path: label_path_text,
         source_geometry,
         output_geometry: prepared.geometry,
@@ -463,7 +532,7 @@ fn prepare_case(
         image_chunk_cache_sha256,
         label_chunk_cache_path,
         label_chunk_cache_sha256,
-        shape: prepared.image.shape,
+        shape: prepared.label.shape,
         chunk_shape: chunk_shape_out,
         chunk_grid,
         crop_origin: prepared.crop_origin,
@@ -476,6 +545,47 @@ fn prepare_case(
         .map_err(|source| CacheError::json(&case_json, source))?;
     fs::write(&case_json, text).map_err(|source| CacheError::io(case_json, source))?;
     Ok(cached)
+}
+
+fn image_sources_for_case(
+    case: &medkit_dataset::CaseManifest,
+    dataset_root: &Path,
+) -> Result<Vec<SourceImage>> {
+    let mut sources = if !case.images.is_empty() {
+        case.images
+            .iter()
+            .map(|image| {
+                let path = resolve_manifest_source_path(dataset_root, &image.path);
+                SourceImage {
+                    path_text: path.to_string_lossy().into_owned(),
+                    path,
+                    channel_index: image.channel_index,
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let image_path = case.image_path.as_ref().ok_or_else(|| {
+            CacheError::invalid_input(format!("case {} has no image path", case.case_id))
+        })?;
+        let path = resolve_manifest_source_path(dataset_root, image_path);
+        vec![SourceImage {
+            path_text: path.to_string_lossy().into_owned(),
+            path,
+            channel_index: None,
+        }]
+    };
+    sources.sort_by(|left, right| {
+        left.channel_index
+            .cmp(&right.channel_index)
+            .then_with(|| left.path_text.cmp(&right.path_text))
+    });
+    if sources.is_empty() {
+        return Err(CacheError::invalid_input(format!(
+            "case {} has no image channels",
+            case.case_id
+        )));
+    }
+    Ok(sources)
 }
 
 fn resolve_manifest_source_path(dataset_root: &Path, path: &str) -> PathBuf {
@@ -494,7 +604,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn write_f32_volume(volume: &Volume3D<f32>, path: &Path) -> Result<()> {
+fn write_u16_volume(volume: &Volume3D<u16>, path: &Path) -> Result<()> {
     let mut writer =
         BufWriter::new(File::create(path).map_err(|source| CacheError::io(path, source))?);
     for value in &volume.data {
@@ -507,13 +617,15 @@ fn write_f32_volume(volume: &Volume3D<f32>, path: &Path) -> Result<()> {
         .map_err(|source| CacheError::io(path, source))
 }
 
-fn write_u16_volume(volume: &Volume3D<u16>, path: &Path) -> Result<()> {
+fn write_f32_channels(channels: &[Volume3D<f32>], path: &Path) -> Result<()> {
     let mut writer =
         BufWriter::new(File::create(path).map_err(|source| CacheError::io(path, source))?);
-    for value in &volume.data {
-        writer
-            .write_all(&value.to_le_bytes())
-            .map_err(|source| CacheError::io(path, source))?;
+    for channel in channels {
+        for value in &channel.data {
+            writer
+                .write_all(&value.to_le_bytes())
+                .map_err(|source| CacheError::io(path, source))?;
+        }
     }
     writer
         .flush()
@@ -591,24 +703,26 @@ fn chunk_grid(shape: [usize; 3], chunk_shape: [usize; 3]) -> [usize; 3] {
     ]
 }
 
-fn write_chunked_volume_f32(
-    volume: &Volume3D<f32>,
+fn write_chunked_channels_f32(
+    channels: &[Volume3D<f32>],
     chunk_shape: [usize; 3],
     path: &Path,
 ) -> Result<()> {
     let mut writer =
         BufWriter::new(File::create(path).map_err(|source| CacheError::io(path, source))?);
-    write_chunked_values(
-        volume,
-        chunk_shape,
-        0.0_f32,
-        |value, writer| {
-            writer.write_all(&value.to_le_bytes())?;
-            Ok(())
-        },
-        &mut writer,
-    )
-    .map_err(|source| CacheError::io(path, source))?;
+    for channel in channels {
+        write_chunked_values(
+            channel,
+            chunk_shape,
+            0.0_f32,
+            |value, writer| {
+                writer.write_all(&value.to_le_bytes())?;
+                Ok(())
+            },
+            &mut writer,
+        )
+        .map_err(|source| CacheError::io(path, source))?;
+    }
     writer
         .flush()
         .map_err(|source| CacheError::io(path, source))
@@ -685,16 +799,20 @@ fn chunked_value_count(shape: [usize; 3], chunk_shape: [usize; 3]) -> usize {
 
 fn source_hash(
     case: &medkit_dataset::CaseManifest,
+    image_paths: &[String],
+    image_channel_indices: &[Option<u16>],
     image_geometry: &VolumeGeometry,
     label_geometry: &VolumeGeometry,
-    image_content_hash: &str,
+    image_content_hashes: &[String],
     label_content_hash: &str,
 ) -> Result<String> {
     let text = serde_json::to_string(&(
         case,
+        image_paths,
+        image_channel_indices,
         image_geometry,
         label_geometry,
-        image_content_hash,
+        image_content_hashes,
         label_content_hash,
     ))
     .map_err(|source| CacheError::json(PathBuf::from("<case-source-hash>"), source))?;
@@ -746,7 +864,7 @@ mod tests {
     };
 
     use medkit_dataset::{
-        CaseManifest, CaseStatus, DatasetLayout, DatasetManifest, ValidationSummary,
+        CaseImage, CaseManifest, CaseStatus, DatasetLayout, DatasetManifest, ValidationSummary,
     };
     use medkit_transform::Volume3D;
 
@@ -872,6 +990,8 @@ mod tests {
         assert_eq!(cached.label_chunk_cache_sha256.as_ref().unwrap().len(), 64);
         assert_eq!(cached.image_path, path_text(&image_path));
         assert_eq!(cached.label_path, path_text(&label_path));
+        assert_eq!(cached.image_paths, vec![path_text(&image_path)]);
+        assert_eq!(cached.image_channel_count, 1);
         assert_eq!(cached.source_geometry.spacing, [1.0, 1.0, 1.0]);
         assert!(cached
             .source_geometry
@@ -956,6 +1076,101 @@ mod tests {
             manifest_path: manifest_path.clone(),
             plan_path: plan_path.clone(),
             cache_dir: root.join("cache-changed"),
+            chunk_shape: Some([2, 2, 2]),
+        })
+        .unwrap();
+        assert_ne!(
+            changed_manifest.cases[0].source_metadata_hash,
+            original_source_hash
+        );
+        assert_ne!(changed_manifest.cases[0].cache_key, original_cache_key);
+    }
+
+    #[test]
+    fn prepare_cache_stacks_structured_image_channels() {
+        let root = temp_dir("prepare-multi-channel");
+        let image0_path = root.join("case_multi_0000.nii");
+        let image1_path = root.join("case_multi_0001.nii");
+        let label_path = root.join("case_multi.nii");
+        let manifest_path = root.join("manifest.json");
+        let plan_path = root.join("plan.toml");
+        let cache_dir = root.join("cache");
+
+        fs::write(
+            &image0_path,
+            NiftiFixture::new(&[3, 2, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        fs::write(
+            &image1_path,
+            NiftiFixture::new(&[3, 2, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]),
+        )
+        .unwrap();
+        fs::write(
+            &label_path,
+            NiftiFixture::new(&[3, 2, 1], 512, &[1.0, 1.0, 1.0])
+                .append_u16_pixels(&[0, 1, 0, 2, 0, 3]),
+        )
+        .unwrap();
+        write_plan(&plan_path, identity_plan());
+        write_manifest(
+            &manifest_path,
+            &root,
+            vec![multi_channel_case(
+                "case_multi",
+                &[&image0_path, &image1_path],
+                &label_path,
+            )],
+        );
+
+        let manifest = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path: manifest_path.clone(),
+            plan_path: plan_path.clone(),
+            cache_dir: cache_dir.clone(),
+            chunk_shape: Some([2, 2, 2]),
+        })
+        .unwrap();
+        let cached = &manifest.cases[0];
+
+        assert_eq!(cached.image_channel_count, 2);
+        assert_eq!(
+            cached.image_paths,
+            vec![path_text(&image0_path), path_text(&image1_path)]
+        );
+        assert_eq!(cached.image_path, path_text(&image0_path));
+        assert_eq!(cached.shape, [3, 2, 1]);
+        assert_eq!(cached.chunk_shape, [2, 2, 1]);
+        assert_eq!(cached.chunk_grid, Some([2, 1, 1]));
+        assert_eq!(cached.bytes_written, 260);
+        assert_eq!(
+            read_f32_values(Path::new(&cached.image_cache_path)),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+        );
+        assert_eq!(
+            read_f32_values(Path::new(cached.image_chunk_cache_path.as_ref().unwrap())),
+            vec![
+                1.0, 2.0, 4.0, 5.0, 3.0, 0.0, 6.0, 0.0, 10.0, 20.0, 40.0, 50.0, 30.0, 0.0, 60.0,
+                0.0
+            ]
+        );
+        assert_eq!(crate::validate_cache(&cache_dir).unwrap().status, "ok");
+
+        let original_source_hash = cached.source_metadata_hash.clone();
+        let original_cache_key = cached.cache_key.clone();
+        fs::write(
+            &image1_path,
+            NiftiFixture::new(&[3, 2, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[10.0, 99.0, 30.0, 40.0, 50.0, 60.0]),
+        )
+        .unwrap();
+        let changed_manifest = prepare_cache(&PrepareConfig {
+            dataset_root: root,
+            manifest_path,
+            plan_path,
+            cache_dir: cache_dir.join("changed"),
             chunk_shape: Some([2, 2, 2]),
         })
         .unwrap();
@@ -1327,6 +1542,21 @@ mod tests {
             label: None,
             problems: Vec::new(),
         }
+    }
+
+    fn multi_channel_case(case_id: &str, image_paths: &[&Path], label_path: &Path) -> CaseManifest {
+        let mut case = valid_case(case_id, image_paths.first().copied(), Some(label_path));
+        case.images = image_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| CaseImage {
+                path: path_text(path),
+                channel_index: Some(index as u16),
+                modality: None,
+                image: None,
+            })
+            .collect();
+        case
     }
 
     fn invalid_case(case_id: &str) -> CaseManifest {

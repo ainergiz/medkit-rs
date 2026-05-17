@@ -11,6 +11,8 @@ from .dataset import (
 )
 from . import cxr
 
+__version__ = "0.1.0a1"
+
 __all__ = [
     "MedkitCxrNativeBatchIterableDataset",
     "MedkitCxrNativePrefetchDataset",
@@ -19,5 +21,6 @@ __all__ = [
     "MedkitPatchDataset",
     "MedkitPatchIterableDataset",
     "MedkitViewBatchIterableDataset",
+    "__version__",
     "cxr",
 ]

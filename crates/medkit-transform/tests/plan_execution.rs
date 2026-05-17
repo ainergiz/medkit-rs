@@ -115,6 +115,49 @@ op = "z_score_normalize"
     assert_values_close(&z_scored, &[-1.3416407, -0.4472136, 0.4472136, 1.3416407]);
 }
 
+#[test]
+fn channel_plan_applies_shared_geometry_and_per_channel_intensity() {
+    let plan = TransformPlan::from_toml_str(
+        r#"
+name = "channel-test"
+image_interpolation = "nearest"
+label_interpolation = "nearest"
+
+[[operations]]
+op = "min_max_normalize"
+
+[[operations]]
+op = "crop_foreground"
+margin = 0
+"#,
+    )
+    .unwrap();
+    let channel0 = Volume3D::new([3, 2, 1], vec![0.0, 5.0, 10.0, 20.0, 25.0, 30.0]).unwrap();
+    let channel1 =
+        Volume3D::new([3, 2, 1], vec![100.0, 105.0, 110.0, 120.0, 125.0, 130.0]).unwrap();
+    let label = Volume3D::new([3, 2, 1], vec![0_u16, 1, 0, 0, 0, 2]).unwrap();
+    let geometry = VolumeGeometry::identity([3, 2, 1], [1.0, 1.0, 1.0]).unwrap();
+
+    let prepared = plan
+        .apply_channels_with_geometry(vec![channel0, channel1], label, geometry)
+        .unwrap();
+
+    assert_eq!(prepared.images.len(), 2);
+    assert_eq!(prepared.images[0].shape, [2, 2, 1]);
+    assert_eq!(prepared.images[1].shape, [2, 2, 1]);
+    assert_eq!(prepared.label.shape, [2, 2, 1]);
+    assert_eq!(prepared.crop_origin, [1, 0, 0]);
+    assert_eq!(prepared.label.data, vec![1, 0, 0, 2]);
+    assert_values_close(
+        &prepared.images[0].data,
+        &[0.16666667, 0.33333334, 0.8333333, 1.0],
+    );
+    assert_values_close(
+        &prepared.images[1].data,
+        &[0.16666667, 0.33333334, 0.8333333, 1.0],
+    );
+}
+
 fn apply_intensity_ops(operations: &str) -> Vec<f32> {
     let plan = TransformPlan::from_toml_str(&format!(
         r#"

@@ -168,6 +168,29 @@ def test_patch_dataset_reads_memmaps_metadata_and_state(
         ds.MedkitPatchDataset(cache, patches, length=0)
 
 
+def test_patch_dataset_reads_multichannel_memmap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ds = reload_dataset_module(monkeypatch)
+    cache, patches = write_patch_fixture(tmp_path)
+    stacked = np.concatenate(
+        [
+            np.arange(8, dtype="<f4"),
+            np.arange(8, dtype="<f4") + 100.0,
+        ]
+    )
+    stacked.tofile(cache / "image.raw")
+    manifest = json.loads((cache / "cache_manifest.json").read_text())
+    manifest["cases"][0]["image_channel_count"] = 2
+    (cache / "cache_manifest.json").write_text(json.dumps(manifest))
+
+    sample = ds.MedkitPatchDataset(cache, patches)[0]
+
+    assert sample["image"].shape == (2, 2, 2, 1)
+    assert sample["label"].shape == (1, 2, 2, 1)
+    assert sample["image"].data[1, 0, 0, 0] == 100.0
+
+
 def test_patch_iterable_shards_by_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -188,6 +211,7 @@ def test_patch_iterable_shards_by_worker(
 
 class FakeFfi:
     records = 3
+    channels = 1
     fill_return: int | None = None
     freed: list[int] = []
 
@@ -210,6 +234,9 @@ class FakeFfi:
     def patch_z(self, handle: int) -> int:
         return 4
 
+    def image_channels(self, handle: int) -> int:
+        return self.channels
+
     def fill_batch(self, handle: int | None, start: int, batch_size: int, image: Any, label: Any) -> int:
         self.calls.append((start, batch_size))
         return self.fill_return if self.fill_return is not None else batch_size
@@ -224,6 +251,7 @@ def test_ffi_batch_iterable_opens_batches_and_reopens_after_pickle(
     ds = reload_dataset_module(monkeypatch)
     monkeypatch.setattr(ds, "_MedkitFfi", FakeFfi)
     FakeFfi.records = 3
+    FakeFfi.channels = 2
     FakeFfi.fill_return = None
     FakeFfi.freed = []
 
@@ -233,7 +261,7 @@ def test_ffi_batch_iterable_opens_batches_and_reopens_after_pickle(
 
     batches = list(dataset)
     assert len(dataset) == 3
-    assert batches[0]["image"].shape == (2, 1, 4, 3, 2)
+    assert batches[0]["image"].shape == (2, 2, 4, 3, 2)
     assert batches[1]["label"].shape == (1, 1, 4, 3, 2)
     assert dataset.__getstate__()["_handle"] is None
     assert dataset.__getstate__()["_ffi"] is None
@@ -257,6 +285,7 @@ def test_ffi_batch_iterable_worker_shard_and_short_write(
     ds = reload_dataset_module(monkeypatch, worker)
     monkeypatch.setattr(ds, "_MedkitFfi", FakeFfi)
     FakeFfi.records = 6
+    FakeFfi.channels = 1
     FakeFfi.fill_return = 1
 
     dataset = ds.MedkitFfiBatchIterableDataset(
@@ -275,6 +304,7 @@ def test_ffi_batch_iterable_reports_zero_writes(
     ds = reload_dataset_module(monkeypatch)
     monkeypatch.setattr(ds, "_MedkitFfi", FakeFfi)
     FakeFfi.records = 2
+    FakeFfi.channels = 1
     FakeFfi.fill_return = 0
 
     dataset = ds.MedkitFfiBatchIterableDataset(
@@ -596,6 +626,7 @@ class FakeCLib:
         self.medkit_dataset_patch_x = FakeCFunc(2)
         self.medkit_dataset_patch_y = FakeCFunc(3)
         self.medkit_dataset_patch_z = FakeCFunc(4)
+        self.medkit_dataset_image_channels = FakeCFunc(2)
         self.medkit_dataset_fill_batch = FakeCFunc(0)
         self.medkit_dataset_fill_batch_f32_labels = FakeCFunc(2)
 
@@ -614,6 +645,7 @@ def test_ctypes_ffi_wrapper_configures_and_calls_library(
     assert ffi.patch_x(88) == 2
     assert ffi.patch_y(88) == 3
     assert ffi.patch_z(88) == 4
+    assert ffi.image_channels(88) == 2
     array = np.zeros((2,), dtype=np.float32)
     assert ffi.fill_batch(88, 1, 2, array, array) == 2
     ffi.free(88)

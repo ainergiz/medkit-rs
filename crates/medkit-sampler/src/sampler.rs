@@ -89,8 +89,8 @@ pub struct BatchPlan {
 pub struct LoadedCachedCase {
     /// Cached case metadata.
     pub metadata: CachedCase,
-    /// Cached image volume.
-    pub image: Volume3D<f32>,
+    /// Cached image volume with channel-major storage.
+    pub image: CachedImageVolume,
     /// Cached label volume.
     pub label: Volume3D<u16>,
     /// Flat indices of non-zero label voxels.
@@ -106,6 +106,8 @@ pub struct MmapCachedCase {
     pub metadata: CachedCase,
     /// Cached volume shape in x, y, z order.
     pub shape: [usize; 3],
+    /// Number of image channels.
+    pub image_channel_count: usize,
     image_mmap: Mmap,
     label_mmap: Mmap,
 }
@@ -117,6 +119,8 @@ pub struct ChunkedCachedCase {
     pub metadata: CachedCase,
     /// Cached volume shape in x, y, z order.
     pub shape: [usize; 3],
+    /// Number of image channels.
+    pub image_channel_count: usize,
     /// Fixed chunk shape in x, y, z order.
     pub chunk_shape: [usize; 3],
     /// Chunk grid in x, y, z order.
@@ -133,11 +137,61 @@ struct SamplingCase {
     foreground_prefix: ForegroundPrefix,
 }
 
+/// Cached image values with channel-major `[C, Z, Y, X]` storage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedImageVolume {
+    /// Spatial shape in x, y, z order.
+    pub shape: [usize; 3],
+    /// Number of image channels.
+    pub channels: usize,
+    /// Contiguous channel-major image values.
+    pub data: Vec<f32>,
+}
+
+impl CachedImageVolume {
+    /// Builds an image volume and validates channel/data length.
+    pub fn new(shape: [usize; 3], channels: usize, data: Vec<f32>) -> Result<Self> {
+        if channels == 0 {
+            return Err(SamplerError::invalid_input(
+                "image channel count must be greater than zero",
+            ));
+        }
+        let expected = value_count(shape)?
+            .checked_mul(channels)
+            .ok_or_else(|| SamplerError::invalid_input("image value count overflow"))?;
+        if data.len() != expected {
+            return Err(SamplerError::invalid_input(format!(
+                "image volume for shape {shape:?} and {channels} channel(s) has {} values, expected {expected}",
+                data.len()
+            )));
+        }
+        Ok(Self {
+            shape,
+            channels,
+            data,
+        })
+    }
+
+    /// Returns the flat index for a channel/spatial coordinate.
+    pub fn index(&self, channel: usize, x: usize, y: usize, z: usize) -> usize {
+        channel * self.spatial_voxels() + flat_index(self.shape, x, y, z)
+    }
+
+    /// Returns a shared image value reference.
+    pub fn get(&self, channel: usize, x: usize, y: usize, z: usize) -> &f32 {
+        &self.data[self.index(channel, x, y, z)]
+    }
+
+    fn spatial_voxels(&self) -> usize {
+        self.shape[0] * self.shape[1] * self.shape[2]
+    }
+}
+
 /// Aligned image/label patch payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedPatch {
-    /// Patch image values.
-    pub image: Volume3D<f32>,
+    /// Patch image values with channel-major storage.
+    pub image: CachedImageVolume,
     /// Patch label values.
     pub label: Volume3D<u16>,
     /// Whether the patch contains non-zero labels.
@@ -239,12 +293,13 @@ pub fn extract_patch_pair(
     validate_patch(patch_size)?;
     validate_patch_start(case.image.shape, start, patch_size)?;
     let voxels = patch_voxels(patch_size);
-    let mut image = vec![0.0; voxels];
+    let mut image = vec![0.0; voxels * case.image.channels];
     let mut label = vec![0; voxels];
     let has_foreground = extract_patch_pair_into(case, start, patch_size, &mut image, &mut label)?;
     Ok(CachedPatch {
-        image: Volume3D {
+        image: CachedImageVolume {
             shape: patch_size,
+            channels: case.image.channels,
             data: image,
         },
         label: Volume3D {
@@ -266,9 +321,10 @@ pub fn extract_patch_pair_into(
     validate_patch(patch_size)?;
     validate_patch_start(case.image.shape, start, patch_size)?;
     let voxels = patch_voxels(patch_size);
-    if image_out.len() != voxels {
+    let expected_image = voxels * case.image.channels;
+    if image_out.len() != expected_image {
         return Err(SamplerError::invalid_input(format!(
-            "image output buffer has {} values, expected {voxels}",
+            "image output buffer has {} values, expected {expected_image}",
             image_out.len()
         )));
     }
@@ -278,7 +334,7 @@ pub fn extract_patch_pair_into(
             label_out.len()
         )));
     }
-    copy_patch_rows(&case.image, start, patch_size, image_out);
+    copy_image_patch_rows(&case.image, start, patch_size, image_out);
     copy_patch_rows(&case.label, start, patch_size, label_out);
     Ok(case.foreground_prefix.count_unchecked(start, patch_size) != 0)
 }
@@ -293,22 +349,37 @@ pub fn extract_patch_pair_mmap_into(
 ) -> Result<bool> {
     validate_patch_outputs(
         case.shape,
+        case.image_channel_count,
         start,
         patch_size,
         image_out.len(),
         label_out.len(),
     )?;
+    let spatial_voxels = value_count(case.shape)?;
+    let patch_voxels = patch_voxels(patch_size);
+    for channel in 0..case.image_channel_count {
+        for local_z in 0..patch_size[2] {
+            let source_z = start[2] + local_z;
+            for local_y in 0..patch_size[1] {
+                let source_y = start[1] + local_y;
+                let source_start =
+                    channel * spatial_voxels + flat_index(case.shape, start[0], source_y, source_z);
+                let destination_start =
+                    channel * patch_voxels + patch_size[0] * (local_y + patch_size[1] * local_z);
+                read_f32_values_from_mmap(
+                    &case.image_mmap,
+                    source_start,
+                    &mut image_out[destination_start..destination_start + patch_size[0]],
+                )?;
+            }
+        }
+    }
     for local_z in 0..patch_size[2] {
         let source_z = start[2] + local_z;
         for local_y in 0..patch_size[1] {
             let source_y = start[1] + local_y;
             let source_start = flat_index(case.shape, start[0], source_y, source_z);
             let destination_start = patch_size[0] * (local_y + patch_size[1] * local_z);
-            read_f32_values_from_mmap(
-                &case.image_mmap,
-                source_start,
-                &mut image_out[destination_start..destination_start + patch_size[0]],
-            )?;
             read_u16_values_from_mmap(
                 &case.label_mmap,
                 source_start,
@@ -329,6 +400,7 @@ pub fn extract_patch_pair_chunked_into(
 ) -> Result<bool> {
     validate_patch_outputs(
         case.shape,
+        case.image_channel_count,
         start,
         patch_size,
         image_out.len(),
@@ -443,7 +515,11 @@ fn load_sampling_case(case: &CachedCase) -> Result<SamplingCase> {
 }
 
 fn load_case(case: &CachedCase) -> Result<LoadedCachedCase> {
-    let image = read_f32_volume(Path::new(&case.image_cache_path), case.shape)?;
+    let image = read_f32_image_volume(
+        Path::new(&case.image_cache_path),
+        case.shape,
+        case.image_channel_count,
+    )?;
     let label = read_u16_volume(Path::new(&case.label_cache_path), case.shape)?;
     let (foreground_indices, foreground_prefix) = if has_foreground_artifacts(case) {
         read_foreground_artifacts(case)?
@@ -464,11 +540,15 @@ fn load_mmap_case(case: &CachedCase) -> Result<MmapCachedCase> {
     let label_path = Path::new(&case.label_cache_path);
     let image_mmap = mmap_file(image_path)?;
     let label_mmap = mmap_file(label_path)?;
-    validate_mmap_len(image_path, &image_mmap, value_count(case.shape)?, 4)?;
+    let image_values = value_count(case.shape)?
+        .checked_mul(case.image_channel_count.max(1))
+        .ok_or_else(|| SamplerError::invalid_input("image mmap value count overflow"))?;
+    validate_mmap_len(image_path, &image_mmap, image_values, 4)?;
     validate_mmap_len(label_path, &label_mmap, value_count(case.shape)?, 2)?;
     Ok(MmapCachedCase {
         metadata: case.clone(),
         shape: case.shape,
+        image_channel_count: case.image_channel_count.max(1),
         image_mmap,
         label_mmap,
     })
@@ -491,11 +571,15 @@ fn load_chunked_case(case: &CachedCase) -> Result<ChunkedCachedCase> {
     let chunk_values = value_count(chunk_grid)?
         .checked_mul(value_count(case.chunk_shape)?)
         .ok_or_else(|| SamplerError::invalid_input("chunked value count overflow"))?;
-    validate_mmap_len(image_path, &image_mmap, chunk_values, 4)?;
+    let image_chunk_values = chunk_values
+        .checked_mul(case.image_channel_count.max(1))
+        .ok_or_else(|| SamplerError::invalid_input("chunked image value count overflow"))?;
+    validate_mmap_len(image_path, &image_mmap, image_chunk_values, 4)?;
     validate_mmap_len(label_path, &label_mmap, chunk_values, 2)?;
     Ok(ChunkedCachedCase {
         metadata: case.clone(),
         shape: case.shape,
+        image_channel_count: case.image_channel_count.max(1),
         chunk_shape: case.chunk_shape,
         chunk_grid,
         image_mmap,
@@ -583,7 +667,11 @@ impl ForegroundPrefix {
     }
 }
 
-fn read_f32_volume(path: &Path, shape: [usize; 3]) -> Result<Volume3D<f32>> {
+fn read_f32_image_volume(
+    path: &Path,
+    shape: [usize; 3],
+    image_channel_count: usize,
+) -> Result<CachedImageVolume> {
     let bytes = fs::read(path).map_err(|source| SamplerError::io(path, source))?;
     if bytes.len() % 4 != 0 {
         return Err(SamplerError::invalid_input(format!(
@@ -596,7 +684,7 @@ fn read_f32_volume(path: &Path, shape: [usize; 3]) -> Result<Volume3D<f32>> {
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunk length")))
         .collect();
-    Volume3D::new(shape, values)
+    CachedImageVolume::new(shape, image_channel_count.max(1), values)
         .map_err(|error| SamplerError::invalid_input(format!("invalid cached image: {error}")))
 }
 
@@ -686,6 +774,31 @@ fn read_u32_values(path: &Path) -> Result<Vec<u32>> {
         .collect())
 }
 
+fn copy_image_patch_rows(
+    image: &CachedImageVolume,
+    start: [usize; 3],
+    patch_size: [usize; 3],
+    out: &mut [f32],
+) {
+    let row = patch_size[0];
+    let patch_voxels = patch_voxels(patch_size);
+    let source_channel_stride = image.spatial_voxels();
+    for channel in 0..image.channels {
+        for local_z in 0..patch_size[2] {
+            let source_z = start[2] + local_z;
+            for local_y in 0..patch_size[1] {
+                let source_y = start[1] + local_y;
+                let source_start = channel * source_channel_stride
+                    + flat_index(image.shape, start[0], source_y, source_z);
+                let destination_start =
+                    channel * patch_voxels + row * (local_y + patch_size[1] * local_z);
+                out[destination_start..destination_start + row]
+                    .copy_from_slice(&image.data[source_start..source_start + row]);
+            }
+        }
+    }
+}
+
 fn copy_patch_rows<T: Copy>(
     volume: &Volume3D<T>,
     start: [usize; 3],
@@ -741,6 +854,11 @@ fn copy_chunk_overlap_from_mmap(
         return Ok(());
     }
     let row = overlap_end[0] - overlap_start[0];
+    let patch_values = patch_voxels(patch_size);
+    let chunk_values_per_channel = case.chunk_grid[0]
+        * case.chunk_grid[1]
+        * case.chunk_grid[2]
+        * patch_voxels(case.chunk_shape);
     for z in overlap_start[2]..overlap_end[2] {
         for y in overlap_start[1]..overlap_end[1] {
             let chunk_source = (overlap_start[0] - chunk_start[0])
@@ -748,11 +866,16 @@ fn copy_chunk_overlap_from_mmap(
                     * ((y - chunk_start[1]) + case.chunk_shape[1] * (z - chunk_start[2]));
             let patch_dest = (overlap_start[0] - patch_start[0])
                 + patch_size[0] * ((y - patch_start[1]) + patch_size[1] * (z - patch_start[2]));
-            read_f32_values_from_mmap(
-                &case.image_mmap,
-                chunk_value_offset + chunk_source,
-                &mut image_out[patch_dest..patch_dest + row],
-            )?;
+            for channel in 0..case.image_channel_count {
+                let image_chunk_offset =
+                    channel * chunk_values_per_channel + chunk_value_offset + chunk_source;
+                let image_patch_dest = channel * patch_values + patch_dest;
+                read_f32_values_from_mmap(
+                    &case.image_mmap,
+                    image_chunk_offset,
+                    &mut image_out[image_patch_dest..image_patch_dest + row],
+                )?;
+            }
             read_u16_values_from_mmap(
                 &case.label_mmap,
                 chunk_value_offset + chunk_source,
@@ -826,6 +949,7 @@ fn validate_mmap_len(
 
 fn validate_patch_outputs(
     shape: [usize; 3],
+    image_channel_count: usize,
     start: [usize; 3],
     patch_size: [usize; 3],
     image_len: usize,
@@ -834,9 +958,10 @@ fn validate_patch_outputs(
     validate_patch(patch_size)?;
     validate_patch_start(shape, start, patch_size)?;
     let voxels = patch_voxels(patch_size);
-    if image_len != voxels {
+    let expected_image = voxels * image_channel_count.max(1);
+    if image_len != expected_image {
         return Err(SamplerError::invalid_input(format!(
-            "image output buffer has {image_len} values, expected {voxels}"
+            "image output buffer has {image_len} values, expected {expected_image}"
         )));
     }
     if label_len != voxels {

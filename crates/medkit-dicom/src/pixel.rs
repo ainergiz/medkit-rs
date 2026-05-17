@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -6,8 +6,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     parser::DicomDataSet,
     types::{
-        EXPLICIT_VR_BIG_ENDIAN, EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN,
-        JPEG_BASELINE_8BIT, RLE_LOSSLESS,
+        is_dicom_rs_transfer_syntax, is_native_transfer_syntax, JPEG_BASELINE_8BIT, RLE_LOSSLESS,
     },
     DicomError, Result,
 };
@@ -42,6 +41,7 @@ pub struct DicomPresentationOptions {
     pub apply_rescale: bool,
     pub voi: DicomVoiStrategy,
     pub invert_monochrome1: bool,
+    pub decoder: DicomDecoderSelection,
 }
 
 impl Default for DicomPresentationOptions {
@@ -50,6 +50,46 @@ impl Default for DicomPresentationOptions {
             apply_rescale: true,
             voi: DicomVoiStrategy::Auto,
             invert_monochrome1: true,
+            decoder: DicomDecoderSelection::Native,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DicomDecoderSelection {
+    #[default]
+    Native,
+    DicomRs,
+    Auto,
+}
+
+impl DicomDecoderSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "medkit-native",
+            Self::DicomRs => "dicom-rs",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl std::fmt::Display for DicomDecoderSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DicomDecoderSelection {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "medkit-native" | "native" => Ok(Self::Native),
+            "dicom-rs" | "dicom_rs" | "external" => Ok(Self::DicomRs),
+            "auto" => Ok(Self::Auto),
+            other => Err(format!(
+                "unsupported DICOM decoder backend {other:?}; expected medkit-native, dicom-rs, or auto"
+            )),
         }
     }
 }
@@ -96,14 +136,7 @@ impl DecoderBackend for NativeDecoderBackend {
     }
 
     fn supports_transfer_syntax(&self, transfer_syntax_uid: &str) -> bool {
-        matches!(
-            transfer_syntax_uid,
-            EXPLICIT_VR_LITTLE_ENDIAN
-                | IMPLICIT_VR_LITTLE_ENDIAN
-                | EXPLICIT_VR_BIG_ENDIAN
-                | RLE_LOSSLESS
-                | JPEG_BASELINE_8BIT
-        )
+        is_native_transfer_syntax(transfer_syntax_uid)
     }
 
     fn decode_pixels(
@@ -224,6 +257,95 @@ impl DecoderBackend for NativeDecoderBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DicomRsDecoderBackend;
+
+impl DecoderBackend for DicomRsDecoderBackend {
+    fn name(&self) -> &'static str {
+        "dicom-rs"
+    }
+
+    fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn supports_transfer_syntax(&self, transfer_syntax_uid: &str) -> bool {
+        is_dicom_rs_transfer_syntax(transfer_syntax_uid)
+    }
+
+    fn decode_pixels(
+        &self,
+        dataset: &DicomDataSet,
+        expected_bytes: usize,
+    ) -> Result<DecodedPixelData> {
+        #[cfg(not(feature = "dicom-rs-codecs"))]
+        {
+            let _ = expected_bytes;
+            return Err(DicomError::unsupported(
+                &dataset.path,
+                "DICOM-rs decoder backend requested but medkit-dicom was built without the dicom-rs-codecs feature",
+            ));
+        }
+
+        #[cfg(feature = "dicom-rs-codecs")]
+        {
+            use dicom_pixeldata::PixelDecoder;
+
+            if !self.supports_transfer_syntax(&dataset.transfer_syntax_uid) {
+                return Err(DicomError::unsupported(
+                    &dataset.path,
+                    format!(
+                        "DICOM-rs decoder backend does not support transfer syntax {} with the enabled medkit-dicom features",
+                        dataset.transfer_syntax_uid
+                    ),
+                ));
+            }
+            let pixel_data = dataset
+                .element((0x7FE0, 0x0010))
+                .ok_or_else(|| DicomError::parse(&dataset.path, "missing PixelData"))?;
+            let source_pixel_hash = sha256_hex(pixel_data);
+            let object = dicom_object::open_file(&dataset.path).map_err(|error| {
+                DicomError::parse(
+                    &dataset.path,
+                    format!("DICOM-rs failed to read object: {error}"),
+                )
+            })?;
+            let decoded = object.decode_pixel_data().map_err(|error| {
+                DicomError::unsupported(
+                    &dataset.path,
+                    format!(
+                        "DICOM-rs failed to decode PixelData for transfer syntax {}: {error}",
+                        dataset.transfer_syntax_uid
+                    ),
+                )
+            })?;
+            let bytes = decoded.data().to_vec();
+            if bytes.len() != expected_bytes {
+                return Err(DicomError::parse(
+                    &dataset.path,
+                    format!(
+                        "DICOM-rs decoded PixelData length mismatch: expected {expected_bytes} bytes, got {}",
+                        bytes.len()
+                    ),
+                ));
+            }
+            Ok(DecodedPixelData {
+                bytes,
+                source_pixel_hash,
+                backend: self.name().to_string(),
+                backend_version: self.version().to_string(),
+                compressed: !crate::types::is_uncompressed_transfer_syntax(
+                    &dataset.transfer_syntax_uid,
+                ),
+                steps: vec![
+                    format!("decode transfer syntax {}", dataset.transfer_syntax_uid),
+                    "decode PixelData with DICOM-rs".to_string(),
+                ],
+            })
+        }
+    }
+}
+
 pub fn explain_pixels(path: impl AsRef<Path>) -> Result<PixelExplanation> {
     Ok(present_dicom_pixels(path)?.explanation)
 }
@@ -238,7 +360,7 @@ pub fn present_dicom_pixels_with_options(
     options: DicomPresentationOptions,
 ) -> Result<PresentedImage> {
     let dataset = DicomDataSet::from_file(path.as_ref())?;
-    present_dataset_pixels_with_backend_and_options(&dataset, &NativeDecoderBackend, options)
+    present_dataset_pixels_with_options(&dataset, options)
 }
 
 pub fn present_dicom_pixels_with_backend(
@@ -257,6 +379,23 @@ pub(crate) fn present_dataset_pixels(dataset: &DicomDataSet) -> Result<Presented
     present_dataset_pixels_with_backend(dataset, &NativeDecoderBackend)
 }
 
+pub(crate) fn present_dataset_pixels_with_options(
+    dataset: &DicomDataSet,
+    options: DicomPresentationOptions,
+) -> Result<PresentedImage> {
+    match options.decoder {
+        DicomDecoderSelection::Native => {
+            present_dataset_pixels_with_backend_and_options(dataset, &NativeDecoderBackend, options)
+        }
+        DicomDecoderSelection::DicomRs => present_dataset_pixels_with_backend_and_options(
+            dataset,
+            &DicomRsDecoderBackend,
+            options,
+        ),
+        DicomDecoderSelection::Auto => present_dataset_pixels_with_auto_backend(dataset, options),
+    }
+}
+
 pub(crate) fn present_dataset_pixels_with_backend(
     dataset: &DicomDataSet,
     backend: &dyn DecoderBackend,
@@ -266,6 +405,33 @@ pub(crate) fn present_dataset_pixels_with_backend(
         backend,
         DicomPresentationOptions::default(),
     )
+}
+
+fn present_dataset_pixels_with_auto_backend(
+    dataset: &DicomDataSet,
+    options: DicomPresentationOptions,
+) -> Result<PresentedImage> {
+    if NativeDecoderBackend.supports_transfer_syntax(&dataset.transfer_syntax_uid) {
+        return present_dataset_pixels_with_backend_and_options(
+            dataset,
+            &NativeDecoderBackend,
+            options,
+        );
+    }
+    if DicomRsDecoderBackend.supports_transfer_syntax(&dataset.transfer_syntax_uid) {
+        return present_dataset_pixels_with_backend_and_options(
+            dataset,
+            &DicomRsDecoderBackend,
+            options,
+        );
+    }
+    Err(DicomError::unsupported(
+        &dataset.path,
+        format!(
+            "unsupported transfer syntax {} for automatic DICOM decoder selection",
+            dataset.transfer_syntax_uid
+        ),
+    ))
 }
 
 pub(crate) fn present_dataset_pixels_with_backend_and_options(

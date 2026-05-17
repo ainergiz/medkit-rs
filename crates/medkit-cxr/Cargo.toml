@@ -3,13 +3,19 @@ name = "medkit-cxr"
 version = "0.1.0"
 description = "Chest X-ray manifest, validation, split, and cache utilities for medkit-rs."
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
 [lib]
 name = "medkit_cxr"
 path = "src/lib.rs"
+
+[features]
+default = []
+dicom-rs-codecs = ["medkit-dicom/dicom-rs-codecs"]
 
 [dependencies]
 csv.workspace = true

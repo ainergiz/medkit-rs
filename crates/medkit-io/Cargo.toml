@@ -3,7 +3,9 @@ name = "medkit-io"
 version = "0.1.0"
 description = "Medical image metadata IO adapters for medkit-rs."
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
@@ -14,4 +16,3 @@ path = "src/lib.rs"
 [dependencies]
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 medkit-core = { path = "../medkit-core" }
-

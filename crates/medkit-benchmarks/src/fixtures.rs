@@ -546,6 +546,7 @@ pub fn synthetic_volume_pair(
 /// Creates an in-memory loaded cached case for sampler benchmarks.
 pub fn synthetic_loaded_case(shape: [usize; 3]) -> Result<LoadedCachedCase> {
     let (image, label, geometry) = synthetic_volume_pair(shape, [1.0, 1.0, 1.0], 0)?;
+    let image = medkit_sampler::CachedImageVolume::new(shape, 1, image.data)?;
     let foreground_indices: Vec<usize> = label
         .data
         .iter()
@@ -560,6 +561,8 @@ pub fn synthetic_loaded_case(shape: [usize; 3]) -> Result<LoadedCachedCase> {
             source_metadata_hash: "source".to_string(),
             transform_plan_hash: "plan".to_string(),
             image_path: "image.nii".to_string(),
+            image_paths: vec!["image.nii".to_string()],
+            image_channel_count: 1,
             label_path: "label.nii".to_string(),
             source_geometry: geometry,
             output_geometry: geometry,

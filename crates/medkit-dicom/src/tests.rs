@@ -7,6 +7,7 @@ use crate::{
     parser::DicomDataSet,
     pixel::{
         explain_pixels, present_dicom_pixels, present_dicom_pixels_with_backend,
+        present_dicom_pixels_with_options, DicomDecoderSelection, DicomPresentationOptions,
         NativeDecoderBackend,
     },
     scan::write_scan_outputs,
@@ -322,6 +323,66 @@ fn jpeg_baseline_fixture_decodes_through_native_backend() {
 }
 
 #[test]
+fn decoder_selection_defaults_to_native_and_auto_prefers_native() {
+    let root = unique_test_dir();
+    let path = root.join("native.dcm");
+    write_fixture(
+        &path,
+        FixtureSpec {
+            pixels: vec![0, 64, 128, 255],
+            ..FixtureSpec::default()
+        },
+    );
+
+    let default =
+        present_dicom_pixels_with_options(&path, DicomPresentationOptions::default()).unwrap();
+    assert_eq!(default.explanation.decoder_backend, "medkit-native");
+
+    let auto = present_dicom_pixels_with_options(
+        &path,
+        DicomPresentationOptions {
+            decoder: DicomDecoderSelection::Auto,
+            ..DicomPresentationOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(auto.explanation.decoder_backend, "medkit-native");
+}
+
+#[test]
+fn explicit_dicom_rs_decoder_is_feature_gated() {
+    let root = unique_test_dir();
+    let path = root.join("external.dcm");
+    write_fixture(
+        &path,
+        FixtureSpec {
+            pixels: vec![0, 64, 128, 255],
+            ..FixtureSpec::default()
+        },
+    );
+    let result = present_dicom_pixels_with_options(
+        &path,
+        DicomPresentationOptions {
+            decoder: DicomDecoderSelection::DicomRs,
+            ..DicomPresentationOptions::default()
+        },
+    );
+
+    #[cfg(feature = "dicom-rs-codecs")]
+    {
+        let image = result.unwrap();
+        assert_eq!(image.pixels.len(), 4);
+        assert_eq!(image.explanation.decoder_backend, "dicom-rs");
+    }
+
+    #[cfg(not(feature = "dicom-rs-codecs"))]
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("dicom-rs-codecs feature"));
+}
+
+#[test]
 fn parallel_scan_is_byte_stable_and_graph_summarizes_duplicates_and_warnings() {
     let root = unique_test_dir();
     write_fixture(
@@ -614,13 +675,44 @@ impl Default for FixtureSpec<'_> {
 fn write_fixture(path: &Path, spec: FixtureSpec<'_>) {
     let mut bytes = vec![0u8; 128];
     bytes.extend_from_slice(b"DICM");
+    let mut meta = Vec::new();
+    push_explicit(&mut meta, (0x0002, 0x0001), "OB", &[0, 1], false);
     push_explicit(
-        &mut bytes,
+        &mut meta,
+        (0x0002, 0x0002),
+        "UI",
+        b"1.2.840.10008.5.1.4.1.1.1.1",
+        false,
+    );
+    push_explicit(
+        &mut meta,
+        (0x0002, 0x0003),
+        "UI",
+        spec.sop_uid.as_bytes(),
+        false,
+    );
+    push_explicit(
+        &mut meta,
         (0x0002, 0x0010),
         "UI",
         spec.transfer_syntax.as_bytes(),
         false,
     );
+    push_explicit(
+        &mut meta,
+        (0x0002, 0x0012),
+        "UI",
+        b"1.2.826.0.1.3680043.10.54321.1",
+        false,
+    );
+    push_explicit(
+        &mut bytes,
+        (0x0002, 0x0000),
+        "UL",
+        &(meta.len() as u32).to_le_bytes(),
+        false,
+    );
+    bytes.extend_from_slice(&meta);
     let implicit = spec.implicit_vr;
     let be = spec.big_endian;
     push_text(

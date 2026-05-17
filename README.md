@@ -68,6 +68,23 @@ cargo run -p medkit-cli -- cxr validate-cache data/cxr/.medkit/cache --split tra
 uv run --with torch examples/cxr_dropin_pytorch_train.py --cache-dir data/cxr/.medkit/cache --batch-size 32
 ```
 
+## DICOM Decoder Policy
+
+The default DICOM pixel backend is `medkit-native`. It keeps normal builds
+small and covers the initial CXR-focused support matrix: uncompressed little and
+big endian, RLE Lossless, and JPEG Baseline.
+
+An opt-in DICOM-rs backend is available for broader pure-Rust codec coverage:
+
+```bash
+cargo test -p medkit-dicom --features dicom-rs-codecs
+cargo run -p medkit-cli --features dicom-rs-codecs -- dicom pixels --explain image.dcm --decoder-backend dicom-rs
+cargo run -p medkit-cli --features dicom-rs-codecs -- cxr cache manifest.jsonl --splits splits.json --plan recipes/cxr-512.toml --cache .medkit/cxr-cache --dicom-decoder-backend auto
+```
+
+Native codec stacks for JPEG-LS or JPEG 2000 are intentionally not enabled for
+the alpha path until real fixtures and packaging tradeoffs are verified.
+
 ## Python Surface
 
 The CXR drop-in API exposes PyTorch-style dataset and loader helpers:

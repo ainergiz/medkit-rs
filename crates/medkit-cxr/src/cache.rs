@@ -1140,10 +1140,15 @@ fn dicom_presentation_options(
             policy.output
         )));
     }
+    let decoder = policy
+        .decoder_backend
+        .parse::<medkit_dicom::DicomDecoderSelection>()
+        .map_err(CxrError::Message)?;
     Ok(medkit_dicom::DicomPresentationOptions {
         apply_rescale: policy.apply_rescale,
         voi,
         invert_monochrome1: policy.invert_monochrome1,
+        decoder,
     })
 }
 

@@ -62,6 +62,8 @@ pub struct RecipePresentationSection {
     pub invert_monochrome1: bool,
     #[serde(default = "default_output")]
     pub output: String,
+    #[serde(default = "default_decoder_backend")]
+    pub decoder_backend: String,
 }
 
 impl Default for RecipePresentationSection {
@@ -71,6 +73,7 @@ impl Default for RecipePresentationSection {
             voi: default_voi(),
             invert_monochrome1: true,
             output: default_output(),
+            decoder_backend: default_decoder_backend(),
         }
     }
 }
@@ -210,6 +213,11 @@ pub fn validate_cxr_dicom_recipe(recipe: &CxrDicomRecipe) -> Result<(), CxrError
             recipe.dicom.unsupported_transfer_syntax
         )));
     }
+    recipe
+        .presentation
+        .decoder_backend
+        .parse::<medkit_dicom::DicomDecoderSelection>()
+        .map_err(CxrError::Message)?;
     let ratio_sum = recipe.split.train + recipe.split.val + recipe.split.test;
     if !ratio_sum.is_finite() || (ratio_sum - 1.0).abs() > 1.0e-6 {
         return Err(CxrError::Message(format!(
@@ -264,7 +272,7 @@ impl CxrDicomRecipe {
             voi: self.presentation.voi.clone(),
             invert_monochrome1: self.presentation.invert_monochrome1,
             output: self.presentation.output.clone(),
-            decoder_backend: "medkit-native".to_string(),
+            decoder_backend: self.presentation.decoder_backend.clone(),
             decoder_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
@@ -316,6 +324,10 @@ fn default_voi() -> String {
 
 fn default_output() -> String {
     "mono8".to_string()
+}
+
+fn default_decoder_backend() -> String {
+    "medkit-native".to_string()
 }
 
 fn default_image_size() -> [usize; 2] {
@@ -396,6 +408,9 @@ test = 0.0
             recipe.presentation_policy().decoder_backend,
             "medkit-native"
         );
+        let mut custom = recipe.clone();
+        custom.presentation.decoder_backend = "auto".to_string();
+        assert_eq!(custom.presentation_policy().decoder_backend, "auto");
         assert_eq!(
             recipe.transfer_syntax_policy().unsupported_transfer_syntax,
             "fail"
@@ -450,6 +465,13 @@ test = 0.0
             .unwrap_err()
             .to_string()
             .contains("unsupported_transfer_syntax"));
+
+        recipe = valid_recipe();
+        recipe.presentation.decoder_backend = "other".to_string();
+        assert!(validate_cxr_dicom_recipe(&recipe)
+            .unwrap_err()
+            .to_string()
+            .contains("decoder backend"));
 
         recipe = valid_recipe();
         recipe.split.train = 0.5;

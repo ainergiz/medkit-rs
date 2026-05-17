@@ -7,6 +7,64 @@ pub const IMPLICIT_VR_LITTLE_ENDIAN: &str = "1.2.840.10008.1.2";
 pub const EXPLICIT_VR_BIG_ENDIAN: &str = "1.2.840.10008.1.2.2";
 pub const RLE_LOSSLESS: &str = "1.2.840.10008.1.2.5";
 pub const JPEG_BASELINE_8BIT: &str = "1.2.840.10008.1.2.4.50";
+pub const JPEG_EXTENDED_12BIT: &str = "1.2.840.10008.1.2.4.51";
+pub const JPEG_LOSSLESS: &str = "1.2.840.10008.1.2.4.57";
+pub const JPEG_LOSSLESS_SV1: &str = "1.2.840.10008.1.2.4.70";
+pub const JPEG_LS_LOSSLESS: &str = "1.2.840.10008.1.2.4.80";
+pub const JPEG_LS_LOSSY: &str = "1.2.840.10008.1.2.4.81";
+pub const JPEG_2000_LOSSLESS: &str = "1.2.840.10008.1.2.4.90";
+pub const JPEG_2000: &str = "1.2.840.10008.1.2.4.91";
+
+pub fn is_native_transfer_syntax(transfer_syntax_uid: &str) -> bool {
+    matches!(
+        transfer_syntax_uid,
+        EXPLICIT_VR_LITTLE_ENDIAN
+            | IMPLICIT_VR_LITTLE_ENDIAN
+            | EXPLICIT_VR_BIG_ENDIAN
+            | RLE_LOSSLESS
+            | JPEG_BASELINE_8BIT
+    )
+}
+
+pub fn is_dicom_rs_transfer_syntax(transfer_syntax_uid: &str) -> bool {
+    if !cfg!(feature = "dicom-rs-codecs") {
+        return false;
+    }
+    matches!(
+        transfer_syntax_uid,
+        EXPLICIT_VR_LITTLE_ENDIAN
+            | IMPLICIT_VR_LITTLE_ENDIAN
+            | EXPLICIT_VR_BIG_ENDIAN
+            | RLE_LOSSLESS
+            | JPEG_BASELINE_8BIT
+            | JPEG_EXTENDED_12BIT
+            | JPEG_LOSSLESS
+            | JPEG_LOSSLESS_SV1
+    )
+}
+
+pub fn is_known_explicit_vr_little_endian_transfer_syntax(transfer_syntax_uid: &str) -> bool {
+    matches!(
+        transfer_syntax_uid,
+        EXPLICIT_VR_LITTLE_ENDIAN
+            | RLE_LOSSLESS
+            | JPEG_BASELINE_8BIT
+            | JPEG_EXTENDED_12BIT
+            | JPEG_LOSSLESS
+            | JPEG_LOSSLESS_SV1
+            | JPEG_LS_LOSSLESS
+            | JPEG_LS_LOSSY
+            | JPEG_2000_LOSSLESS
+            | JPEG_2000
+    )
+}
+
+pub fn is_uncompressed_transfer_syntax(transfer_syntax_uid: &str) -> bool {
+    matches!(
+        transfer_syntax_uid,
+        EXPLICIT_VR_LITTLE_ENDIAN | IMPLICIT_VR_LITTLE_ENDIAN | EXPLICIT_VR_BIG_ENDIAN
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DicomScanConfig {

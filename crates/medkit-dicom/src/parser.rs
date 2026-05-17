@@ -8,8 +8,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     types::{
-        DicomInspectReport, DicomInventoryRecord, DicomWarning, EXPLICIT_VR_BIG_ENDIAN,
-        EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN, JPEG_BASELINE_8BIT, RLE_LOSSLESS,
+        is_dicom_rs_transfer_syntax, is_known_explicit_vr_little_endian_transfer_syntax,
+        is_native_transfer_syntax, DicomInspectReport, DicomInventoryRecord, DicomWarning,
+        EXPLICIT_VR_BIG_ENDIAN, EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN,
     },
     DicomError, Result,
 };
@@ -283,14 +284,8 @@ impl DicomDataSet {
     }
 
     pub fn is_supported_transfer_syntax(&self) -> bool {
-        matches!(
-            self.transfer_syntax_uid.as_str(),
-            EXPLICIT_VR_LITTLE_ENDIAN
-                | IMPLICIT_VR_LITTLE_ENDIAN
-                | EXPLICIT_VR_BIG_ENDIAN
-                | RLE_LOSSLESS
-                | JPEG_BASELINE_8BIT
-        )
+        is_native_transfer_syntax(&self.transfer_syntax_uid)
+            || is_dicom_rs_transfer_syntax(&self.transfer_syntax_uid)
     }
 
     fn dataset_endian(&self) -> Endian {
@@ -412,11 +407,11 @@ fn parse_element(
 
 fn syntax_modes(uid: &str) -> (Option<Endian>, Option<VrMode>) {
     match uid {
-        EXPLICIT_VR_LITTLE_ENDIAN => (Some(Endian::Little), Some(VrMode::Explicit)),
         IMPLICIT_VR_LITTLE_ENDIAN => (Some(Endian::Little), Some(VrMode::Implicit)),
         EXPLICIT_VR_BIG_ENDIAN => (Some(Endian::Big), Some(VrMode::Explicit)),
-        RLE_LOSSLESS => (Some(Endian::Little), Some(VrMode::Explicit)),
-        JPEG_BASELINE_8BIT => (Some(Endian::Little), Some(VrMode::Explicit)),
+        _ if is_known_explicit_vr_little_endian_transfer_syntax(uid) => {
+            (Some(Endian::Little), Some(VrMode::Explicit))
+        }
         _ => (None, None),
     }
 }
