@@ -91,6 +91,152 @@ fn splits_are_patient_safe_and_cache_builds() {
 }
 
 #[test]
+fn relative_cache_dirs_store_portable_split_paths_and_validate() {
+    let root = unique_test_dir();
+    let Fixture {
+        manifest,
+        splits,
+        plan,
+        ..
+    } = build_fixture(&root);
+    let cache_dir = unique_relative_test_dir();
+
+    let cache = cache_cxr(&CacheConfig {
+        manifest_path: manifest,
+        splits_path: splits,
+        plan_path: plan.clone(),
+        cache_dir: cache_dir.clone(),
+    })
+    .unwrap();
+    let train = cache.splits.get("train").unwrap();
+    assert_eq!(train.images_path, "train-images.float32.dat");
+    assert_eq!(train.labels_path, "train-labels.float32.dat");
+    assert_eq!(train.masks_path, "train-masks.float32.dat");
+    assert_eq!(train.metadata_path, "train-metadata.jsonl");
+
+    let validation = validate_cache_cxr(&ValidateCacheConfig {
+        cache_dir: cache_dir.clone(),
+        split: Some("train".to_string()),
+        expected_targets: Some(cache.targets.clone()),
+        expected_image_shape: None,
+        plan_path: Some(plan),
+        report_path: None,
+        json_path: None,
+    })
+    .unwrap();
+    assert_eq!(validation.status, "ok");
+
+    let reader = CxrCacheReader::open(&cache_dir, "train").unwrap();
+    assert!(reader.samples() > 0);
+    let _ = fs::remove_dir_all(cache_dir);
+}
+
+#[test]
+fn dicom_index_manifest_validates_splits_caches_and_reads_batch() {
+    let root = unique_test_dir();
+    let raw = root.join("raw-dicom");
+    let dicom = raw.join("patient-1/image.dc");
+    write_dicom_fixture(&dicom, "DICOM-P1", "1.2.826.0.1", "1.2.826.0.1.1");
+
+    let dicom_index = root.join("dicom-index.jsonl");
+    let dicom_report = root.join("dicom-report.md");
+    let scan_config = medkit_dicom::DicomScanConfig {
+        root: raw,
+        out_path: dicom_index.clone(),
+        report_path: dicom_report,
+    };
+    let (scan_summary, scan_records) = medkit_dicom::scan_dicom(&scan_config).unwrap();
+    medkit_dicom::write_scan_outputs(
+        &scan_summary,
+        &scan_records,
+        &scan_config.out_path,
+        &scan_config.report_path,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("labels.csv"),
+        "patient_id,study_instance_uid,Pneumonia\nDICOM-P1,1.2.826.0.1,1\n",
+    )
+    .unwrap();
+    let manifest = root.join("manifest.jsonl");
+    let index = index_cxr(&IndexConfig {
+        images_root: root.clone(),
+        dicom_index_path: Some(dicom_index),
+        metadata_path: None,
+        labels_path: Some(root.join("labels.csv")),
+        reports_root: None,
+        out_path: manifest.clone(),
+    })
+    .unwrap();
+    assert_eq!(index.records, 1);
+    assert!(index.dicom_index_path.is_some());
+
+    let records = read_manifest(&manifest).unwrap();
+    assert_eq!(records[0].source_format, "dicom");
+    assert_eq!(records[0].patient_id, "DICOM-P1");
+    assert_eq!(records[0].study_id, "1.2.826.0.1");
+    assert_eq!(records[0].width, Some(2));
+    assert_eq!(records[0].height, Some(2));
+    assert_eq!(
+        records[0].transfer_syntax_uid.as_deref(),
+        Some(medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN)
+    );
+    assert_eq!(records[0].labels["Pneumonia"], Some(1));
+
+    let validation = validate_cxr(&ValidateConfig {
+        manifest_path: manifest.clone(),
+        require_frontal: true,
+        check_patient_leakage: true,
+        check_duplicates: true,
+        report_path: root.join("validation.md"),
+    })
+    .unwrap();
+    assert_eq!(validation.readable_images, 1);
+    assert_eq!(validation.unreadable_images, 0);
+
+    let splits = root.join("splits.json");
+    split_cxr(&SplitConfig {
+        manifest_path: manifest.clone(),
+        by: "patient_id".to_string(),
+        train: 1.0,
+        val: 0.0,
+        test: 0.0,
+        stratify: Vec::new(),
+        out_path: splits.clone(),
+        seed: 0,
+    })
+    .unwrap();
+
+    let plan = root.join("plan.toml");
+    fs::write(&plan, "name = \"cxr-dicom-test\"\n[image]\nsize = [4, 4]\n").unwrap();
+    let cache_dir = root.join("cache");
+    let cache = cache_cxr(&CacheConfig {
+        manifest_path: manifest,
+        splits_path: splits,
+        plan_path: plan,
+        cache_dir: cache_dir.clone(),
+    })
+    .unwrap();
+    assert!(cache.failed_samples.is_empty());
+    assert!(cache
+        .image_size_policy
+        .transform
+        .contains("medkit-dicom presentation"));
+
+    let reader = CxrCacheReader::open(cache_dir, "train").unwrap();
+    let batch = reader.read_batch(0, 1).unwrap();
+    assert_eq!(batch.samples, 1);
+    assert_eq!(batch.image_shape, [1, 1, 4, 4]);
+    assert_eq!(batch.labels, vec![1.0]);
+    assert_eq!(batch.masks, vec![1.0]);
+    assert!(batch
+        .images
+        .iter()
+        .any(|value| value.is_finite() && *value != 0.0));
+}
+
+#[test]
 fn stratified_patient_split_balances_labels_and_metadata_without_leakage() {
     let root = unique_test_dir();
     let manifest = root.join("manifest.jsonl");
@@ -370,6 +516,7 @@ fn image_only_indexing_and_helper_policies_are_stable() {
     let manifest = root.join("manifest.jsonl");
     let summary = index_cxr(&IndexConfig {
         images_root: root.join("nested"),
+        dicom_index_path: None,
         metadata_path: None,
         labels_path: None,
         reports_root: None,
@@ -685,6 +832,7 @@ fn metadata_indexing_skips_missing_images_and_reads_gz_labels() {
     let manifest = root.join("manifest.jsonl");
     let summary = index_cxr(&IndexConfig {
         images_root: root.join("images"),
+        dicom_index_path: None,
         metadata_path: Some(root.join("metadata.csv")),
         labels_path: Some(gz_labels),
         reports_root: Some(root.join("reports")),
@@ -993,6 +1141,7 @@ fn malformed_metadata_and_cache_io_errors_surface() {
     fs::write(root.join("metadata.csv"), "subject_id,study_id\n1,1\n").unwrap();
     let missing_dicom = index_cxr(&IndexConfig {
         images_root: root.join("images"),
+        dicom_index_path: None,
         metadata_path: Some(root.join("metadata.csv")),
         labels_path: None,
         reports_root: None,
@@ -1063,6 +1212,10 @@ fn empty_train_rgb_cache_and_remaining_fallbacks_are_covered() {
             width: Some(4),
             height: Some(4),
             photometric_interpretation: Some("RGB".to_string()),
+            series_instance_uid: None,
+            sop_instance_uid: None,
+            transfer_syntax_uid: None,
+            pixel_hash: None,
             labels: BTreeMap::from([("Finding".to_string(), Some(1))]),
             label_source: Some("test".to_string()),
             report_path: None,
@@ -1233,6 +1386,7 @@ fn build_fixture(root: &Path) -> Fixture {
     let manifest = root.join("manifest.jsonl");
     let index = index_cxr(&IndexConfig {
         images_root: root.join("images"),
+        dicom_index_path: None,
         metadata_path: Some(root.join("metadata.csv")),
         labels_path: Some(root.join("labels.csv")),
         reports_root: Some(root.join("reports")),
@@ -1282,6 +1436,10 @@ fn test_cxr_record(
         width: Some(4),
         height: Some(4),
         photometric_interpretation: Some("MONOCHROME2".to_string()),
+        series_instance_uid: None,
+        sop_instance_uid: None,
+        transfer_syntax_uid: None,
+        pixel_hash: None,
         labels: BTreeMap::from([("Finding".to_string(), finding)]),
         label_source: Some("test".to_string()),
         report_path: None,
@@ -1344,9 +1502,78 @@ fn unique_test_dir() -> PathBuf {
     path
 }
 
+fn unique_relative_test_dir() -> PathBuf {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = PathBuf::from("../../target").join(format!(
+        "medkit-cxr-relative-cache-{}-{}-{}",
+        std::process::id(),
+        sequence,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&path);
+    path
+}
+
 fn write_png(path: &Path, value: u8) {
     let image = image::GrayImage::from_pixel(4, 4, image::Luma([value]));
     image.save(path).unwrap();
+}
+
+fn write_dicom_fixture(path: &Path, patient_id: &str, study_uid: &str, sop_uid: &str) {
+    let mut bytes = vec![0u8; 128];
+    bytes.extend_from_slice(b"DICM");
+    push_text(
+        &mut bytes,
+        (0x0002, 0x0010),
+        "UI",
+        medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN,
+    );
+    push_text(&mut bytes, (0x0010, 0x0020), "LO", patient_id);
+    push_text(&mut bytes, (0x0020, 0x000D), "UI", study_uid);
+    push_text(&mut bytes, (0x0020, 0x000E), "UI", "1.2.826.0.1.99");
+    push_text(&mut bytes, (0x0008, 0x0018), "UI", sop_uid);
+    push_text(&mut bytes, (0x0008, 0x0060), "CS", "DX");
+    push_text(&mut bytes, (0x0018, 0x5101), "CS", "PA");
+    push_text(&mut bytes, (0x0028, 0x0030), "DS", "0.5\\0.5");
+    push_text(&mut bytes, (0x0028, 0x0004), "CS", "MONOCHROME2");
+    push_u16(&mut bytes, (0x0028, 0x0002), 1);
+    push_u16(&mut bytes, (0x0028, 0x0010), 2);
+    push_u16(&mut bytes, (0x0028, 0x0011), 2);
+    push_u16(&mut bytes, (0x0028, 0x0100), 8);
+    push_u16(&mut bytes, (0x0028, 0x0101), 8);
+    push_u16(&mut bytes, (0x0028, 0x0102), 7);
+    push_u16(&mut bytes, (0x0028, 0x0103), 0);
+    push_element(&mut bytes, (0x7FE0, 0x0010), "OB", vec![0, 64, 128, 255]);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+}
+
+fn push_text(out: &mut Vec<u8>, tag: (u16, u16), vr: &str, value: &str) {
+    push_element(out, tag, vr, value.as_bytes().to_vec());
+}
+
+fn push_u16(out: &mut Vec<u8>, tag: (u16, u16), value: u16) {
+    push_element(out, tag, "US", value.to_le_bytes().to_vec());
+}
+
+fn push_element(out: &mut Vec<u8>, tag: (u16, u16), vr: &str, mut value: Vec<u8>) {
+    if value.len() % 2 == 1 {
+        value.push(if vr == "UI" { 0 } else { b' ' });
+    }
+    out.extend_from_slice(&tag.0.to_le_bytes());
+    out.extend_from_slice(&tag.1.to_le_bytes());
+    out.extend_from_slice(vr.as_bytes());
+    if matches!(vr, "OB" | "OW" | "SQ" | "UN" | "UT") {
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    } else {
+        out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    }
+    out.extend_from_slice(&value);
 }
 
 fn write_rgb_png(path: &Path, value: [u8; 3]) {
@@ -1400,6 +1627,10 @@ fn write_synthetic_cache(
                 width: Some(image_size as u32),
                 height: Some(image_size as u32),
                 photometric_interpretation: Some("MONOCHROME2".to_string()),
+                series_instance_uid: None,
+                sop_instance_uid: None,
+                transfer_syntax_uid: None,
+                pixel_hash: None,
                 labels: BTreeMap::new(),
                 label_source: None,
                 report_path: None,

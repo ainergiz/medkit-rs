@@ -8,6 +8,7 @@ pub const CXR_REPORT_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 pub struct IndexConfig {
     pub images_root: PathBuf,
+    pub dicom_index_path: Option<PathBuf>,
     pub metadata_path: Option<PathBuf>,
     pub labels_path: Option<PathBuf>,
     pub reports_root: Option<PathBuf>,
@@ -68,6 +69,14 @@ pub struct CxrRecord {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub photometric_interpretation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_instance_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sop_instance_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_syntax_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_hash: Option<String>,
     pub labels: BTreeMap<String, Option<i8>>,
     pub label_source: Option<String>,
     pub report_path: Option<String>,
@@ -80,6 +89,8 @@ pub struct CxrRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSummary {
     pub images_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dicom_index_path: Option<String>,
     pub metadata_path: Option<String>,
     pub labels_path: Option<String>,
     pub records: usize,

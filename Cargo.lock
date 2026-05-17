@@ -475,6 +475,7 @@ dependencies = [
  "medkit-cache",
  "medkit-cxr",
  "medkit-dataset",
+ "medkit-dicom",
  "medkit-sampler",
  "serde_json",
 ]
@@ -490,6 +491,7 @@ dependencies = [
  "csv",
  "flate2",
  "image",
+ "medkit-dicom",
  "serde",
  "serde_json",
  "sha2",
@@ -505,6 +507,15 @@ dependencies = [
  "medkit-io",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "medkit-dicom"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

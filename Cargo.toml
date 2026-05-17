@@ -7,6 +7,7 @@ members = [
     "crates/medkit-core",
     "crates/medkit-cxr",
     "crates/medkit-dataset",
+    "crates/medkit-dicom",
     "crates/medkit-io",
     "crates/medkit-python",
     "crates/medkit-python-ffi",

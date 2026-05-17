@@ -4,6 +4,7 @@ pub enum CxrError {
     Csv(csv::Error),
     Json(serde_json::Error),
     Image(image::ImageError),
+    Dicom(medkit_dicom::DicomError),
     Toml(toml::de::Error),
     Message(String),
 }
@@ -15,6 +16,7 @@ impl std::fmt::Display for CxrError {
             Self::Csv(error) => write!(f, "{error}"),
             Self::Json(error) => write!(f, "{error}"),
             Self::Image(error) => write!(f, "{error}"),
+            Self::Dicom(error) => write!(f, "{error}"),
             Self::Toml(error) => write!(f, "{error}"),
             Self::Message(message) => write!(f, "{message}"),
         }
@@ -44,6 +46,12 @@ impl From<serde_json::Error> for CxrError {
 impl From<image::ImageError> for CxrError {
     fn from(value: image::ImageError) -> Self {
         Self::Image(value)
+    }
+}
+
+impl From<medkit_dicom::DicomError> for CxrError {
+    fn from(value: medkit_dicom::DicomError) -> Self {
+        Self::Dicom(value)
     }
 }
 

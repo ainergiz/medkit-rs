@@ -61,7 +61,7 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Cxr
 
 pub(crate) fn resolve_cache_path(cache_dir: &Path, path: &str) -> PathBuf {
     let path = PathBuf::from(path);
-    if path.is_absolute() {
+    if path.is_absolute() || path.starts_with(cache_dir) {
         path
     } else {
         cache_dir.join(path)

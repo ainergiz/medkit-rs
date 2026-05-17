@@ -16,9 +16,10 @@ medkit-bench = { path = "../medkit-bench" }
 medkit-cache = { path = "../medkit-cache" }
 medkit-cxr = { path = "../medkit-cxr" }
 medkit-dataset = { path = "../medkit-dataset" }
+medkit-dicom = { path = "../medkit-dicom" }
 medkit-sampler = { path = "../medkit-sampler" }
+serde_json.workspace = true
 
 [dev-dependencies]
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 image.workspace = true
-serde_json.workspace = true

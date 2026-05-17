@@ -6,6 +6,7 @@ use std::{
 };
 
 use flate2::read::MultiGzDecoder;
+use medkit_dicom::DicomInventoryRecord;
 
 use crate::{
     error::CxrError,
@@ -14,14 +15,19 @@ use crate::{
 };
 
 pub fn index_cxr(config: &IndexConfig) -> Result<IndexSummary, CxrError> {
-    let image_map = scan_images(&config.images_root)?;
     let label_map = match &config.labels_path {
         Some(path) => read_label_csv(path)?,
         None => HashMap::new(),
     };
-    let mut records = match &config.metadata_path {
-        Some(path) => records_from_metadata(path, &image_map, &label_map, config)?,
-        None => records_from_images(&image_map, config)?,
+    let mut records = match &config.dicom_index_path {
+        Some(path) => records_from_dicom_index(path, &label_map, config)?,
+        None => {
+            let image_map = scan_images(&config.images_root)?;
+            match &config.metadata_path {
+                Some(path) => records_from_metadata(path, &image_map, &label_map, config)?,
+                None => records_from_images(&image_map, config)?,
+            }
+        }
     };
     records.sort_by(|left, right| left.sample_id.cmp(&right.sample_id));
     write_manifest(&config.out_path, &records)?;
@@ -44,7 +50,7 @@ pub fn validate_cxr(config: &ValidateConfig) -> Result<ValidationSummary, CxrErr
             filtered_non_frontal += 1;
             continue;
         }
-        if image::image_dimensions(&record.image_path).is_ok() {
+        if record_is_readable_image(record) {
             readable_images += 1;
         } else {
             unreadable_images += 1;
@@ -59,10 +65,7 @@ pub fn validate_cxr(config: &ValidateConfig) -> Result<ValidationSummary, CxrErr
                 .or_default()
                 .insert(record.patient_id.clone());
             if config.check_duplicates {
-                let hash = match &record.sha256 {
-                    Some(value) => value.clone(),
-                    None => hash_file(Path::new(&record.image_path))?,
-                };
+                let hash = duplicate_hash(record)?;
                 split_hashes.entry(split.clone()).or_default().insert(hash);
             }
         }
@@ -142,6 +145,10 @@ fn records_from_metadata(
             width: Some(width),
             height: Some(height),
             photometric_interpretation: Some("MONOCHROME2".to_string()),
+            series_instance_uid: None,
+            sop_instance_uid: None,
+            transfer_syntax_uid: None,
+            pixel_hash: None,
             labels,
             label_source: Some("chexpert_csv".to_string()),
             report_path,
@@ -177,12 +184,99 @@ fn records_from_images(
             width: Some(width),
             height: Some(height),
             photometric_interpretation: Some("MONOCHROME2".to_string()),
+            series_instance_uid: None,
+            sop_instance_uid: None,
+            transfer_syntax_uid: None,
+            pixel_hash: None,
             labels: BTreeMap::new(),
             label_source: None,
             report_path: None,
             split: None,
             sha256: Some(hash_file(path)?),
         });
+    }
+    Ok(records)
+}
+
+fn records_from_dicom_index(
+    dicom_index_path: &Path,
+    label_map: &HashMap<(String, String), BTreeMap<String, Option<i8>>>,
+    config: &IndexConfig,
+) -> Result<Vec<CxrRecord>, CxrError> {
+    let mut records = Vec::new();
+    for record in read_dicom_index(dicom_index_path)? {
+        let path = PathBuf::from(&record.path);
+        let image_id = record
+            .sop_instance_uid
+            .clone()
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("dicom-{}", records.len()));
+        let patient_id = record
+            .patient_id
+            .clone()
+            .unwrap_or_else(|| patient_from_filename(&image_id));
+        let study_id = record
+            .study_instance_uid
+            .clone()
+            .unwrap_or_else(|| "unknown-study".to_string());
+        let labels = label_map
+            .get(&(patient_id.clone(), study_id.clone()))
+            .cloned()
+            .unwrap_or_default();
+        let report_path = config.reports_root.as_ref().map(|root| {
+            root.join(format!("{}.txt", manifest_component(&study_id)))
+                .display()
+                .to_string()
+        });
+        records.push(CxrRecord {
+            sample_id: format!(
+                "{}/{}/{}",
+                manifest_component(&patient_id),
+                manifest_component(&study_id),
+                manifest_component(&image_id)
+            ),
+            patient_id,
+            study_id,
+            image_id,
+            image_path: record.path,
+            source_format: "dicom".to_string(),
+            modality: record.modality,
+            view_position: record.view_position,
+            laterality: record.laterality,
+            width: record.columns.map(u32::from),
+            height: record.rows.map(u32::from),
+            photometric_interpretation: record.photometric_interpretation,
+            series_instance_uid: record.series_instance_uid,
+            sop_instance_uid: record.sop_instance_uid,
+            transfer_syntax_uid: Some(record.transfer_syntax_uid),
+            pixel_hash: record.pixel_hash,
+            labels,
+            label_source: config
+                .labels_path
+                .as_ref()
+                .map(|_| "chexpert_csv".to_string()),
+            report_path,
+            split: None,
+            sha256: Some(record.sha256),
+        });
+    }
+    Ok(records)
+}
+
+fn read_dicom_index(path: &Path) -> Result<Vec<DicomInventoryRecord>, CxrError> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut records = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        records.push(serde_json::from_str(&line)?);
     }
     Ok(records)
 }
@@ -200,11 +294,14 @@ pub(crate) fn read_label_csv(
             .get(&row, &["subject_id", "patient_id"])
             .ok_or_else(|| CxrError::Message("labels row missing subject_id".to_string()))?;
         let study = index
-            .get(&row, &["study_id"])
+            .get(&row, &["study_id", "study_instance_uid"])
             .ok_or_else(|| CxrError::Message("labels row missing study_id".to_string()))?;
         let mut labels = BTreeMap::new();
         for (header_index, header) in headers.iter().enumerate() {
-            if matches!(header, "subject_id" | "study_id" | "patient_id") {
+            if matches!(
+                header,
+                "subject_id" | "study_id" | "patient_id" | "study_instance_uid"
+            ) {
                 continue;
             }
             let value = row.get(header_index).unwrap_or("").trim();
@@ -223,6 +320,10 @@ fn index_summary(config: &IndexConfig, records: &[CxrRecord]) -> IndexSummary {
     }
     IndexSummary {
         images_root: config.images_root.display().to_string(),
+        dicom_index_path: config
+            .dicom_index_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
         metadata_path: config
             .metadata_path
             .as_ref()
@@ -244,6 +345,46 @@ fn index_summary(config: &IndexConfig, records: &[CxrRecord]) -> IndexSummary {
             .len(),
         labels,
         out_path: config.out_path.display().to_string(),
+    }
+}
+
+fn record_is_readable_image(record: &CxrRecord) -> bool {
+    if is_dicom_record(record) {
+        medkit_dicom::present_dicom_pixels(&record.image_path).is_ok()
+    } else {
+        image::image_dimensions(&record.image_path).is_ok()
+    }
+}
+
+fn duplicate_hash(record: &CxrRecord) -> Result<String, CxrError> {
+    if let Some(value) = &record.pixel_hash {
+        Ok(value.clone())
+    } else if let Some(value) = &record.sha256 {
+        Ok(value.clone())
+    } else {
+        hash_file(Path::new(&record.image_path))
+    }
+}
+
+pub(crate) fn is_dicom_record(record: &CxrRecord) -> bool {
+    record.source_format.eq_ignore_ascii_case("dicom")
+}
+
+fn manifest_component(value: &str) -> String {
+    let component = value
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '/' | '\\' | ':' | ' ') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    if component.is_empty() {
+        "unknown".to_string()
+    } else {
+        component
     }
 }
 

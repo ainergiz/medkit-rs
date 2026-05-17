@@ -7,12 +7,12 @@ use std::{
     time::Instant,
 };
 
-use image::{imageops::FilterType, DynamicImage};
+use image::{imageops::FilterType, DynamicImage, GrayImage};
 use serde_json;
 
 use crate::{
     error::CxrError,
-    manifest::read_manifest,
+    manifest::{is_dicom_record, read_manifest},
     types::{
         CacheConfig, CacheSplitSummary, CacheSummary, CacheValidationSummary, CxrCacheBatch,
         CxrCacheReader, CxrIndexedReadMetrics, CxrRecord, ImageSizePolicy, LabelPolicy,
@@ -43,6 +43,11 @@ pub fn cache_cxr(config: &CacheConfig) -> Result<CacheSummary, CxrError> {
     fs::create_dir_all(&config.cache_dir)?;
     let targets = collect_targets(&records);
     let transform_plan_hash = hash_file(&config.plan_path)?;
+    let transform_description = if records.iter().any(is_dicom_record) {
+        "medkit-dicom presentation to MONOCHROME2 u8, resize square, normalize dataset mean/std"
+    } else {
+        "decode grayscale, resize square, normalize dataset mean/std"
+    };
     let train_records = records_for_split(&records, &split_file.train)?;
     let normalization = estimate_normalization(&train_records, image_size)?;
     let mut splits = BTreeMap::new();
@@ -86,7 +91,7 @@ pub fn cache_cxr(config: &CacheConfig) -> Result<CacheSummary, CxrError> {
             height: image_size,
             width: image_size,
             dtype: "float32".to_string(),
-            transform: "decode grayscale, resize square, normalize dataset mean/std".to_string(),
+            transform: transform_description.to_string(),
         },
         splits,
         failed_samples,
@@ -758,17 +763,21 @@ fn write_cache_split(
     normalization: &Normalization,
     failed_samples: &mut Vec<String>,
 ) -> Result<CacheSplitSummary, CxrError> {
-    let images_path = cache_dir.join(format!("{split}-images.float32.dat"));
-    let labels_path = cache_dir.join(format!("{split}-labels.float32.dat"));
-    let masks_path = cache_dir.join(format!("{split}-masks.float32.dat"));
-    let metadata_path = cache_dir.join(format!("{split}-metadata.jsonl"));
+    let images_name = format!("{split}-images.float32.dat");
+    let labels_name = format!("{split}-labels.float32.dat");
+    let masks_name = format!("{split}-masks.float32.dat");
+    let metadata_name = format!("{split}-metadata.jsonl");
+    let images_path = cache_dir.join(&images_name);
+    let labels_path = cache_dir.join(&labels_name);
+    let masks_path = cache_dir.join(&masks_name);
+    let metadata_path = cache_dir.join(&metadata_name);
     let mut images = BufWriter::new(File::create(&images_path)?);
     let mut labels = BufWriter::new(File::create(&labels_path)?);
     let mut masks = BufWriter::new(File::create(&masks_path)?);
     let mut metadata = BufWriter::new(File::create(&metadata_path)?);
 
     for record in records {
-        match preprocess_image(&record.image_path, image_size, normalization) {
+        match preprocess_image(record, image_size, normalization) {
             Ok(values) => {
                 for value in values {
                     images.write_all(&value.to_le_bytes())?;
@@ -804,10 +813,10 @@ fn write_cache_split(
     Ok(CacheSplitSummary {
         samples: records.len(),
         shape: [records.len(), 1, image_size, image_size],
-        images_path: images_path.display().to_string(),
-        labels_path: labels_path.display().to_string(),
-        masks_path: masks_path.display().to_string(),
-        metadata_path: metadata_path.display().to_string(),
+        images_path: images_name,
+        labels_path: labels_name,
+        masks_path: masks_name,
+        metadata_path: metadata_name,
     })
 }
 
@@ -820,7 +829,7 @@ fn estimate_normalization(
     let mut count = 0usize;
     let stride = (records.len() / 512).max(1);
     for record in records.iter().step_by(stride) {
-        let gray = load_resized_luma(&record.image_path, image_size)?;
+        let gray = load_resized_luma(record, image_size)?;
         for value in gray {
             let scaled = value as f64 / 255.0;
             sum += scaled;
@@ -843,11 +852,11 @@ fn estimate_normalization(
 }
 
 fn preprocess_image(
-    path: &str,
+    record: &CxrRecord,
     image_size: usize,
     normalization: &Normalization,
 ) -> Result<Vec<f32>, CxrError> {
-    let gray = load_resized_luma(path, image_size)?;
+    let gray = load_resized_luma(record, image_size)?;
     Ok(gray
         .into_iter()
         .map(|value| {
@@ -857,12 +866,33 @@ fn preprocess_image(
         .collect())
 }
 
-fn load_resized_luma(path: &str, image_size: usize) -> Result<Vec<u8>, CxrError> {
+fn load_resized_luma(record: &CxrRecord, image_size: usize) -> Result<Vec<u8>, CxrError> {
+    if is_dicom_record(record) {
+        load_resized_dicom_luma(&record.image_path, image_size)
+    } else {
+        load_resized_raster_luma(&record.image_path, image_size)
+    }
+}
+
+fn load_resized_raster_luma(path: &str, image_size: usize) -> Result<Vec<u8>, CxrError> {
     let image = image::open(path)?;
     let gray = match image {
         DynamicImage::ImageLuma8(value) => value,
         other => other.to_luma8(),
     };
+    let resized = image::imageops::resize(
+        &gray,
+        image_size as u32,
+        image_size as u32,
+        FilterType::Triangle,
+    );
+    Ok(resized.into_raw())
+}
+
+fn load_resized_dicom_luma(path: &str, image_size: usize) -> Result<Vec<u8>, CxrError> {
+    let image = medkit_dicom::present_dicom_pixels(path)?;
+    let gray = GrayImage::from_raw(image.width as u32, image.height as u32, image.pixels)
+        .ok_or_else(|| CxrError::Message(format!("invalid DICOM raster shape for {path}")))?;
     let resized = image::imageops::resize(
         &gray,
         image_size as u32,

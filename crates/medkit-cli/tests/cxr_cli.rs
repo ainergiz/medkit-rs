@@ -305,8 +305,24 @@ fn cxr_cli_reports_parse_errors_without_running_products() {
     assert!(cxr_help.stderr.contains("Usage:"));
 
     let missing_images = run_medkit_fail(&["cxr", "manifest", "--out", "manifest.jsonl"]);
-    assert!(missing_images.stderr.contains("missing --images"));
+    assert!(missing_images
+        .stderr
+        .contains("missing --images or --dicom-index"));
     assert!(missing_images.stderr.contains("Usage:"));
+
+    let conflicting_sources = run_medkit_fail(&[
+        "cxr",
+        "manifest",
+        "--images",
+        ".",
+        "--dicom-index",
+        "dicom-index.jsonl",
+        "--out",
+        "manifest.jsonl",
+    ]);
+    assert!(conflicting_sources
+        .stderr
+        .contains("use either --images or --dicom-index"));
 
     let index_missing_out = run_medkit_fail(&["cxr", "index", "--images", "."]);
     assert!(index_missing_out.stderr.contains("missing --out"));

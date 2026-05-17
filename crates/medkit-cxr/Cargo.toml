@@ -15,6 +15,7 @@ path = "src/lib.rs"
 csv.workspace = true
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 image.workspace = true
+medkit-dicom = { path = "../medkit-dicom" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
