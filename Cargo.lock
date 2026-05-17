@@ -980,6 +980,7 @@ dependencies = [
  "medkit-cxr",
  "medkit-python-ffi",
  "pyo3",
+ "sha2",
 ]
 
 [[package]]

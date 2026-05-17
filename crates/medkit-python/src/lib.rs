@@ -1011,6 +1011,7 @@ mod pyo3_tests {
     };
 
     use pyo3::types::{PyDict, PyList, PyTuple};
+    use sha2::{Digest, Sha256};
 
     const CASE_ID: &str = "case_a";
     const SHAPE: [usize; 3] = [4, 3, 2];
@@ -1310,9 +1311,13 @@ def empty_like(tensor):
       "samples": 3,
       "shape": [3, 1, 2, 2],
       "images_path": "{images}",
+      "images_sha256": "{images_sha256}",
       "labels_path": "{labels}",
+      "labels_sha256": "{labels_sha256}",
       "masks_path": "{masks}",
-      "metadata_path": "{metadata}"
+      "masks_sha256": "{masks_sha256}",
+      "metadata_path": "{metadata}",
+      "metadata_sha256": "{metadata_sha256}"
     }}
   }},
   "failed_samples": [],
@@ -1320,9 +1325,13 @@ def empty_like(tensor):
 }}"#,
                     cache_dir = path_string(&cache_dir),
                     images = path_string(&cache_dir.join("train-images.float32.dat")),
+                    images_sha256 = sha256_file(&cache_dir.join("train-images.float32.dat")),
                     labels = path_string(&cache_dir.join("train-labels.float32.dat")),
+                    labels_sha256 = sha256_file(&cache_dir.join("train-labels.float32.dat")),
                     masks = path_string(&cache_dir.join("train-masks.float32.dat")),
+                    masks_sha256 = sha256_file(&cache_dir.join("train-masks.float32.dat")),
                     metadata = path_string(&cache_dir.join("train-metadata.jsonl")),
+                    metadata_sha256 = sha256_file(&cache_dir.join("train-metadata.jsonl")),
                 ),
             )
             .unwrap();
@@ -1332,6 +1341,13 @@ def empty_like(tensor):
                 cache_dir,
             }
         }
+    }
+
+    fn sha256_file(path: &Path) -> String {
+        let bytes = fs::read(path).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
     }
 
     fn assert_value_error(py: Python<'_>, error: PyErr, expected: &str) {
