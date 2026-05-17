@@ -10,8 +10,41 @@ permissions:
   contents: read
 
 jobs:
+  preflight-tests:
+    name: Release preflight tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Sync package
+        run: uv sync --dev
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run workspace tests
+        run: cargo test --workspace --locked --exclude medkit-python
+      - name: Run medkit-python Rust tests
+        run: |
+          python scripts/run_medkit_python_rust_tests.py
+      - name: Check public Python API contract
+        run: uv run python scripts/check_python_api.py
+      - name: Compile Python files
+        run: uv run python -m compileall python tests scripts examples crates/medkit-benchmarks/scripts
+      - name: Run Python API tests
+        run: uv run pytest tests/python -q
+
   build-wheels:
     name: Wheel ${{ matrix.os }} ${{ matrix.target }}
+    needs:
+      - preflight-tests
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -70,6 +103,8 @@ jobs:
 
   build-sdist:
     name: Source distribution
+    needs:
+      - preflight-tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -90,6 +125,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs:
+      - preflight-tests
       - build-wheels
       - build-sdist
     runs-on: ubuntu-latest

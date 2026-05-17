@@ -3,7 +3,6 @@
 from .dataset import (
     MedkitCxrNativeBatchIterableDataset,
     MedkitCxrNativePrefetchDataset,
-    MedkitFfiBatchIterableDataset,
     MedkitNativeBatchIterableDataset,
     MedkitPatchDataset,
     MedkitPatchIterableDataset,
@@ -16,7 +15,6 @@ __version__ = "0.1.0"
 __all__ = [
     "MedkitCxrNativeBatchIterableDataset",
     "MedkitCxrNativePrefetchDataset",
-    "MedkitFfiBatchIterableDataset",
     "MedkitNativeBatchIterableDataset",
     "MedkitPatchDataset",
     "MedkitPatchIterableDataset",

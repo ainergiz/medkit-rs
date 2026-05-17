@@ -125,7 +125,7 @@ fn inspect_case(case: &CachedCase, strict_hashes: bool) -> CacheCaseInspection {
                     .checked_mul(image_channels)
                     .ok_or_else(|| "image channel value count overflow".to_string())
             })
-            .map(|count| count * 4),
+            .and_then(|count| checked_bytes(count, 4, "image cache")),
         "image cache",
         &mut errors,
     );
@@ -138,7 +138,7 @@ fn inspect_case(case: &CachedCase, strict_hashes: bool) -> CacheCaseInspection {
     );
     bytes += check_file_bytes(
         &case.label_cache_path,
-        voxels.map(|count| count * 2),
+        voxels.and_then(|count| checked_bytes(count, 2, "label cache")),
         "label cache",
         &mut errors,
     );
@@ -160,14 +160,15 @@ fn inspect_case(case: &CachedCase, strict_hashes: bool) -> CacheCaseInspection {
         );
     }
     if let Some(path) = &case.foreground_prefix_path {
-        let prefix_shape = case.foreground_prefix_shape.unwrap_or([
-            case.shape[0] + 1,
-            case.shape[1] + 1,
-            case.shape[2] + 1,
-        ]);
+        let prefix_shape = case
+            .foreground_prefix_shape
+            .map(Ok)
+            .unwrap_or_else(|| checked_prefix_shape(case.shape));
         bytes += check_file_bytes(
             path,
-            value_count(prefix_shape).map(|count| count * 4),
+            prefix_shape
+                .and_then(value_count)
+                .and_then(|count| checked_bytes(count, 4, "foreground prefix")),
             "foreground prefix",
             &mut errors,
         );
@@ -229,7 +230,7 @@ fn inspect_chunked_case(
         Some(path) => {
             *bytes += check_file_bytes(
                 path,
-                image_chunk_values.map(|count| count * 4),
+                image_chunk_values.and_then(|count| checked_bytes(count, 4, "image chunk cache")),
                 "image chunk cache",
                 errors,
             );
@@ -247,7 +248,7 @@ fn inspect_chunked_case(
         Some(path) => {
             *bytes += check_file_bytes(
                 path,
-                chunk_values.map(|count| count * 2),
+                chunk_values.and_then(|count| checked_bytes(count, 2, "label chunk cache")),
                 "label chunk cache",
                 errors,
             );
@@ -366,4 +367,44 @@ fn value_count(shape: [usize; 3]) -> std::result::Result<usize, String> {
         .checked_mul(shape[1])
         .and_then(|value| value.checked_mul(shape[2]))
         .ok_or_else(|| format!("shape {shape:?} overflows usize"))
+}
+
+fn checked_prefix_shape(shape: [usize; 3]) -> std::result::Result<[usize; 3], String> {
+    Ok([
+        checked_add(shape[0], 1, "foreground prefix x")?,
+        checked_add(shape[1], 1, "foreground prefix y")?,
+        checked_add(shape[2], 1, "foreground prefix z")?,
+    ])
+}
+
+fn checked_add(value: usize, rhs: usize, what: &str) -> std::result::Result<usize, String> {
+    value
+        .checked_add(rhs)
+        .ok_or_else(|| format!("{what} overflows usize"))
+}
+
+fn checked_bytes(
+    values: usize,
+    bytes_per_value: usize,
+    what: &str,
+) -> std::result::Result<usize, String> {
+    values
+        .checked_mul(bytes_per_value)
+        .ok_or_else(|| format!("{what} byte count overflows usize"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_fallback_sizes_report_overflow() {
+        assert_eq!(checked_prefix_shape([0, 1, 2]).unwrap(), [1, 2, 3]);
+        assert!(checked_prefix_shape([usize::MAX, 1, 1])
+            .unwrap_err()
+            .contains("foreground prefix x"));
+        assert!(checked_bytes(usize::MAX, 4, "image cache")
+            .unwrap_err()
+            .contains("image cache byte count"));
+    }
 }

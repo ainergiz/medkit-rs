@@ -28,46 +28,7 @@ jobs:
         run: cargo test --workspace --locked --exclude medkit-python
       - name: Run medkit-python Rust tests
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          import sys
-          import sysconfig
-
-          config_path = Path("target/ci-pyo3-config.txt")
-          config_path.parent.mkdir(parents=True, exist_ok=True)
-
-          libdir = sysconfig.get_config_var("LIBDIR") or ""
-          ldlibrary = sysconfig.get_config_var("LDLIBRARY") or ""
-          lib_name = ldlibrary.removeprefix("lib")
-          for suffix in (".dylib", ".so", ".a", ".dll"):
-              lib_name = lib_name.removesuffix(suffix)
-
-          version = sysconfig.get_config_var("VERSION") or f"{sys.version_info.major}.{sys.version_info.minor}"
-          config_path.write_text(
-              "\n".join(
-                  [
-                      "implementation=CPython",
-                      f"version={version}",
-                      "shared=true",
-                      "abi3=true",
-                      f"lib_name={lib_name}",
-                      f"lib_dir={libdir}",
-                      f"executable={sys.executable}",
-                      "pointer_width=64",
-                      "build_flags=",
-                      "suppress_build_script_link_lines=false",
-                  ]
-              )
-              + "\n",
-              encoding="utf-8",
-          )
-          PY
-          PYTHONHOME="$(python - <<'PY'
-          import sys
-          print(sys.base_prefix)
-          PY
-          )" PYO3_CONFIG_FILE="$GITHUB_WORKSPACE/target/ci-pyo3-config.txt" \
-            cargo test -p medkit-python --no-default-features --lib --locked
+          python scripts/run_medkit_python_rust_tests.py
 
   python-contract:
     name: Python import and API contract
@@ -85,24 +46,7 @@ jobs:
           uv sync --dev
       - name: Check public Python API contract
         run: |
-          uv run python - <<'PY'
-          import inspect
-          import medkit_rs as medkit
-
-          assert hasattr(medkit, "cxr")
-          assert hasattr(medkit.cxr, "Dataset")
-          assert hasattr(medkit.cxr, "DataLoader")
-          assert hasattr(medkit.cxr, "datasets")
-
-          dataset_sig = inspect.signature(medkit.cxr.Dataset)
-          loader_sig = inspect.signature(medkit.cxr.DataLoader)
-          for name in ("cache_dir", "split", "batch_size", "shuffle", "pin_memory", "prefetch"):
-              assert name in dataset_sig.parameters, name
-          for name in ("dataset", "batch_size", "shuffle", "num_workers", "pin_memory", "drop_last"):
-              assert name in loader_sig.parameters, name
-
-          print("medkit_rs.cxr public API contract ok")
-          PY
+          uv run python scripts/check_python_api.py
       - name: Compile Python files
         run: |
           uv run python - <<'PY'
@@ -111,6 +55,7 @@ jobs:
 
           roots = [
               Path("python"),
+              Path("scripts"),
               Path("examples"),
               Path("crates/medkit-benchmarks/scripts"),
           ]

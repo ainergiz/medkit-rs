@@ -117,8 +117,13 @@ uv run maturin develop --release
 Run the full test suite:
 
 ```bash
-cargo test --workspace --all-targets
-uv run pytest
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked --exclude medkit-python
+uv run python scripts/run_medkit_python_rust_tests.py
+uv run python scripts/check_python_api.py
+uv run python -m compileall python tests scripts examples crates/medkit-benchmarks/scripts
+uv run pytest tests/python -q
 ```
 
 Internal planning, benchmark notes, and generated reports are intentionally

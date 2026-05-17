@@ -53,11 +53,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     torch = import_torch()
     from medkit_rs import (
-        MedkitFfiBatchIterableDataset,
         MedkitNativeBatchIterableDataset,
         MedkitPatchDataset,
         MedkitViewBatchIterableDataset,
     )
+    from medkit_rs.dataset import MedkitFfiBatchIterableDataset
 
     init_start = time.perf_counter()
     if args.backend == "ffi-batch":

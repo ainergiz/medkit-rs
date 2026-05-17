@@ -163,8 +163,14 @@ pub fn prepare_cache(config: &PrepareConfig) -> Result<CacheManifest> {
     let result = prepare_cache_in_staging(config, manifest, plan, plan_hash, &staging_dir);
     match result {
         Ok(cache_manifest) => {
-            promote_staged_cache(&staging_dir, &config.cache_dir, &cache_manifest)?;
-            Ok(cache_manifest)
+            if let Err(error) =
+                promote_staged_cache(&staging_dir, &config.cache_dir, &cache_manifest)
+            {
+                let _ = cleanup_staging(&staging_dir);
+                Err(error)
+            } else {
+                Ok(cache_manifest)
+            }
         }
         Err(error) => {
             cleanup_staging(&staging_dir)?;
@@ -272,6 +278,12 @@ fn promote_staged_cache(
         let staged_case_dir = staging_dir.join(&case.cache_key);
         let final_case_dir = cache_dir.join(&case.cache_key);
         if final_case_dir.exists() {
+            if !final_case_dir.is_dir() {
+                return Err(CacheError::invalid_input(format!(
+                    "cache case path exists but is not a directory: {}",
+                    final_case_dir.display()
+                )));
+            }
             match existing_case_status(&final_case_dir, case)? {
                 ExistingCaseStatus::Valid => cleanup_staging(&staged_case_dir)?,
                 ExistingCaseStatus::Corrupt => {
@@ -1499,6 +1511,71 @@ mod tests {
         assert_eq!(
             read_f32_values(Path::new(&cached.image_cache_path)),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn prepare_cache_rejects_case_cache_path_that_is_a_file() {
+        let root = temp_dir("prepare-final-case-file");
+        let image_path = root.join("case_file_0000.nii");
+        let label_path = root.join("case_file.nii");
+        let manifest_path = root.join("manifest.json");
+        let plan_path = root.join("plan.toml");
+        let cache_dir = root.join("cache");
+
+        fs::write(
+            &image_path,
+            NiftiFixture::new(&[3, 2, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        fs::write(
+            &label_path,
+            NiftiFixture::new(&[3, 2, 1], 512, &[1.0, 1.0, 1.0])
+                .append_u16_pixels(&[0, 1, 0, 2, 0, 3]),
+        )
+        .unwrap();
+        write_plan(&plan_path, identity_plan());
+        write_manifest(
+            &manifest_path,
+            &root,
+            vec![valid_case(
+                "case_file",
+                Some(&image_path),
+                Some(&label_path),
+            )],
+        );
+
+        let original = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path: manifest_path.clone(),
+            plan_path: plan_path.clone(),
+            cache_dir: cache_dir.clone(),
+            chunk_shape: None,
+        })
+        .unwrap();
+        let case_path = cache_dir.join(&original.cases[0].cache_key);
+        fs::remove_dir_all(&case_path).unwrap();
+        fs::write(&case_path, b"not a case directory").unwrap();
+
+        let error = prepare_cache(&PrepareConfig {
+            dataset_root: root,
+            manifest_path,
+            plan_path,
+            cache_dir: cache_dir.clone(),
+            chunk_shape: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cache case path exists but is not a directory"),
+            "{error}"
+        );
+        assert!(
+            !cache_dir.join(".staging").exists(),
+            "failed promotion should remove staging artifacts"
         );
     }
 

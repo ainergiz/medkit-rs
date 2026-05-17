@@ -34,6 +34,15 @@ def test_cxr_module_imports_and_validates_arguments() -> None:
         cxr.DataLoader(dataset, persistent_workers=True)
 
 
+def test_package_root_exports_wheel_ready_api_only() -> None:
+    medkit = _import_or_skip("medkit_rs")
+    dataset = _import_or_skip("medkit_rs.dataset")
+
+    assert "MedkitFfiBatchIterableDataset" not in medkit.__all__
+    assert not hasattr(medkit, "MedkitFfiBatchIterableDataset")
+    assert hasattr(dataset, "MedkitFfiBatchIterableDataset")
+
+
 @pytest.mark.cxr_fixture
 def test_cxr_dataloader_contract_against_cli_cache_fixture() -> None:
     cxr = _import_or_skip("medkit_rs.cxr")
