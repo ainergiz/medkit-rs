@@ -112,6 +112,12 @@ fn prepare_sample_and_bench_workflow_runs_end_to_end() {
         "foreground-balanced",
         "--count",
         "10",
+        "--seed",
+        "123",
+        "--epoch",
+        "4",
+        "--worker",
+        "2",
         "--out",
         patches_path.to_str().unwrap(),
     ]));
@@ -123,6 +129,8 @@ fn prepare_sample_and_bench_workflow_runs_end_to_end() {
     assert_eq!(patches.len(), 10);
     let first_patch: serde_json::Value = serde_json::from_str(patches[0]).unwrap();
     assert_eq!(first_patch["patch_size"], serde_json::json!([8, 8, 8]));
+    assert_eq!(first_patch["epoch"], serde_json::json!(4));
+    assert_eq!(first_patch["worker"], serde_json::json!(2));
     assert!(patches
         .iter()
         .any(|line| line.contains("\"has_foreground\":true")));
@@ -280,6 +288,22 @@ fn runtime_commands_report_parse_and_legacy_alias_errors() {
     assert!(sample_bad_count
         .stderr
         .contains("invalid integer for --count: many"));
+
+    let sample_bad_seed = run_fail([
+        "sample",
+        "cache",
+        "--patch",
+        "8,8,8",
+        "--count",
+        "1",
+        "--seed",
+        "many",
+        "--out",
+        "patches.jsonl",
+    ]);
+    assert!(sample_bad_seed
+        .stderr
+        .contains("invalid integer for --seed: many"));
 
     let sample_cache_error = run_fail([
         "sample",

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr, sync::Arc};
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -141,6 +141,8 @@ pub struct SplitSummary {
     pub by: String,
     pub ratios: BTreeMap<String, f64>,
     pub stratify: Vec<String>,
+    #[serde(default)]
+    pub seed: u64,
     pub patient_overlap_count: usize,
     pub out_path: String,
 }
@@ -195,8 +197,8 @@ pub struct CacheSummary {
 pub struct LabelPolicy {
     pub positive: String,
     pub negative: String,
-    pub uncertain: String,
-    pub missing: String,
+    pub uncertain: LabelAction,
+    pub missing: LabelAction,
     pub loss_mask: String,
 }
 
@@ -205,8 +207,8 @@ impl Default for LabelPolicy {
         Self {
             positive: "label=1 mask=1".to_string(),
             negative: "label=0 mask=1".to_string(),
-            uncertain: "ignore".to_string(),
-            missing: "ignore".to_string(),
+            uncertain: LabelAction::Ignore,
+            missing: LabelAction::Ignore,
             loss_mask: "uncertain and missing labels are masked from loss".to_string(),
         }
     }
@@ -214,6 +216,55 @@ impl Default for LabelPolicy {
 
 fn default_label_policy() -> LabelPolicy {
     LabelPolicy::default()
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelAction {
+    #[default]
+    Ignore,
+    Zero,
+    Negative,
+    One,
+    Positive,
+    Fail,
+}
+
+impl LabelAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::Zero => "zero",
+            Self::Negative => "negative",
+            Self::One => "one",
+            Self::Positive => "positive",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+impl fmt::Display for LabelAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LabelAction {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "ignore" => Ok(Self::Ignore),
+            "zero" => Ok(Self::Zero),
+            "negative" => Ok(Self::Negative),
+            "one" => Ok(Self::One),
+            "positive" => Ok(Self::Positive),
+            "fail" => Ok(Self::Fail),
+            other => Err(format!(
+                "unsupported label policy {other:?}; expected ignore, zero, negative, one, positive, or fail"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -262,6 +313,7 @@ impl Default for TransferSyntaxPolicy {
                 medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
                 medkit_dicom::EXPLICIT_VR_BIG_ENDIAN.to_string(),
                 medkit_dicom::RLE_LOSSLESS.to_string(),
+                medkit_dicom::JPEG_BASELINE_8BIT.to_string(),
             ],
             unsupported_transfer_syntax: "fail".to_string(),
         }

@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -234,8 +234,10 @@ impl CxrDicomRecipe {
         LabelPolicy {
             positive: "label=1 mask=1".to_string(),
             negative: "label=0 mask=1".to_string(),
-            uncertain: self.labels.uncertain.clone(),
-            missing: self.labels.missing.clone(),
+            uncertain: crate::types::LabelAction::from_str(&self.labels.uncertain)
+                .expect("validated CXR recipe uncertain label policy"),
+            missing: crate::types::LabelAction::from_str(&self.labels.missing)
+                .expect("validated CXR recipe missing label policy"),
             loss_mask: format!(
                 "uncertain={} missing={}",
                 self.labels.uncertain, self.labels.missing
@@ -300,6 +302,7 @@ fn default_transfer_syntaxes() -> Vec<String> {
         medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
         medkit_dicom::EXPLICIT_VR_BIG_ENDIAN.to_string(),
         medkit_dicom::RLE_LOSSLESS.to_string(),
+        medkit_dicom::JPEG_BASELINE_8BIT.to_string(),
     ]
 }
 
@@ -387,7 +390,7 @@ test = 0.0
             .allow_transfer_syntaxes
             .contains(&medkit_dicom::RLE_LOSSLESS.to_string()));
         assert_eq!(recipe.image_size(), 512);
-        assert_eq!(recipe.label_policy().missing, "ignore");
+        assert_eq!(recipe.label_policy().missing.as_str(), "ignore");
         assert!(recipe.image_size_policy().transform.contains("resize=fit"));
         assert_eq!(
             recipe.presentation_policy().decoder_backend,

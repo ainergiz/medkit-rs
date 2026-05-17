@@ -9,7 +9,7 @@ pub enum DatasetLayout {
     /// Use full NIfTI stems as case IDs without stripping channel suffixes.
     #[default]
     Flat,
-    /// Treat image stems ending in `_0000` as nnU-Net single-channel image names.
+    /// Treat image stems ending in `_dddd` as nnU-Net channel image names.
     Nnunet,
 }
 
@@ -44,6 +44,16 @@ pub(crate) fn case_id_from_image_path_for_layout(
     )
 }
 
+pub(crate) fn channel_index_from_image_path_for_layout(
+    path: &Path,
+    layout: DatasetLayout,
+) -> Option<u16> {
+    match layout {
+        DatasetLayout::Flat => None,
+        DatasetLayout::Nnunet => nifti_stem(path).and_then(nnunet_channel_index),
+    }
+}
+
 /// Derives a case id from a label path.
 pub fn case_id_from_label_path(path: &Path) -> Option<String> {
     nifti_stem(path).map(ToString::to_string)
@@ -73,9 +83,21 @@ fn strip_nnunet_channel_suffix(stem: &str) -> &str {
     let Some((case_id, suffix)) = stem.rsplit_once('_') else {
         return stem;
     };
-    if suffix == "0000" {
+    if suffix.len() == 4
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        && suffix.parse::<u16>().is_ok_and(|value| value < 1000)
+    {
         case_id
     } else {
         stem
+    }
+}
+
+fn nnunet_channel_index(stem: &str) -> Option<u16> {
+    let (_, suffix) = stem.rsplit_once('_')?;
+    if suffix.len() == 4 && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        suffix.parse::<u16>().ok().filter(|value| *value < 1000)
+    } else {
+        None
     }
 }

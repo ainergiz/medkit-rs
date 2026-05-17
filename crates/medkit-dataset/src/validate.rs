@@ -11,9 +11,11 @@ use crate::{
     error::DatasetError,
     manifest::{path_string, summarize},
     pairing::{
-        case_id_from_image_path_for_layout, case_id_from_label_path, is_nifti_path, DatasetLayout,
+        case_id_from_image_path_for_layout, case_id_from_label_path,
+        channel_index_from_image_path_for_layout, is_nifti_path, DatasetLayout,
     },
-    render_report, CaseManifest, DatasetManifest, ImageRecord, Problem, ProblemCode, Result,
+    render_report, CaseImage, CaseManifest, DatasetManifest, ImageRecord, Problem, ProblemCode,
+    Result,
 };
 
 /// Configuration for dataset validation.
@@ -112,6 +114,7 @@ pub fn validate_dataset(config: &ValidationConfig) -> Result<DatasetManifest> {
             label_entry,
             &image_reader,
             &label_reader,
+            config.layout,
         ));
     }
 
@@ -158,6 +161,7 @@ fn validate_case(
     label_entry: Option<&IndexedPaths>,
     image_reader: &NiftiMetadataReader,
     label_reader: &NiftiMetadataReader,
+    layout: DatasetLayout,
 ) -> CaseManifest {
     let image_path = image_entry.and_then(IndexedPaths::first);
     let label_path = label_entry.and_then(IndexedPaths::first);
@@ -175,10 +179,10 @@ fn validate_case(
             "case has no label file",
         ));
     }
-    if image_entry.is_some_and(IndexedPaths::has_duplicates) {
+    if image_entry.is_some_and(|entry| entry.has_duplicate_channels(layout)) {
         problems.push(Problem::new(
             ProblemCode::DuplicateImage,
-            "multiple image files map to the same case id",
+            "multiple image files map to the same case id and channel",
         ));
     }
     if label_entry.is_some_and(IndexedPaths::has_duplicates) {
@@ -188,16 +192,37 @@ fn validate_case(
         ));
     }
 
-    let image_spec = image_path.and_then(|path| match image_reader.read_spec(path) {
-        Ok(spec) => Some(spec),
-        Err(error) => {
-            problems.push(Problem::new(
-                ProblemCode::ImageReadError,
-                format!("failed to read image metadata: {error}"),
-            ));
-            None
+    let mut image_specs = Vec::new();
+    let mut images = Vec::new();
+    if let Some(entry) = image_entry {
+        for path in &entry.paths {
+            let channel_index = channel_index_from_image_path_for_layout(path, layout);
+            let spec = match image_reader.read_spec(path) {
+                Ok(spec) => Some(spec),
+                Err(error) => {
+                    problems.push(Problem::new(
+                        ProblemCode::ImageReadError,
+                        format!(
+                            "failed to read image metadata for {}: {error}",
+                            path.display()
+                        ),
+                    ));
+                    None
+                }
+            };
+            let record = spec.as_ref().map(ImageRecord::from_spec);
+            images.push(CaseImage {
+                path: path_string(path),
+                channel_index,
+                modality: record.as_ref().map(|record| record.modality.clone()),
+                image: record,
+            });
+            if let Some(spec) = spec {
+                image_specs.push(spec);
+            }
         }
-    });
+    }
+    let image_spec = image_specs.first();
     let label_spec = label_path.and_then(|path| match label_reader.read_spec(path) {
         Ok(spec) => Some(spec),
         Err(error) => {
@@ -209,21 +234,25 @@ fn validate_case(
         }
     });
 
-    if let (Some(image_spec), Some(label_spec)) = (&image_spec, &label_spec) {
-        let report = image_spec
-            .geometry()
-            .compatibility_with(label_spec.geometry(), Default::default());
-        problems.extend(report.mismatches().iter().map(Problem::geometry));
+    if let Some(label_spec) = &label_spec {
+        for image_spec in &image_specs {
+            let report = image_spec
+                .geometry()
+                .compatibility_with(label_spec.geometry(), Default::default());
+            problems.extend(report.mismatches().iter().map(Problem::geometry));
+        }
     }
 
-    CaseManifest::new(
+    let mut case = CaseManifest::new(
         case_id,
         image_path.map(|path| path_string(path)),
         label_path.map(|path| path_string(path)),
-        image_spec.as_ref().map(ImageRecord::from_spec),
+        image_spec.map(ImageRecord::from_spec),
         label_spec.as_ref().map(ImageRecord::from_spec),
         problems,
-    )
+    );
+    case.images = images;
+    case
 }
 
 fn collect_index(
@@ -295,6 +324,19 @@ impl IndexedPaths {
 
     fn has_duplicates(&self) -> bool {
         self.paths.len() > 1
+    }
+
+    fn has_duplicate_channels(&self, layout: DatasetLayout) -> bool {
+        match layout {
+            DatasetLayout::Flat => self.has_duplicates(),
+            DatasetLayout::Nnunet => {
+                let mut seen = BTreeSet::new();
+                self.paths.iter().any(|path| {
+                    let channel = channel_index_from_image_path_for_layout(path, layout);
+                    !seen.insert(channel)
+                })
+            }
+        }
     }
 }
 

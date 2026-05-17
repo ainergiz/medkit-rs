@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     parser::DicomDataSet,
     types::{
-        EXPLICIT_VR_BIG_ENDIAN, EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN, RLE_LOSSLESS,
+        EXPLICIT_VR_BIG_ENDIAN, EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN,
+        JPEG_BASELINE_8BIT, RLE_LOSSLESS,
     },
     DicomError, Result,
 };
@@ -34,6 +35,31 @@ pub struct PresentedImage {
     pub height: usize,
     pub pixels: Vec<u8>,
     pub explanation: PixelExplanation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DicomPresentationOptions {
+    pub apply_rescale: bool,
+    pub voi: DicomVoiStrategy,
+    pub invert_monochrome1: bool,
+}
+
+impl Default for DicomPresentationOptions {
+    fn default() -> Self {
+        Self {
+            apply_rescale: true,
+            voi: DicomVoiStrategy::Auto,
+            invert_monochrome1: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DicomVoiStrategy {
+    #[default]
+    Auto,
+    Window,
+    MinMax,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +102,7 @@ impl DecoderBackend for NativeDecoderBackend {
                 | IMPLICIT_VR_LITTLE_ENDIAN
                 | EXPLICIT_VR_BIG_ENDIAN
                 | RLE_LOSSLESS
+                | JPEG_BASELINE_8BIT
         )
     }
 
@@ -97,6 +124,61 @@ impl DecoderBackend for NativeDecoderBackend {
             ));
         }
         let source_pixel_hash = sha256_hex(pixel_data);
+        if dataset.transfer_syntax_uid == JPEG_BASELINE_8BIT {
+            let image = image::load_from_memory(pixel_data).map_err(|error| {
+                DicomError::unsupported(
+                    &dataset.path,
+                    format!("failed to decode JPEG Baseline PixelData: {error}"),
+                )
+            })?;
+            let rows = dataset.u16_value((0x0028, 0x0010)).unwrap_or(0) as u32;
+            let columns = dataset.u16_value((0x0028, 0x0011)).unwrap_or(0) as u32;
+            if image.width() != columns || image.height() != rows {
+                return Err(DicomError::parse(
+                    &dataset.path,
+                    format!(
+                        "JPEG Baseline dimensions {}x{} do not match DICOM Columns/Rows {}x{}",
+                        image.width(),
+                        image.height(),
+                        columns,
+                        rows
+                    ),
+                ));
+            }
+            let samples_per_pixel = dataset.u16_value((0x0028, 0x0002)).unwrap_or(1);
+            let bytes = match samples_per_pixel {
+                1 => image.to_luma8().into_raw(),
+                3 => image.to_rgb8().into_raw(),
+                other => {
+                    return Err(DicomError::unsupported(
+                        &dataset.path,
+                        format!(
+                        "JPEG Baseline presentation supports 1 or 3 samples per pixel, got {other}"
+                    ),
+                    ))
+                }
+            };
+            if bytes.len() != expected_bytes {
+                return Err(DicomError::parse(
+                    &dataset.path,
+                    format!(
+                        "decoded JPEG Baseline length mismatch: expected {expected_bytes} bytes, got {}",
+                        bytes.len()
+                    ),
+                ));
+            }
+            return Ok(DecodedPixelData {
+                bytes,
+                source_pixel_hash,
+                backend: self.name().to_string(),
+                backend_version: self.version().to_string(),
+                compressed: true,
+                steps: vec![
+                    format!("decode transfer syntax {}", dataset.transfer_syntax_uid),
+                    "decode JPEG Baseline image".to_string(),
+                ],
+            });
+        }
         if dataset.transfer_syntax_uid == RLE_LOSSLESS {
             let bits_allocated = dataset.u16_value((0x0028, 0x0100)).unwrap_or(8);
             let samples_per_pixel = dataset.u16_value((0x0028, 0x0002)).unwrap_or(1);
@@ -151,12 +233,24 @@ pub fn present_dicom_pixels(path: impl AsRef<Path>) -> Result<PresentedImage> {
     present_dataset_pixels(&dataset)
 }
 
+pub fn present_dicom_pixels_with_options(
+    path: impl AsRef<Path>,
+    options: DicomPresentationOptions,
+) -> Result<PresentedImage> {
+    let dataset = DicomDataSet::from_file(path.as_ref())?;
+    present_dataset_pixels_with_backend_and_options(&dataset, &NativeDecoderBackend, options)
+}
+
 pub fn present_dicom_pixels_with_backend(
     path: impl AsRef<Path>,
     backend: &dyn DecoderBackend,
 ) -> Result<PresentedImage> {
     let dataset = DicomDataSet::from_file(path.as_ref())?;
-    present_dataset_pixels_with_backend(&dataset, backend)
+    present_dataset_pixels_with_backend_and_options(
+        &dataset,
+        backend,
+        DicomPresentationOptions::default(),
+    )
 }
 
 pub(crate) fn present_dataset_pixels(dataset: &DicomDataSet) -> Result<PresentedImage> {
@@ -167,6 +261,18 @@ pub(crate) fn present_dataset_pixels_with_backend(
     dataset: &DicomDataSet,
     backend: &dyn DecoderBackend,
 ) -> Result<PresentedImage> {
+    present_dataset_pixels_with_backend_and_options(
+        dataset,
+        backend,
+        DicomPresentationOptions::default(),
+    )
+}
+
+pub(crate) fn present_dataset_pixels_with_backend_and_options(
+    dataset: &DicomDataSet,
+    backend: &dyn DecoderBackend,
+    options: DicomPresentationOptions,
+) -> Result<PresentedImage> {
     let rows = required_u16(dataset, (0x0028, 0x0010), "Rows")? as usize;
     let columns = required_u16(dataset, (0x0028, 0x0011), "Columns")? as usize;
     if rows == 0 || columns == 0 {
@@ -176,10 +282,10 @@ pub(crate) fn present_dataset_pixels_with_backend(
         ));
     }
     let samples_per_pixel = dataset.u16_value((0x0028, 0x0002)).unwrap_or(1);
-    if samples_per_pixel != 1 {
+    if !matches!(samples_per_pixel, 1 | 3) {
         return Err(DicomError::unsupported(
             &dataset.path,
-            format!("only single-sample grayscale pixels are supported, got {samples_per_pixel}"),
+            format!("only 1-sample grayscale or 3-sample color pixels are supported, got {samples_per_pixel}"),
         ));
     }
     let bits_allocated = required_u16(dataset, (0x0028, 0x0100), "BitsAllocated")?;
@@ -193,50 +299,97 @@ pub(crate) fn present_dataset_pixels_with_backend(
         ));
     }
     let signed = dataset.u16_value((0x0028, 0x0103)).unwrap_or(0) != 0;
-    let expected = rows * columns * (bits_allocated as usize).div_ceil(8);
+    if samples_per_pixel == 3 && (bits_allocated != 8 || bits_stored != 8 || signed) {
+        return Err(DicomError::unsupported(
+            &dataset.path,
+            "3-sample color presentation currently requires unsigned 8-bit stored pixels",
+        ));
+    }
+    let expected = rows
+        .checked_mul(columns)
+        .and_then(|value| value.checked_mul(samples_per_pixel as usize))
+        .and_then(|value| value.checked_mul((bits_allocated as usize).div_ceil(8)))
+        .ok_or_else(|| DicomError::parse(&dataset.path, "expected pixel byte count overflow"))?;
     let decoded = backend.decode_pixels(dataset, expected)?;
+    let photometric = dataset
+        .string((0x0028, 0x0004))
+        .unwrap_or_else(|| "MONOCHROME2".to_string());
 
     let mut steps = decoded.steps.clone();
-    steps.push(format!(
-        "unpack {bits_allocated}-bit pixels with {bits_stored} stored bits"
-    ));
-    let mut values = unpack_pixels(
-        &decoded.bytes,
-        bits_allocated,
-        bits_stored,
-        signed,
-        dataset.pixel_is_big_endian(),
-        &dataset.path,
-    )?;
+    let mut values = if samples_per_pixel == 1 {
+        steps.push(format!(
+            "unpack {bits_allocated}-bit pixels with {bits_stored} stored bits"
+        ));
+        unpack_pixels(
+            &decoded.bytes,
+            bits_allocated,
+            bits_stored,
+            signed,
+            dataset.pixel_is_big_endian(),
+            &dataset.path,
+        )?
+    } else {
+        steps.push(format!(
+            "convert {} color samples to MONOCHROME2 luma",
+            photometric
+        ));
+        color_samples_to_luma(
+            &decoded.bytes,
+            &photometric,
+            decoded.compressed,
+            &dataset.path,
+        )?
+    };
     let slope = dataset.f32_value((0x0028, 0x1053)).unwrap_or(1.0);
     let intercept = dataset.f32_value((0x0028, 0x1052)).unwrap_or(0.0);
-    if slope != 1.0 || intercept != 0.0 {
+    if samples_per_pixel == 1 && options.apply_rescale && (slope != 1.0 || intercept != 0.0) {
         steps.push(format!("apply rescale slope={slope} intercept={intercept}"));
-    }
-    for value in &mut values {
-        *value = *value * slope + intercept;
+        for value in &mut values {
+            *value = *value * slope + intercept;
+        }
+    } else if samples_per_pixel == 1 && !options.apply_rescale && (slope != 1.0 || intercept != 0.0)
+    {
+        steps.push("skip rescale by presentation policy".to_string());
     }
     let min_value = values.iter().copied().fold(f32::INFINITY, f32::min);
     let max_value = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
-    let mut pixels = if let (Some(center), Some(width)) = (
+    let window = (
         dataset.f32_value((0x0028, 0x1050)),
         dataset.f32_value((0x0028, 0x1051)),
-    ) {
-        steps.push(format!("apply window center={center} width={width}"));
-        window_pixels(&values, center, width)
-    } else {
-        steps.push("scale min/max to u8".to_string());
-        min_max_pixels(&values, min_value, max_value)
+    );
+    let mut pixels = match (options.voi, window) {
+        (DicomVoiStrategy::Auto | DicomVoiStrategy::Window, (Some(center), Some(width)))
+            if samples_per_pixel == 1 =>
+        {
+            steps.push(format!("apply window center={center} width={width}"));
+            window_pixels(&values, center, width)
+        }
+        (DicomVoiStrategy::Window, _) => {
+            steps.push(
+                "requested window VOI but no usable window was present; scale min/max to u8"
+                    .to_string(),
+            );
+            min_max_pixels(&values, min_value, max_value)
+        }
+        _ => {
+            steps.push("scale min/max to u8".to_string());
+            min_max_pixels(&values, min_value, max_value)
+        }
     };
-    let photometric = dataset
-        .string((0x0028, 0x0004))
-        .unwrap_or_else(|| "MONOCHROME2".to_string());
-    if photometric.eq_ignore_ascii_case("MONOCHROME1") {
+    if samples_per_pixel == 1
+        && options.invert_monochrome1
+        && photometric.eq_ignore_ascii_case("MONOCHROME1")
+    {
         steps.push("invert MONOCHROME1 to MONOCHROME2".to_string());
         for value in &mut pixels {
             *value = 255u8.saturating_sub(*value);
         }
+    } else if samples_per_pixel == 1
+        && !options.invert_monochrome1
+        && photometric.eq_ignore_ascii_case("MONOCHROME1")
+    {
+        steps.push("skip MONOCHROME1 inversion by presentation policy".to_string());
     }
     steps.push("output canonical MONOCHROME2 u8 raster".to_string());
     let explanation = PixelExplanation {
@@ -420,6 +573,44 @@ fn unpack_pixels(
             format!("unsupported BitsAllocated {other}; expected 8 or 16"),
         )),
     }
+}
+
+fn color_samples_to_luma(
+    pixel_data: &[u8],
+    photometric: &str,
+    compressed: bool,
+    path: &Path,
+) -> Result<Vec<f32>> {
+    if pixel_data.len() % 3 != 0 {
+        return Err(DicomError::parse(
+            path,
+            format!(
+                "3-sample color PixelData length {} is not divisible by 3",
+                pixel_data.len()
+            ),
+        ));
+    }
+    let photometric = photometric.to_ascii_uppercase();
+    if photometric == "RGB" || (compressed && photometric.starts_with("YBR")) {
+        return Ok(pixel_data
+            .chunks_exact(3)
+            .map(|sample| {
+                0.299 * f32::from(sample[0])
+                    + 0.587 * f32::from(sample[1])
+                    + 0.114 * f32::from(sample[2])
+            })
+            .collect());
+    }
+    if photometric == "YBR_FULL" {
+        return Ok(pixel_data
+            .chunks_exact(3)
+            .map(|sample| f32::from(sample[0]))
+            .collect());
+    }
+    Err(DicomError::unsupported(
+        path,
+        format!("unsupported 3-sample photometric interpretation {photometric:?}"),
+    ))
 }
 
 fn sign_or_mask(raw: u32, bits_stored: u16, signed: bool) -> i32 {

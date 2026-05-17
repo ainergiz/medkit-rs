@@ -6,6 +6,7 @@ pub const EXPLICIT_VR_LITTLE_ENDIAN: &str = "1.2.840.10008.1.2.1";
 pub const IMPLICIT_VR_LITTLE_ENDIAN: &str = "1.2.840.10008.1.2";
 pub const EXPLICIT_VR_BIG_ENDIAN: &str = "1.2.840.10008.1.2.2";
 pub const RLE_LOSSLESS: &str = "1.2.840.10008.1.2.5";
+pub const JPEG_BASELINE_8BIT: &str = "1.2.840.10008.1.2.4.50";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DicomScanConfig {

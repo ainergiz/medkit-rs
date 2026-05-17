@@ -254,15 +254,19 @@ fn pixel_errors_are_specific() {
     write_fixture(
         &rgb,
         FixtureSpec {
+            photometric: "RGB",
             samples_per_pixel: 3,
-            pixels: vec![1; 12],
+            pixels: vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
             ..FixtureSpec::default()
         },
     );
-    assert!(present_dicom_pixels(&rgb)
-        .unwrap_err()
-        .to_string()
-        .contains("single-sample grayscale"));
+    let rgb_image = present_dicom_pixels(&rgb).unwrap();
+    assert_eq!(rgb_image.pixels.len(), 4);
+    assert!(rgb_image
+        .explanation
+        .steps
+        .iter()
+        .any(|step| step.contains("color samples")));
 }
 
 #[test]
@@ -291,6 +295,30 @@ fn rle_lossless_fixture_decodes_through_native_backend() {
         .steps
         .iter()
         .any(|step| step.contains("RLE Lossless")));
+}
+
+#[test]
+fn jpeg_baseline_fixture_decodes_through_native_backend() {
+    let root = unique_test_dir();
+    let jpeg = root.join("jpeg-baseline.dcm");
+    write_fixture(
+        &jpeg,
+        FixtureSpec {
+            transfer_syntax: JPEG_BASELINE_8BIT,
+            pixels: jpeg_luma_pixels(&[0, 64, 128, 255], 2, 2),
+            ..FixtureSpec::default()
+        },
+    );
+
+    let image = present_dicom_pixels(&jpeg).unwrap();
+    assert_eq!(image.width, 2);
+    assert_eq!(image.height, 2);
+    assert!(image.explanation.compressed);
+    assert!(image
+        .explanation
+        .steps
+        .iter()
+        .any(|step| step.contains("JPEG Baseline")));
 }
 
 #[test]
@@ -735,6 +763,15 @@ fn rle_single_segment_pixels(raw: &[u8]) -> Vec<u8> {
     bytes.push((raw.len() as u8).saturating_sub(1));
     bytes.extend_from_slice(raw);
     bytes
+}
+
+fn jpeg_luma_pixels(raw: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let image = image::GrayImage::from_raw(width, height, raw.to_vec()).unwrap();
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, image::ImageFormat::Jpeg)
+        .unwrap();
+    cursor.into_inner()
 }
 
 fn push_text(out: &mut Vec<u8>, tag: (u16, u16), vr: &str, value: &str, implicit: bool, be: bool) {

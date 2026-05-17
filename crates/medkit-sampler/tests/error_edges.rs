@@ -78,6 +78,11 @@ fn planning_and_patch_guards_return_invalid_input() {
 
     let prefix_error = ForegroundPrefix::from_values([2, 2, 2], vec![0; 3]).unwrap_err();
     assert_invalid_input(prefix_error, "foreground prefix");
+
+    let prefix =
+        ForegroundPrefix::from_label(&Volume3D::new([2, 2, 2], vec![0_u16; 8]).unwrap()).unwrap();
+    let bounds_error = prefix.count_checked([2, 0, 0], [1, 1, 1]).unwrap_err();
+    assert_invalid_input(bounds_error, "patch start");
 }
 
 #[test]
@@ -206,7 +211,13 @@ fn load_cached_cases_reads_volumes_and_derives_foreground_from_label() {
     assert_eq!(cases[0].image.data, vec![1.0, 2.0]);
     assert_eq!(cases[0].label.data, vec![0, 5]);
     assert_eq!(cases[0].foreground_indices, vec![1]);
-    assert_eq!(cases[0].foreground_prefix.count([0, 0, 0], [2, 1, 1]), 1);
+    assert_eq!(
+        cases[0]
+            .foreground_prefix
+            .count_checked([0, 0, 0], [2, 1, 1])
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -238,7 +249,13 @@ fn load_cached_cases_reads_persisted_foreground_artifacts() {
     let cases = load_cached_cases(&cache_dir).unwrap();
 
     assert_eq!(cases[0].foreground_indices, vec![1]);
-    assert_eq!(cases[0].foreground_prefix.count([1, 0, 0], [1, 1, 1]), 1);
+    assert_eq!(
+        cases[0]
+            .foreground_prefix
+            .count_checked([1, 0, 0], [1, 1, 1])
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -441,15 +458,21 @@ fn cached_case(cache_dir: &Path, shape: [usize; 3]) -> CachedCase {
             .join("image.f32.raw")
             .to_string_lossy()
             .into_owned(),
+        image_cache_sha256: String::new(),
         label_cache_path: cache_dir
             .join("label.u16.raw")
             .to_string_lossy()
             .into_owned(),
+        label_cache_sha256: String::new(),
         foreground_indices_path: None,
+        foreground_indices_sha256: None,
         foreground_prefix_path: None,
+        foreground_prefix_sha256: None,
         foreground_prefix_shape: None,
         image_chunk_cache_path: None,
+        image_chunk_cache_sha256: None,
         label_chunk_cache_path: None,
+        label_chunk_cache_sha256: None,
         shape,
         chunk_shape: shape,
         chunk_grid: None,

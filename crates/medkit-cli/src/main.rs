@@ -14,13 +14,14 @@ use medkit_cache::{
     inspect_cache, prepare_cache, validate_cache, CacheInspection, CacheManifest, PrepareConfig,
 };
 use medkit_cxr::{
-    cache_cxr, index_cxr, ingest_cxr_dicom, split_cxr, validate_cache_cxr, validate_cxr,
-    CacheConfig as CxrCacheConfig, CacheSummary as CxrCacheSummary,
-    CacheValidationSummary as CxrCacheValidationSummary, IndexConfig as CxrIndexConfig,
-    IndexSummary as CxrIndexSummary, IngestConfig as CxrIngestConfig,
-    IngestSummary as CxrIngestSummary, SplitConfig as CxrSplitConfig,
-    SplitSummary as CxrSplitSummary, ValidateCacheConfig as CxrValidateCacheConfig,
-    ValidateConfig as CxrValidateConfig, ValidationSummary as CxrValidationSummary,
+    cache_cxr_with_options, index_cxr, ingest_cxr_dicom, split_cxr, validate_cache_cxr,
+    validate_cxr, CacheConfig as CxrCacheConfig, CacheSummary as CxrCacheSummary,
+    CacheValidationSummary as CxrCacheValidationSummary, CxrCacheOptions,
+    IndexConfig as CxrIndexConfig, IndexSummary as CxrIndexSummary,
+    IngestConfig as CxrIngestConfig, IngestSummary as CxrIngestSummary, LabelAction,
+    SplitConfig as CxrSplitConfig, SplitSummary as CxrSplitSummary,
+    ValidateCacheConfig as CxrValidateCacheConfig, ValidateConfig as CxrValidateConfig,
+    ValidationSummary as CxrValidationSummary,
 };
 use medkit_dataset::{
     validate_dataset, write_manifest_json, write_report, DatasetLayout, DatasetManifest,
@@ -87,6 +88,9 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
             strategy,
             count,
             out_path,
+            seed,
+            epoch,
+            worker,
         } => {
             let summary = sample_cache(&SampleConfig {
                 cache_dir,
@@ -94,9 +98,9 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
                 strategy,
                 count,
                 out_path: out_path.clone(),
-                seed: 0,
-                epoch: 0,
-                worker: 0,
+                seed,
+                epoch,
+                worker,
             })?;
             print_sample_summary(&summary, &out_path);
             Ok(())
@@ -211,13 +215,15 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
             splits_path,
             plan_path,
             cache_dir,
+            options,
         } => {
-            let summary = cache_cxr(&CxrCacheConfig {
+            let config = CxrCacheConfig {
                 manifest_path,
                 splits_path,
                 plan_path,
                 cache_dir,
-            })?;
+            };
+            let summary = cache_cxr_with_options(&config, &options)?;
             print_cxr_cache_summary(&summary);
             Ok(())
         }
@@ -359,6 +365,9 @@ enum Command {
         strategy: SamplingStrategy,
         count: usize,
         out_path: PathBuf,
+        seed: u64,
+        epoch: u64,
+        worker: u64,
     },
     CacheInspect {
         cache_dir: PathBuf,
@@ -408,6 +417,7 @@ enum Command {
         splits_path: PathBuf,
         plan_path: PathBuf,
         cache_dir: PathBuf,
+        options: Box<CxrCacheOptions>,
     },
     CxrValidateCache {
         cache_dir: PathBuf,
@@ -991,12 +1001,51 @@ fn parse_cxr_cache_command(mut args: impl Iterator<Item = OsString>) -> Result<C
     let mut splits_path = None;
     let mut plan_path = None;
     let mut cache_dir = None;
+    let mut options = CxrCacheOptions::default();
     let mut rest = args.peekable();
     while let Some(flag) = rest.next() {
         match flag.to_string_lossy().as_ref() {
             "--splits" => splits_path = Some(next_path(&mut rest, "--splits")?),
             "--plan" => plan_path = Some(next_path(&mut rest, "--plan")?),
             "--cache" => cache_dir = Some(next_path(&mut rest, "--cache")?),
+            "--targets" => options.targets = parse_csv_list(&next_string(&mut rest, "--targets")?),
+            "--uncertain" => {
+                options.label_policy.uncertain =
+                    parse_label_action(&next_string(&mut rest, "--uncertain")?, "--uncertain")?
+            }
+            "--missing" => {
+                options.label_policy.missing =
+                    parse_label_action(&next_string(&mut rest, "--missing")?, "--missing")?
+            }
+            "--dicom-apply-rescale" => {
+                options.dicom_presentation_policy.apply_rescale = parse_bool(
+                    &next_string(&mut rest, "--dicom-apply-rescale")?,
+                    "--dicom-apply-rescale",
+                )?
+            }
+            "--dicom-voi" => {
+                options.dicom_presentation_policy.voi = next_string(&mut rest, "--dicom-voi")?
+            }
+            "--dicom-invert-monochrome1" => {
+                options.dicom_presentation_policy.invert_monochrome1 = parse_bool(
+                    &next_string(&mut rest, "--dicom-invert-monochrome1")?,
+                    "--dicom-invert-monochrome1",
+                )?
+            }
+            "--dicom-output" => {
+                options.dicom_presentation_policy.output = next_string(&mut rest, "--dicom-output")?
+            }
+            "--allow-transfer-syntaxes" => {
+                options.transfer_syntax_policy.allow_transfer_syntaxes =
+                    parse_csv_list(&next_string(&mut rest, "--allow-transfer-syntaxes")?)
+            }
+            "--unsupported-transfer-syntax" => {
+                options.transfer_syntax_policy.unsupported_transfer_syntax =
+                    parse_transfer_syntax_action(&next_string(
+                        &mut rest,
+                        "--unsupported-transfer-syntax",
+                    )?)?
+            }
             "--help" | "-h" => return Err(CliError::usage()),
             other => {
                 return Err(CliError::Message(format!(
@@ -1014,6 +1063,7 @@ fn parse_cxr_cache_command(mut args: impl Iterator<Item = OsString>) -> Result<C
             .ok_or_else(|| CliError::Message(format!("missing --plan\n\n{}", usage())))?,
         cache_dir: cache_dir
             .ok_or_else(|| CliError::Message(format!("missing --cache\n\n{}", usage())))?,
+        options: Box::new(options),
     })
 }
 
@@ -1210,6 +1260,9 @@ fn parse_sample_command(mut args: impl Iterator<Item = OsString>) -> Result<Comm
     let mut strategy = None;
     let mut count = None;
     let mut out_path = None;
+    let mut seed = 0_u64;
+    let mut epoch = 0_u64;
+    let mut worker = 0_u64;
     let mut rest = args.peekable();
     while let Some(flag) = rest.next() {
         match flag.to_string_lossy().as_ref() {
@@ -1218,6 +1271,9 @@ fn parse_sample_command(mut args: impl Iterator<Item = OsString>) -> Result<Comm
                 strategy = Some(parse_strategy(&next_string(&mut rest, "--strategy")?)?)
             }
             "--count" => count = Some(parse_usize(&next_string(&mut rest, "--count")?, "--count")?),
+            "--seed" => seed = parse_u64(&next_string(&mut rest, "--seed")?, "--seed")?,
+            "--epoch" => epoch = parse_u64(&next_string(&mut rest, "--epoch")?, "--epoch")?,
+            "--worker" => worker = parse_u64(&next_string(&mut rest, "--worker")?, "--worker")?,
             "--out" => out_path = Some(next_path(&mut rest, "--out")?),
             "--help" | "-h" => return Err(CliError::usage()),
             other => {
@@ -1236,6 +1292,9 @@ fn parse_sample_command(mut args: impl Iterator<Item = OsString>) -> Result<Comm
         count: count.ok_or_else(|| CliError::Message(format!("missing --count\n\n{}", usage())))?,
         out_path: out_path
             .ok_or_else(|| CliError::Message(format!("missing --out\n\n{}", usage())))?,
+        seed,
+        epoch,
+        worker,
     })
 }
 
@@ -1397,6 +1456,16 @@ fn parse_f64(value: &str, flag: &str) -> Result<f64, CliError> {
         .map_err(|_| CliError::Message(format!("invalid float for {flag}: {value}")))
 }
 
+fn parse_bool(value: &str, flag: &str) -> Result<bool, CliError> {
+    match value {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        other => Err(CliError::Message(format!(
+            "invalid boolean for {flag}: {other}"
+        ))),
+    }
+}
+
 fn parse_shape4(value: &str, flag: &str) -> Result<[usize; 4], CliError> {
     let parts = value.split(',').collect::<Vec<_>>();
     if parts.len() != 4 {
@@ -1426,6 +1495,21 @@ fn parse_strategy(value: &str) -> Result<SamplingStrategy, CliError> {
         "foreground-balanced" | "foreground_balanced" => Ok(SamplingStrategy::ForegroundBalanced),
         other => Err(CliError::Message(format!(
             "unsupported sampling strategy: {other}"
+        ))),
+    }
+}
+
+fn parse_label_action(value: &str, flag: &str) -> Result<LabelAction, CliError> {
+    value
+        .parse::<LabelAction>()
+        .map_err(|error| CliError::Message(format!("invalid {flag}: {error}")))
+}
+
+fn parse_transfer_syntax_action(value: &str) -> Result<String, CliError> {
+    match value {
+        "fail" | "warn" | "skip" => Ok(value.to_string()),
+        other => Err(CliError::Message(format!(
+            "invalid --unsupported-transfer-syntax {other:?}; expected fail, warn, or skip"
         ))),
     }
 }
@@ -1844,7 +1928,31 @@ impl From<serde_json::Error> for CliError {
 }
 
 fn usage() -> String {
-    "Usage:\n  medkit dataset validate <root> [--images imagesTr] [--labels labelsTr] [--layout flat|nnunet] [--out manifest.json] [--report report.txt]\n  medkit prepare <root> --manifest manifest.json --plan ct-segmentation.toml --cache .medkit/cache [--chunk 96,96,96]\n  medkit sample <cache> --patch 96,96,96 --strategy foreground-balanced --count 10000 --out patches.jsonl\n  medkit cache inspect <cache>\n  medkit cache validate <cache>\n  medkit bench <cache> --patch 96,96,96 --workers 8 [--samples 10000]\n  medkit bench-plan <cache> --patches patches.jsonl --workers 8 [--samples 10000]\n  medkit cxr manifest --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr manifest --dicom-index dicom-index.jsonl [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr index --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr validate <manifest.jsonl> [--require-frontal] [--check-patient-leakage] [--check-duplicates] --report validation.md\n  medkit cxr split <manifest.jsonl> --by patient_id --train 0.8 --val 0.1 --test 0.1 [--stratify Pneumonia,view_position] [--seed 0] --out splits.json\n  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache\n  medkit cxr validate-cache <cache> [--split train] [--targets Pneumonia] [--image-shape n,c,h,w] [--plan cxr-512.toml] [--report cache-validation.md] [--json cache-validation.json]\n  medkit cxr ingest <raw-dicom> --recipe cxr-dicom-512.toml --labels labels.csv --cache .medkit/cxr-cache --workdir .medkit/cxr-ingest --report ingestion-report.md [--dry-run] [--workers 4]\n  medkit cxr benchmark [--manifest manifest.jsonl] [--splits splits.json] [--plan cxr-512.toml] [--targets Pneumonia] [--baselines pytorch_raw,monai_raw,medkit_cached_mmap] [--batch-sizes 64,128] [--workers 8,16] [--device cuda:0] [--out benchmark.json]\n  medkit dicom scan <root> --out inventory.jsonl --report dicom-report.md [--workers 4]\n  medkit dicom browse <root> --group patient,study,series --out graph.json --report graph-report.md [--workers 4]\n  medkit dicom inspect <file.dcm>\n  medkit dicom pixels --explain <file.dcm>\n  medkit dicom view <file.dcm> [--width 80]".to_string()
+    [
+        "Usage:",
+        "  medkit dataset validate <root> [--images imagesTr] [--labels labelsTr] [--layout flat|nnunet] [--out manifest.json] [--report report.txt]",
+        "  medkit prepare <root> --manifest manifest.json --plan ct-segmentation.toml --cache .medkit/cache [--chunk 96,96,96]",
+        "  medkit sample <cache> --patch 96,96,96 --strategy foreground-balanced --count 10000 --out patches.jsonl [--seed 123] [--epoch 4] [--worker 2]",
+        "  medkit cache inspect <cache>",
+        "  medkit cache validate <cache>",
+        "  medkit bench <cache> --patch 96,96,96 --workers 8 [--samples 10000]",
+        "  medkit bench-plan <cache> --patches patches.jsonl --workers 8 [--samples 10000]",
+        "  medkit cxr manifest --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl",
+        "  medkit cxr manifest --dicom-index dicom-index.jsonl [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl",
+        "  medkit cxr index --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl",
+        "  medkit cxr validate <manifest.jsonl> [--require-frontal] [--check-patient-leakage] [--check-duplicates] --report validation.md",
+        "  medkit cxr split <manifest.jsonl> --by patient_id --train 0.8 --val 0.1 --test 0.1 [--stratify Pneumonia,view_position] [--seed 0] --out splits.json",
+        "  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache [--targets Pneumonia,No Finding] [--uncertain ignore] [--missing ignore] [--dicom-apply-rescale true] [--dicom-voi auto] [--dicom-invert-monochrome1 true] [--allow-transfer-syntaxes uid,uid] [--unsupported-transfer-syntax fail]",
+        "  medkit cxr validate-cache <cache> [--split train] [--targets Pneumonia] [--image-shape n,c,h,w] [--plan cxr-512.toml] [--report cache-validation.md] [--json cache-validation.json]",
+        "  medkit cxr ingest <raw-dicom> --recipe cxr-dicom-512.toml --labels labels.csv --cache .medkit/cxr-cache --workdir .medkit/cxr-ingest --report ingestion-report.md [--dry-run] [--workers 4]",
+        "  medkit cxr benchmark [--manifest manifest.jsonl] [--splits splits.json] [--plan cxr-512.toml] [--targets Pneumonia] [--baselines pytorch_raw,monai_raw,medkit_cached_mmap] [--batch-sizes 64,128] [--workers 8,16] [--device cuda:0] [--out benchmark.json]",
+        "  medkit dicom scan <root> --out inventory.jsonl --report dicom-report.md [--workers 4]",
+        "  medkit dicom browse <root> --group patient,study,series --out graph.json --report graph-report.md [--workers 4]",
+        "  medkit dicom inspect <file.dcm>",
+        "  medkit dicom pixels --explain <file.dcm>",
+        "  medkit dicom view <file.dcm> [--width 80]",
+    ]
+    .join("\n")
 }
 
 #[cfg(test)]

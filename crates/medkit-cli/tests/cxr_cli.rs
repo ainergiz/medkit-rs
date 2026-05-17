@@ -95,6 +95,16 @@ fn cxr_cli_indexes_splits_validates_and_caches_fixture() {
         root.join("plan.toml").to_str().unwrap(),
         "--cache",
         cache.to_str().unwrap(),
+        "--targets",
+        "No Finding,Pneumonia",
+        "--uncertain",
+        "positive",
+        "--missing",
+        "zero",
+        "--dicom-apply-rescale",
+        "false",
+        "--dicom-voi",
+        "minmax",
     ]);
     let mut cache_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(cache.join("cache-metadata.json")).unwrap())
@@ -104,8 +114,23 @@ fn cxr_cli_indexes_splits_validates_and_caches_fixture() {
     assert_eq!(cache_json["image_size"].as_u64().unwrap(), 8);
     assert_eq!(
         cache_json["label_policy"]["uncertain"].as_str().unwrap(),
-        "ignore"
+        "positive"
     );
+    assert_eq!(
+        cache_json["label_policy"]["missing"].as_str().unwrap(),
+        "zero"
+    );
+    assert!(!cache_json["dicom_presentation_policy"]["apply_rescale"]
+        .as_bool()
+        .unwrap());
+    assert_eq!(
+        cache_json["dicom_presentation_policy"]["voi"]
+            .as_str()
+            .unwrap(),
+        "minmax"
+    );
+    assert_eq!(cache_json["split_policy"]["train"].as_f64().unwrap(), 0.5);
+    assert_eq!(cache_json["split_policy"]["seed"].as_u64().unwrap(), 0);
     assert!(
         cache_json["source_manifest_checksum"]
             .as_str()
@@ -114,6 +139,10 @@ fn cxr_cli_indexes_splits_validates_and_caches_fixture() {
             >= 64
     );
     assert_eq!(
+        cache_json["transform_fingerprint"].as_str().unwrap().len(),
+        64
+    );
+    assert_ne!(
         cache_json["transform_fingerprint"].as_str().unwrap(),
         cache_json["transform_plan_hash"].as_str().unwrap()
     );
@@ -458,6 +487,23 @@ fn cxr_cli_reports_parse_errors_without_running_products() {
 
     let cache_help = run_medkit_fail(&["cxr", "cache", "manifest.jsonl", "--help"]);
     assert!(cache_help.stderr.contains("Usage:"));
+
+    let bad_split_ratios = run_medkit_fail(&[
+        "cxr",
+        "split",
+        "manifest.jsonl",
+        "--train",
+        "0.8",
+        "--val",
+        "0.8",
+        "--test",
+        "0.1",
+        "--out",
+        "splits.json",
+    ]);
+    assert!(bad_split_ratios
+        .stderr
+        .contains("train+val+test must equal 1.0"));
 
     let validate_cache_missing_cache = run_medkit_fail(&["cxr", "validate-cache"]);
     assert!(validate_cache_missing_cache.stderr.contains("Usage:"));

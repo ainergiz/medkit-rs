@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     types::{
         DicomInspectReport, DicomInventoryRecord, DicomWarning, EXPLICIT_VR_BIG_ENDIAN,
-        EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN, RLE_LOSSLESS,
+        EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN, JPEG_BASELINE_8BIT, RLE_LOSSLESS,
     },
     DicomError, Result,
 };
@@ -289,6 +289,7 @@ impl DicomDataSet {
                 | IMPLICIT_VR_LITTLE_ENDIAN
                 | EXPLICIT_VR_BIG_ENDIAN
                 | RLE_LOSSLESS
+                | JPEG_BASELINE_8BIT
         )
     }
 
@@ -415,6 +416,7 @@ fn syntax_modes(uid: &str) -> (Option<Endian>, Option<VrMode>) {
         IMPLICIT_VR_LITTLE_ENDIAN => (Some(Endian::Little), Some(VrMode::Implicit)),
         EXPLICIT_VR_BIG_ENDIAN => (Some(Endian::Big), Some(VrMode::Explicit)),
         RLE_LOSSLESS => (Some(Endian::Little), Some(VrMode::Explicit)),
+        JPEG_BASELINE_8BIT => (Some(Endian::Little), Some(VrMode::Explicit)),
         _ => (None, None),
     }
 }

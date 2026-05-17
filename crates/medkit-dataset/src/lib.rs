@@ -16,7 +16,8 @@ mod validate;
 
 pub use error::{DatasetError, Result};
 pub use manifest::{
-    CaseManifest, CaseStatus, DatasetManifest, ImageRecord, Problem, ProblemCode, ValidationSummary,
+    CaseImage, CaseManifest, CaseStatus, DatasetManifest, ImageRecord, Problem, ProblemCode,
+    ValidationSummary,
 };
 pub use pairing::{case_id_from_image_path, case_id_from_label_path, DatasetLayout};
 pub use report::render_report;

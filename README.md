@@ -24,6 +24,7 @@ Validate an nnU-Net-style NIfTI segmentation dataset:
 cargo run -p medkit-cli -- dataset validate ./data \
   --images imagesTr \
   --labels labelsTr \
+  --layout nnunet \
   --out manifest.json \
   --report report.txt
 ```
@@ -45,6 +46,9 @@ cargo run -p medkit-cli -- sample .medkit/cache \
   --patch 96,96,96 \
   --strategy foreground-balanced \
   --count 10000 \
+  --seed 123 \
+  --epoch 0 \
+  --worker 0 \
   --out patches.jsonl
 
 cargo run -p medkit-cli -- bench-plan .medkit/cache \

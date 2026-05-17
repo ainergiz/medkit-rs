@@ -79,6 +79,7 @@ pub fn split_cxr(config: &SplitConfig) -> Result<SplitSummary, CxrError> {
             config.by
         )));
     }
+    validate_split_ratios(config.train, config.val, config.test)?;
     let mut records = read_manifest(&config.manifest_path)?;
     let mut by_patient: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
@@ -110,6 +111,7 @@ pub fn split_cxr(config: &SplitConfig) -> Result<SplitSummary, CxrError> {
         by: "patient_id".to_string(),
         ratios,
         stratify: config.stratify.clone(),
+        seed: config.seed,
         patient_overlap_count: 0,
         out_path: config.out_path.display().to_string(),
     };
@@ -122,6 +124,23 @@ pub fn split_cxr(config: &SplitConfig) -> Result<SplitSummary, CxrError> {
     write_json(&config.out_path, &split_file)?;
     write_manifest(&config.manifest_path, &records)?;
     Ok(summary)
+}
+
+fn validate_split_ratios(train: f64, val: f64, test: f64) -> Result<(), CxrError> {
+    for (name, value) in [("train", train), ("val", val), ("test", test)] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(CxrError::Message(format!(
+                "split ratio {name} must be finite and non-negative, got {value}"
+            )));
+        }
+    }
+    let sum = train + val + test;
+    if (sum - 1.0).abs() > 1.0e-6 {
+        return Err(CxrError::Message(format!(
+            "split train+val+test must equal 1.0, got {sum}"
+        )));
+    }
+    Ok(())
 }
 
 fn assign_patient_splits_by_hash(

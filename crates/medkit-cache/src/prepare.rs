@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::{nifti_pixels, CacheError, Result};
 
 const CACHE_MANIFEST: &str = "cache_manifest.json";
+const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Configuration for deterministic cache preparation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,23 +86,41 @@ pub struct CachedCase {
     pub output_geometry: VolumeGeometry,
     /// Cached image path.
     pub image_cache_path: String,
+    /// SHA-256 of the cached image artifact.
+    #[serde(default)]
+    pub image_cache_sha256: String,
     /// Cached label path.
     pub label_cache_path: String,
+    /// SHA-256 of the cached label artifact.
+    #[serde(default)]
+    pub label_cache_sha256: String,
     /// Cached foreground index path with little-endian u64 flat indices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_indices_path: Option<String>,
+    /// SHA-256 of the foreground index artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_indices_sha256: Option<String>,
     /// Cached foreground integral-volume path with little-endian u32 values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_prefix_path: Option<String>,
+    /// SHA-256 of the foreground prefix artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_prefix_sha256: Option<String>,
     /// Foreground prefix shape in x, y, z order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_prefix_shape: Option<[usize; 3]>,
     /// Optional fixed-size chunked image path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_chunk_cache_path: Option<String>,
+    /// SHA-256 of the optional fixed-size chunked image artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_chunk_cache_sha256: Option<String>,
     /// Optional fixed-size chunked label path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_chunk_cache_path: Option<String>,
+    /// SHA-256 of the optional fixed-size chunked label artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_chunk_cache_sha256: Option<String>,
     /// Optional fixed-size chunk grid in x, y, z order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_grid: Option<[usize; 3]>,
@@ -195,7 +215,7 @@ fn prepare_cache_in_staging(
     }
 
     let cache_manifest = CacheManifest {
-        version: 1,
+        version: CACHE_SCHEMA_VERSION,
         cache_dir: config.cache_dir.to_string_lossy().into_owned(),
         dataset_manifest_path: config.manifest_path.to_string_lossy().into_owned(),
         transform_plan_hash: plan_hash,
@@ -238,6 +258,7 @@ fn promote_staged_cache(
         let staged_case_dir = staging_dir.join(&case.cache_key);
         let final_case_dir = cache_dir.join(&case.cache_key);
         if final_case_dir.exists() {
+            validate_existing_case_dir(&final_case_dir, case)?;
             cleanup_staging(&staged_case_dir)?;
         } else {
             fs::rename(&staged_case_dir, &final_case_dir)
@@ -253,6 +274,22 @@ fn promote_staged_cache(
     fs::rename(&staged_manifest, &final_manifest)
         .map_err(|source| CacheError::io(&final_manifest, source))?;
     cleanup_staging(staging_dir)
+}
+
+fn validate_existing_case_dir(final_case_dir: &Path, case: &CachedCase) -> Result<()> {
+    let case_json = final_case_dir.join("case.json");
+    let text =
+        fs::read_to_string(&case_json).map_err(|source| CacheError::io(&case_json, source))?;
+    let existing: CachedCase =
+        serde_json::from_str(&text).map_err(|source| CacheError::json(&case_json, source))?;
+    if existing != *case {
+        return Err(CacheError::invalid_input(format!(
+            "existing cache case {} at {} does not match staged metadata; remove the case directory or rebuild into a clean cache",
+            case.case_id,
+            final_case_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 fn prepare_case(
@@ -303,7 +340,22 @@ fn prepare_case(
         &image.source_content_hash,
         &label.source_content_hash,
     )?;
-    let cache_key = cache_key(&case.case_id, &source_metadata_hash, plan_hash);
+    let effective_chunk_shape =
+        chunk_shape.map(|shape| valid_chunk_shape(shape, prepared.image.shape));
+    let storage_layout = if effective_chunk_shape.is_some() {
+        "chunked"
+    } else {
+        "resident"
+    };
+    let cache_key = cache_key(
+        &case.case_id,
+        &source_metadata_hash,
+        plan_hash,
+        CACHE_SCHEMA_VERSION,
+        storage_layout,
+        effective_chunk_shape,
+        CACHE_WRITER_VERSION,
+    );
     let staging_case_dir = staging_cache_dir.join(&cache_key);
     let final_case_dir = final_cache_dir.join(&cache_key);
     fs::create_dir_all(&staging_case_dir)
@@ -319,6 +371,9 @@ fn prepare_case(
     write_f32_volume(&prepared.image, &staging_image_cache_path)?;
     write_u16_volume(&prepared.label, &staging_label_cache_path)?;
     write_u64_indices(&foreground_indices, &staging_foreground_indices_path)?;
+    let image_cache_sha256 = sha256_file(&staging_image_cache_path)?;
+    let label_cache_sha256 = sha256_file(&staging_label_cache_path)?;
+    let foreground_indices_sha256 = sha256_file(&staging_foreground_indices_path)?;
     let foreground_prefix_shape = [
         prepared.label.shape[0] + 1,
         prepared.label.shape[1] + 1,
@@ -326,8 +381,8 @@ fn prepare_case(
     ];
     let foreground_prefix = foreground_prefix_values(&prepared.label);
     write_u32_values(&foreground_prefix, &staging_foreground_prefix_path)?;
-    let chunk_shape = chunk_shape.map(|shape| valid_chunk_shape(shape, prepared.image.shape));
-    let chunk_paths = if let Some(chunk_shape) = chunk_shape {
+    let foreground_prefix_sha256 = sha256_file(&staging_foreground_prefix_path)?;
+    let chunk_paths = if let Some(chunk_shape) = effective_chunk_shape {
         let staging_image_chunk_cache_path = staging_case_dir.join("image.chunks.f32.raw");
         let staging_label_chunk_cache_path = staging_case_dir.join("label.chunks.u16.raw");
         let image_chunk_cache_path = final_case_dir.join("image.chunks.f32.raw");
@@ -342,12 +397,16 @@ fn prepare_case(
             chunk_shape,
             &staging_label_chunk_cache_path,
         )?;
+        let image_chunk_cache_sha256 = sha256_file(&staging_image_chunk_cache_path)?;
+        let label_chunk_cache_sha256 = sha256_file(&staging_label_chunk_cache_path)?;
         let chunk_grid = chunk_grid(prepared.image.shape, chunk_shape);
         Some((
             chunk_shape,
             chunk_grid,
             image_chunk_cache_path,
             label_chunk_cache_path,
+            image_chunk_cache_sha256,
+            label_chunk_cache_sha256,
         ))
     } else {
         None
@@ -356,22 +415,32 @@ fn prepare_case(
         + prepared.label.data.len() * 2
         + foreground_indices.len() * 8
         + foreground_prefix.len() * 4;
-    if let Some((chunk_shape, chunk_grid, _, _)) = &chunk_paths {
+    if let Some((chunk_shape, chunk_grid, _, _, _, _)) = &chunk_paths {
         let chunk_voxels = chunk_shape[0] * chunk_shape[1] * chunk_shape[2];
         let chunks = chunk_grid[0] * chunk_grid[1] * chunk_grid[2];
         bytes_written += chunks * chunk_voxels * (4 + 2);
     }
-    let (chunk_shape_out, chunk_grid, image_chunk_cache_path, label_chunk_cache_path) =
-        if let Some((chunk_shape, chunk_grid, image_path, label_path)) = chunk_paths {
-            (
-                chunk_shape,
-                Some(chunk_grid),
-                Some(image_path.to_string_lossy().into_owned()),
-                Some(label_path.to_string_lossy().into_owned()),
-            )
-        } else {
-            (prepared.image.shape, None, None, None)
-        };
+    let (
+        chunk_shape_out,
+        chunk_grid,
+        image_chunk_cache_path,
+        label_chunk_cache_path,
+        image_chunk_cache_sha256,
+        label_chunk_cache_sha256,
+    ) = if let Some((chunk_shape, chunk_grid, image_path, label_path, image_hash, label_hash)) =
+        chunk_paths
+    {
+        (
+            chunk_shape,
+            Some(chunk_grid),
+            Some(image_path.to_string_lossy().into_owned()),
+            Some(label_path.to_string_lossy().into_owned()),
+            Some(image_hash),
+            Some(label_hash),
+        )
+    } else {
+        (prepared.image.shape, None, None, None, None, None)
+    };
     let cached = CachedCase {
         case_id: case.case_id.clone(),
         cache_key,
@@ -382,12 +451,18 @@ fn prepare_case(
         source_geometry,
         output_geometry: prepared.geometry,
         image_cache_path: image_cache_path.to_string_lossy().into_owned(),
+        image_cache_sha256,
         label_cache_path: label_cache_path.to_string_lossy().into_owned(),
+        label_cache_sha256,
         foreground_indices_path: Some(foreground_indices_path.to_string_lossy().into_owned()),
+        foreground_indices_sha256: Some(foreground_indices_sha256),
         foreground_prefix_path: Some(foreground_prefix_path.to_string_lossy().into_owned()),
+        foreground_prefix_sha256: Some(foreground_prefix_sha256),
         foreground_prefix_shape: Some(foreground_prefix_shape),
         image_chunk_cache_path,
+        image_chunk_cache_sha256,
         label_chunk_cache_path,
+        label_chunk_cache_sha256,
         shape: prepared.image.shape,
         chunk_shape: chunk_shape_out,
         chunk_grid,
@@ -405,11 +480,18 @@ fn prepare_case(
 
 fn resolve_manifest_source_path(dataset_root: &Path, path: &str) -> PathBuf {
     let path = PathBuf::from(path);
-    if path.is_absolute() || path.exists() {
+    if path.is_absolute() {
         path
     } else {
         dataset_root.join(path)
     }
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).map_err(|source| CacheError::io(path, source))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn write_f32_volume(volume: &Volume3D<f32>, path: &Path) -> Result<()> {
@@ -621,11 +703,37 @@ fn source_hash(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn cache_key(case_id: &str, source_hash: &str, plan_hash: &str) -> String {
+fn cache_key(
+    case_id: &str,
+    source_hash: &str,
+    plan_hash: &str,
+    cache_schema_version: u32,
+    storage_layout: &str,
+    effective_chunk_shape: Option<[usize; 3]>,
+    writer_version: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(case_id.as_bytes());
+    hasher.update(b"\0");
     hasher.update(source_hash.as_bytes());
+    hasher.update(b"\0");
     hasher.update(plan_hash.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(cache_schema_version.to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(storage_layout.as_bytes());
+    hasher.update(b"\0");
+    match effective_chunk_shape {
+        Some(shape) => {
+            hasher.update(b"chunked");
+            for value in shape {
+                hasher.update(value.to_le_bytes());
+            }
+        }
+        None => hasher.update(b"resident"),
+    }
+    hasher.update(b"\0");
+    hasher.update(writer_version.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -756,6 +864,12 @@ mod tests {
         assert_eq!(cached.source_metadata_hash.len(), 64);
         assert_eq!(cached.transform_plan_hash, manifest.transform_plan_hash);
         assert_eq!(cached.transform_plan_hash.len(), 64);
+        assert_eq!(cached.image_cache_sha256.len(), 64);
+        assert_eq!(cached.label_cache_sha256.len(), 64);
+        assert_eq!(cached.foreground_indices_sha256.as_ref().unwrap().len(), 64);
+        assert_eq!(cached.foreground_prefix_sha256.as_ref().unwrap().len(), 64);
+        assert_eq!(cached.image_chunk_cache_sha256.as_ref().unwrap().len(), 64);
+        assert_eq!(cached.label_chunk_cache_sha256.as_ref().unwrap().len(), 64);
         assert_eq!(cached.image_path, path_text(&image_path));
         assert_eq!(cached.label_path, path_text(&label_path));
         assert_eq!(cached.source_geometry.spacing, [1.0, 1.0, 1.0]);
@@ -803,6 +917,24 @@ mod tests {
         assert_eq!(inspection.chunked_cases, 1);
         assert_eq!(inspection.artifact_bytes, 204);
         assert!(crate::validate_cache(&cache_dir).unwrap().errors.is_empty());
+        fs::write(Path::new(&cached.image_cache_path), vec![0_u8; 24]).unwrap();
+        assert!(
+            crate::inspect_cache(&cache_dir).unwrap().errors.is_empty(),
+            "fast inspection should not read payload hashes"
+        );
+        let strict = crate::validate_cache(&cache_dir).unwrap();
+        assert_eq!(strict.status, "failed");
+        assert!(strict
+            .errors
+            .iter()
+            .any(|error| error.contains("image cache") && error.contains("SHA-256")));
+        fs::write(
+            Path::new(&cached.image_cache_path),
+            NiftiFixture::new(&[3, 2, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .split_off(VOX_OFFSET),
+        )
+        .unwrap();
         let case_json = Path::new(&cached.image_cache_path)
             .parent()
             .unwrap()
@@ -997,6 +1129,60 @@ mod tests {
     }
 
     #[test]
+    fn chunk_shape_changes_cache_key_and_promotes_chunk_artifacts() {
+        let root = temp_dir("prepare-chunk-key");
+        let image_path = root.join("case_chunk_0000.nii");
+        let label_path = root.join("case_chunk.nii");
+        let manifest_path = root.join("manifest.json");
+        let plan_path = root.join("plan.toml");
+        let cache_dir = root.join("cache");
+        fs::write(
+            &image_path,
+            NiftiFixture::new(&[3, 2, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        fs::write(
+            &label_path,
+            NiftiFixture::new(&[3, 2, 1], 512, &[1.0, 1.0, 1.0])
+                .append_u16_pixels(&[0, 1, 0, 2, 0, 3]),
+        )
+        .unwrap();
+        write_plan(&plan_path, identity_plan());
+        write_manifest(
+            &manifest_path,
+            &root,
+            vec![valid_case(
+                "case_chunk",
+                Some(&image_path),
+                Some(&label_path),
+            )],
+        );
+
+        let resident = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path: manifest_path.clone(),
+            plan_path: plan_path.clone(),
+            cache_dir: cache_dir.clone(),
+            chunk_shape: None,
+        })
+        .unwrap();
+        let chunked = prepare_cache(&PrepareConfig {
+            dataset_root: root,
+            manifest_path,
+            plan_path,
+            cache_dir: cache_dir.clone(),
+            chunk_shape: Some([2, 2, 2]),
+        })
+        .unwrap();
+
+        assert_ne!(resident.cases[0].cache_key, chunked.cases[0].cache_key);
+        assert!(chunked.cases[0].image_chunk_cache_path.is_some());
+        assert!(Path::new(chunked.cases[0].image_chunk_cache_path.as_ref().unwrap()).is_file());
+        assert_eq!(crate::validate_cache(&cache_dir).unwrap().status, "ok");
+    }
+
+    #[test]
     fn prepare_cache_resolves_manifest_paths_under_dataset_root() {
         let root = temp_dir("prepare-root-relative");
         let image_dir = root.join("images");
@@ -1083,13 +1269,43 @@ mod tests {
 
     #[test]
     fn cache_key_is_stable_hash_without_raw_case_id_prefix() {
-        let first = cache_key("case_a", "source", "plan");
-        let second = cache_key("case_a", "source", "plan");
-        let different_plan = cache_key("case_a", "source", "other-plan");
-        let path_like = cache_key("../case_a", "source", "plan");
+        let first = cache_key("case_a", "source", "plan", 1, "resident", None, "writer");
+        let second = cache_key("case_a", "source", "plan", 1, "resident", None, "writer");
+        let different_plan = cache_key(
+            "case_a",
+            "source",
+            "other-plan",
+            1,
+            "resident",
+            None,
+            "writer",
+        );
+        let different_chunk = cache_key(
+            "case_a",
+            "source",
+            "plan",
+            1,
+            "chunked",
+            Some([2, 2, 1]),
+            "writer",
+        );
+        let different_schema = cache_key("case_a", "source", "plan", 2, "resident", None, "writer");
+        let different_writer = cache_key(
+            "case_a",
+            "source",
+            "plan",
+            1,
+            "resident",
+            None,
+            "other-writer",
+        );
+        let path_like = cache_key("../case_a", "source", "plan", 1, "resident", None, "writer");
 
         assert_eq!(first, second);
         assert_ne!(first, different_plan);
+        assert_ne!(first, different_chunk);
+        assert_ne!(first, different_schema);
+        assert_ne!(first, different_writer);
         assert_ne!(first, path_like);
         assert_eq!(first.len(), 64);
         assert!(!path_like.contains('/'));
@@ -1107,6 +1323,7 @@ mod tests {
             image_path: image_path.map(path_text),
             label_path: label_path.map(path_text),
             image: None,
+            images: Vec::new(),
             label: None,
             problems: Vec::new(),
         }
@@ -1119,6 +1336,7 @@ mod tests {
             image_path: None,
             label_path: None,
             image: None,
+            images: Vec::new(),
             label: None,
             problems: Vec::new(),
         }

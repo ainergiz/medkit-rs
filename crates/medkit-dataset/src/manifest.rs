@@ -64,6 +64,9 @@ pub struct CaseManifest {
     pub label_path: Option<String>,
     /// Image metadata, if successfully read.
     pub image: Option<ImageRecord>,
+    /// Structured image channels for layouts such as nnU-Net multi-modal cases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<CaseImage>,
     /// Label metadata, if successfully read.
     pub label: Option<ImageRecord>,
     /// Problems found for this case.
@@ -91,10 +94,27 @@ impl CaseManifest {
             image_path,
             label_path,
             image,
+            images: Vec::new(),
             label,
             problems,
         }
     }
+}
+
+/// One image channel belonging to a manifest case.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaseImage {
+    /// Image path.
+    pub path: String,
+    /// Optional nnU-Net-style channel index parsed from `_dddd` suffixes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_index: Option<u16>,
+    /// Optional modality label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modality: Option<String>,
+    /// Image metadata, if successfully read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageRecord>,
 }
 
 /// Serializable metadata extracted from an image spec.

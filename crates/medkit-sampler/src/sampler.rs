@@ -280,7 +280,7 @@ pub fn extract_patch_pair_into(
     }
     copy_patch_rows(&case.image, start, patch_size, image_out);
     copy_patch_rows(&case.label, start, patch_size, label_out);
-    Ok(case.foreground_prefix.count(start, patch_size) != 0)
+    Ok(case.foreground_prefix.count_unchecked(start, patch_size) != 0)
 }
 
 /// Extracts an aligned image/label patch from memory-mapped resident cache files.
@@ -380,7 +380,7 @@ pub fn foreground_voxels_in_patch(
 ) -> Result<usize> {
     validate_patch(patch_size)?;
     validate_patch_start(case.label.shape, start, patch_size)?;
-    Ok(case.foreground_prefix.count(start, patch_size))
+    case.foreground_prefix.count_checked(start, patch_size)
 }
 
 fn sample_record(
@@ -406,7 +406,9 @@ fn sample_record(
     let has_foreground = if want_foreground && !case.foreground_indices.is_empty() {
         true
     } else {
-        case.foreground_prefix.count(start, config.patch_size) != 0
+        case.foreground_prefix
+            .count_unchecked(start, config.patch_size)
+            != 0
     };
     Ok(PatchRecord {
         index,
@@ -554,8 +556,14 @@ impl ForegroundPrefix {
         })
     }
 
-    /// Counts foreground voxels inside a half-open patch.
-    pub fn count(&self, start: [usize; 3], size: [usize; 3]) -> usize {
+    /// Counts foreground voxels inside a half-open patch after validating bounds.
+    pub fn count_checked(&self, start: [usize; 3], size: [usize; 3]) -> Result<usize> {
+        validate_patch(size)?;
+        validate_patch_start(self.shape, start, size)?;
+        Ok(self.count_unchecked(start, size))
+    }
+
+    fn count_unchecked(&self, start: [usize; 3], size: [usize; 3]) -> usize {
         let end = [start[0] + size[0], start[1] + size[1], start[2] + size[2]];
         let [x0, y0, z0] = start;
         let [x1, y1, z1] = end;

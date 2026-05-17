@@ -416,6 +416,7 @@ fn dry_run_summary(
         by: recipe.split_policy().by,
         ratios: BTreeMap::new(),
         stratify: recipe.split.stratify.clone(),
+        seed: recipe.split.seed,
         patient_overlap_count: 0,
         out_path: paths.splits.clone(),
     };

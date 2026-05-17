@@ -47,6 +47,7 @@ fn nnunet_layout_strips_only_explicit_image_channel_suffix() {
     let root = temp_case_dir("nnunet-layout");
     let (images, labels) = create_dataset_dirs(&root);
     fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("liver_001_0000.nii"));
+    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("liver_001_0001.nii"));
     fixture(&[8, 8, 8], 2, &[1.0, 1.0, 1.0]).write_nii(&labels.join("liver_001.nii"));
     fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("patient_2024.nii"));
     fixture(&[8, 8, 8], 2, &[1.0, 1.0, 1.0]).write_nii(&labels.join("patient_2024.nii"));
@@ -61,6 +62,14 @@ fn nnunet_layout_strips_only_explicit_image_channel_suffix() {
         .cases
         .iter()
         .any(|case| case.case_id == "liver_001"));
+    let liver = manifest
+        .cases
+        .iter()
+        .find(|case| case.case_id == "liver_001")
+        .unwrap();
+    assert_eq!(liver.images.len(), 2);
+    assert_eq!(liver.images[0].channel_index, Some(0));
+    assert_eq!(liver.images[1].channel_index, Some(1));
     assert!(manifest
         .cases
         .iter()

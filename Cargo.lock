@@ -515,6 +515,7 @@ dependencies = [
 name = "medkit-dicom"
 version = "0.1.0"
 dependencies = [
+ "image",
  "serde",
  "serde_json",
  "sha2",

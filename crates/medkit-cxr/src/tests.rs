@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    cache::{image_size_from_plan, read_split_file, records_for_split},
+    cache::{image_size_from_plan, read_split_file, records_for_split, resize_luma_fit_pad},
     manifest::{
         is_frontal, is_image_path, parse_label_value, patient_from_filename, read_label_csv,
         write_manifest,
@@ -48,7 +48,8 @@ fn splits_are_patient_safe_and_cache_builds() {
     assert_eq!(cache.report_schema_version, CXR_REPORT_SCHEMA_VERSION);
     assert_eq!(cache.image_size, 8);
     assert_eq!(cache.label_policy, LabelPolicy::default());
-    assert_eq!(cache.transform_fingerprint, cache.transform_plan_hash);
+    assert_eq!(cache.transform_fingerprint.len(), 64);
+    assert_ne!(cache.transform_fingerprint, cache.transform_plan_hash);
     assert_eq!(cache.split_names, vec!["test", "train", "val"]);
     assert_eq!(cache.image_size_policy.height, 8);
     assert!(!cache.source_manifest_checksum.is_empty());
@@ -88,6 +89,18 @@ fn splits_are_patient_safe_and_cache_builds() {
 
     let empty = reader.read_batch(reader.samples(), 1).unwrap();
     assert_eq!(empty.samples, 0);
+}
+
+#[test]
+fn cxr_resize_preserves_aspect_ratio_and_pads_to_square() {
+    let image = image::GrayImage::from_fn(4, 2, |x, _| image::Luma([(x + 1) as u8]));
+    let resized = resize_luma_fit_pad(&image, 8, 0).unwrap();
+
+    assert_eq!(resized.dimensions(), (8, 8));
+    assert!(resized.as_raw()[0..8].iter().all(|value| *value == 0));
+    assert!(resized.as_raw()[8..16].iter().all(|value| *value == 0));
+    assert!(resized.as_raw()[16..24].iter().any(|value| *value != 0));
+    assert!(resized.as_raw()[48..64].iter().all(|value| *value == 0));
 }
 
 #[test]
@@ -1579,8 +1592,8 @@ fn cache_build_uses_configured_label_policy_for_uncertain_and_missing_values() {
     .unwrap();
 
     let policy = LabelPolicy {
-        uncertain: "positive".to_string(),
-        missing: "zero".to_string(),
+        uncertain: crate::types::LabelAction::Positive,
+        missing: crate::types::LabelAction::Zero,
         loss_mask: "uncertain=positive missing=zero".to_string(),
         ..LabelPolicy::default()
     };
@@ -1631,8 +1644,8 @@ fn cache_build_uses_configured_label_policy_for_uncertain_and_missing_values() {
         },
         &CxrCacheOptions {
             label_policy: LabelPolicy {
-                uncertain: "fail".to_string(),
-                missing: "ignore".to_string(),
+                uncertain: crate::types::LabelAction::Fail,
+                missing: crate::types::LabelAction::Ignore,
                 loss_mask: "uncertain=fail missing=ignore".to_string(),
                 ..LabelPolicy::default()
             },
@@ -1744,6 +1757,7 @@ fn empty_train_rgb_cache_and_remaining_fallbacks_are_covered() {
             by: "patient_id".to_string(),
             ratios: BTreeMap::new(),
             stratify: Vec::new(),
+            seed: 0,
             patient_overlap_count: 0,
             out_path: root.join("splits.json").display().to_string(),
         },

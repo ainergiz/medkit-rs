@@ -4,6 +4,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{read_cache_manifest, CachedCase, Result};
 
@@ -65,14 +66,22 @@ pub struct CacheInspection {
 
 /// Inspects cache metadata and artifact sizes without reading tensor payloads.
 pub fn inspect_cache(cache_dir: impl AsRef<Path>) -> Result<CacheInspection> {
-    let cache_dir = cache_dir.as_ref();
+    inspect_cache_inner(cache_dir.as_ref(), false)
+}
+
+/// Validates cache metadata, artifact sizes, and artifact hashes.
+pub fn validate_cache(cache_dir: impl AsRef<Path>) -> Result<CacheInspection> {
+    inspect_cache_inner(cache_dir.as_ref(), true)
+}
+
+fn inspect_cache_inner(cache_dir: &Path, strict_hashes: bool) -> Result<CacheInspection> {
     let manifest = read_cache_manifest(cache_dir)?;
     let mut case_reports = Vec::with_capacity(manifest.cases.len());
     let mut errors = Vec::new();
     let mut artifact_bytes = 0_u64;
     let mut chunked_cases = 0_usize;
     for case in &manifest.cases {
-        let report = inspect_case(case);
+        let report = inspect_case(case, strict_hashes);
         if report.storage == CacheStorageKind::Chunked {
             chunked_cases += 1;
         }
@@ -99,12 +108,7 @@ pub fn inspect_cache(cache_dir: impl AsRef<Path>) -> Result<CacheInspection> {
     })
 }
 
-/// Validates cache metadata and artifact sizes.
-pub fn validate_cache(cache_dir: impl AsRef<Path>) -> Result<CacheInspection> {
-    inspect_cache(cache_dir)
-}
-
-fn inspect_case(case: &CachedCase) -> CacheCaseInspection {
+fn inspect_case(case: &CachedCase, strict_hashes: bool) -> CacheCaseInspection {
     let mut errors = Vec::new();
     let mut bytes = 0_u64;
     let voxels = value_count(case.shape);
@@ -114,14 +118,35 @@ fn inspect_case(case: &CachedCase) -> CacheCaseInspection {
         "image cache",
         &mut errors,
     );
+    check_file_hash(
+        strict_hashes,
+        &case.image_cache_path,
+        Some(case.image_cache_sha256.as_str()),
+        "image cache",
+        &mut errors,
+    );
     bytes += check_file_bytes(
         &case.label_cache_path,
         voxels.map(|count| count * 2),
         "label cache",
         &mut errors,
     );
+    check_file_hash(
+        strict_hashes,
+        &case.label_cache_path,
+        Some(case.label_cache_sha256.as_str()),
+        "label cache",
+        &mut errors,
+    );
     if let Some(path) = &case.foreground_indices_path {
         bytes += check_file_multiple(path, 8, "foreground indices", &mut errors);
+        check_file_hash(
+            strict_hashes,
+            path,
+            case.foreground_indices_sha256.as_deref(),
+            "foreground indices",
+            &mut errors,
+        );
     }
     if let Some(path) = &case.foreground_prefix_path {
         let prefix_shape = case.foreground_prefix_shape.unwrap_or([
@@ -135,13 +160,20 @@ fn inspect_case(case: &CachedCase) -> CacheCaseInspection {
             "foreground prefix",
             &mut errors,
         );
+        check_file_hash(
+            strict_hashes,
+            path,
+            case.foreground_prefix_sha256.as_deref(),
+            "foreground prefix",
+            &mut errors,
+        );
     }
 
     let storage = if case.image_chunk_cache_path.is_some()
         || case.label_chunk_cache_path.is_some()
         || case.chunk_grid.is_some()
     {
-        inspect_chunked_case(case, &mut bytes, &mut errors);
+        inspect_chunked_case(case, strict_hashes, &mut bytes, &mut errors);
         CacheStorageKind::Chunked
     } else {
         CacheStorageKind::Resident
@@ -159,7 +191,12 @@ fn inspect_case(case: &CachedCase) -> CacheCaseInspection {
     }
 }
 
-fn inspect_chunked_case(case: &CachedCase, bytes: &mut u64, errors: &mut Vec<String>) {
+fn inspect_chunked_case(
+    case: &CachedCase,
+    strict_hashes: bool,
+    bytes: &mut u64,
+    errors: &mut Vec<String>,
+) {
     let Some(chunk_grid) = case.chunk_grid else {
         errors.push("chunked storage is missing chunk_grid".to_string());
         return;
@@ -179,6 +216,13 @@ fn inspect_chunked_case(case: &CachedCase, bytes: &mut u64, errors: &mut Vec<Str
                 "image chunk cache",
                 errors,
             );
+            check_file_hash(
+                strict_hashes,
+                path,
+                case.image_chunk_cache_sha256.as_deref(),
+                "image chunk cache",
+                errors,
+            );
         }
         None => errors.push("chunked storage is missing image_chunk_cache_path".to_string()),
     }
@@ -187,6 +231,13 @@ fn inspect_chunked_case(case: &CachedCase, bytes: &mut u64, errors: &mut Vec<Str
             *bytes += check_file_bytes(
                 path,
                 chunk_values.map(|count| count * 2),
+                "label chunk cache",
+                errors,
+            );
+            check_file_hash(
+                strict_hashes,
+                path,
+                case.label_chunk_cache_sha256.as_deref(),
                 "label chunk cache",
                 errors,
             );
@@ -247,6 +298,43 @@ fn check_file_multiple(path: &str, multiple: u64, kind: &str, errors: &mut Vec<S
             0
         }
     }
+}
+
+fn check_file_hash(
+    strict_hashes: bool,
+    path: &str,
+    expected: Option<&str>,
+    kind: &str,
+    errors: &mut Vec<String>,
+) {
+    if !strict_hashes {
+        return;
+    }
+    let Some(expected) = expected.filter(|value| !value.is_empty()) else {
+        errors.push(format!(
+            "{kind} {} is missing SHA-256 metadata",
+            PathBuf::from(path).display()
+        ));
+        return;
+    };
+    match sha256_file(Path::new(path)) {
+        Ok(actual) if actual == expected => {}
+        Ok(actual) => errors.push(format!(
+            "{kind} {} has SHA-256 {actual}, expected {expected}",
+            PathBuf::from(path).display()
+        )),
+        Err(error) => errors.push(format!(
+            "could not hash {kind} {}: {error}",
+            PathBuf::from(path).display()
+        )),
+    }
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn value_count(shape: [usize; 3]) -> std::result::Result<usize, String> {

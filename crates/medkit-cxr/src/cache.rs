@@ -8,8 +8,9 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use image::{imageops::FilterType, DynamicImage, GrayImage};
+use image::{imageops::FilterType, DynamicImage, GrayImage, Luma};
 use memmap2::Mmap;
+use sha2::{Digest, Sha256};
 
 use crate::{
     error::CxrError,
@@ -109,13 +110,14 @@ fn cache_cxr_in_staging(
         options.targets.clone()
     };
     let transform_plan_hash = hash_file(&config.plan_path)?;
+    let transform_fingerprint = cache_transform_fingerprint(&transform_plan_hash, options)?;
     let transform_description = if records.iter().any(is_dicom_record) {
-        "medkit-dicom presentation to MONOCHROME2 u8, resize square, normalize dataset mean/std"
+        "medkit-dicom presentation to MONOCHROME2 u8, resize longest side, pad square, normalize dataset mean/std"
     } else {
-        "decode grayscale, resize square, normalize dataset mean/std"
+        "decode grayscale, resize longest side, pad square, normalize dataset mean/std"
     };
     let train_records = records_for_split(records, &split_file.train)?;
-    let normalization = estimate_normalization(&train_records, image_size)?;
+    let normalization = estimate_normalization(&train_records, image_size, options)?;
     let mut splits = BTreeMap::new();
     for (name, ids) in [
         ("train", &split_file.train),
@@ -130,7 +132,7 @@ fn cache_cxr_in_staging(
             &targets,
             image_size,
             &normalization,
-            &options.label_policy,
+            options,
         )?;
         splits.insert(name.to_string(), split_summary);
     }
@@ -146,7 +148,7 @@ fn cache_cxr_in_staging(
         targets,
         label_policy: options.label_policy.clone(),
         normalization,
-        transform_fingerprint: transform_plan_hash.clone(),
+        transform_fingerprint,
         transform_plan_hash,
         recipe_hash: options.recipe_hash.clone(),
         recipe_path: options.recipe_path.clone(),
@@ -165,7 +167,7 @@ fn cache_cxr_in_staging(
         },
         dicom_presentation_policy: options.dicom_presentation_policy.clone(),
         transfer_syntax_policy: options.transfer_syntax_policy.clone(),
-        split_policy: options.split_policy.clone(),
+        split_policy: effective_split_policy(options, split_file),
         splits,
         failed_samples: Vec::new(),
         cache_size_bytes: directory_size(staging_dir)?,
@@ -891,7 +893,7 @@ fn write_cache_split(
     targets: &[String],
     image_size: usize,
     normalization: &Normalization,
-    label_policy: &LabelPolicy,
+    options: &CxrCacheOptions,
 ) -> Result<CacheSplitSummary, CxrError> {
     let images_name = format!("{split}-images.float32.dat");
     let labels_name = format!("{split}-labels.float32.dat");
@@ -907,18 +909,20 @@ fn write_cache_split(
     let mut metadata = BufWriter::new(File::create(&metadata_path)?);
 
     for record in records {
-        let values = preprocess_image(record, image_size, normalization).map_err(|error| {
-            CxrError::Message(format!(
-                "failed to preprocess sample {}: {error}",
-                record.sample_id
-            ))
-        })?;
+        let values =
+            preprocess_image(record, image_size, normalization, options).map_err(|error| {
+                CxrError::Message(format!(
+                    "failed to preprocess sample {}: {error}",
+                    record.sample_id
+                ))
+            })?;
         for value in values {
             images.write_all(&value.to_le_bytes())?;
         }
         for target in targets {
             let value = record.labels.get(target).copied().flatten();
-            let (label, mask) = encode_label_value(value, label_policy, &record.sample_id, target)?;
+            let (label, mask) =
+                encode_label_value(value, &options.label_policy, &record.sample_id, target)?;
             labels.write_all(&label.to_le_bytes())?;
             masks.write_all(&mask.to_le_bytes())?;
         }
@@ -950,27 +954,24 @@ fn encode_label_value(
     match value {
         Some(1) => Ok((1.0, 1.0)),
         Some(0) => Ok((0.0, 1.0)),
-        Some(-1) => encode_special_label(&policy.uncertain, "uncertain", sample_id, target),
-        None => encode_special_label(&policy.missing, "missing", sample_id, target),
+        Some(-1) => encode_special_label(policy.uncertain, "uncertain", sample_id, target),
+        None => encode_special_label(policy.missing, "missing", sample_id, target),
         Some(other) => Ok((f32::from(other), 1.0)),
     }
 }
 
 fn encode_special_label(
-    action: &str,
+    action: crate::types::LabelAction,
     kind: &str,
     sample_id: &str,
     target: &str,
 ) -> Result<(f32, f32), CxrError> {
     match action {
-        "ignore" => Ok((0.0, 0.0)),
-        "zero" | "negative" => Ok((0.0, 1.0)),
-        "one" | "positive" => Ok((1.0, 1.0)),
-        "fail" => Err(CxrError::Message(format!(
+        crate::types::LabelAction::Ignore => Ok((0.0, 0.0)),
+        crate::types::LabelAction::Zero | crate::types::LabelAction::Negative => Ok((0.0, 1.0)),
+        crate::types::LabelAction::One | crate::types::LabelAction::Positive => Ok((1.0, 1.0)),
+        crate::types::LabelAction::Fail => Err(CxrError::Message(format!(
             "{kind} label for sample {sample_id} target {target} is disallowed by label policy"
-        ))),
-        other => Err(CxrError::Message(format!(
-            "unsupported {kind} label policy {other:?}; expected ignore, zero, negative, one, positive, or fail"
         ))),
     }
 }
@@ -978,13 +979,14 @@ fn encode_special_label(
 fn estimate_normalization(
     records: &[CxrRecord],
     image_size: usize,
+    options: &CxrCacheOptions,
 ) -> Result<Normalization, CxrError> {
     let mut sum = 0.0f64;
     let mut sq_sum = 0.0f64;
     let mut count = 0usize;
     let stride = (records.len() / 512).max(1);
     for record in records.iter().step_by(stride) {
-        let gray = load_resized_luma(record, image_size)?;
+        let gray = load_resized_luma(record, image_size, options)?;
         for value in gray {
             let scaled = value as f64 / 255.0;
             sum += scaled;
@@ -1010,8 +1012,9 @@ fn preprocess_image(
     record: &CxrRecord,
     image_size: usize,
     normalization: &Normalization,
+    options: &CxrCacheOptions,
 ) -> Result<Vec<f32>, CxrError> {
-    let gray = load_resized_luma(record, image_size)?;
+    let gray = load_resized_luma(record, image_size, options)?;
     Ok(gray
         .into_iter()
         .map(|value| {
@@ -1021,9 +1024,18 @@ fn preprocess_image(
         .collect())
 }
 
-fn load_resized_luma(record: &CxrRecord, image_size: usize) -> Result<Vec<u8>, CxrError> {
+fn load_resized_luma(
+    record: &CxrRecord,
+    image_size: usize,
+    options: &CxrCacheOptions,
+) -> Result<Vec<u8>, CxrError> {
     if is_dicom_record(record) {
-        load_resized_dicom_luma(&record.image_path, image_size)
+        validate_dicom_transfer_syntax(record, &options.transfer_syntax_policy)?;
+        load_resized_dicom_luma(
+            &record.image_path,
+            image_size,
+            &options.dicom_presentation_policy,
+        )
     } else {
         load_resized_raster_luma(&record.image_path, image_size)
     }
@@ -1035,26 +1047,141 @@ fn load_resized_raster_luma(path: &str, image_size: usize) -> Result<Vec<u8>, Cx
         DynamicImage::ImageLuma8(value) => value,
         other => other.to_luma8(),
     };
-    let resized = image::imageops::resize(
-        &gray,
-        image_size as u32,
-        image_size as u32,
-        FilterType::Triangle,
-    );
-    Ok(resized.into_raw())
+    Ok(resize_luma_fit_pad(&gray, image_size, 0)?.into_raw())
 }
 
-fn load_resized_dicom_luma(path: &str, image_size: usize) -> Result<Vec<u8>, CxrError> {
-    let image = medkit_dicom::present_dicom_pixels(path)?;
+fn load_resized_dicom_luma(
+    path: &str,
+    image_size: usize,
+    policy: &DicomPresentationPolicy,
+) -> Result<Vec<u8>, CxrError> {
+    let image =
+        medkit_dicom::present_dicom_pixels_with_options(path, dicom_presentation_options(policy)?)?;
     let gray = GrayImage::from_raw(image.width as u32, image.height as u32, image.pixels)
         .ok_or_else(|| CxrError::Message(format!("invalid DICOM raster shape for {path}")))?;
-    let resized = image::imageops::resize(
-        &gray,
-        image_size as u32,
-        image_size as u32,
-        FilterType::Triangle,
-    );
-    Ok(resized.into_raw())
+    Ok(resize_luma_fit_pad(&gray, image_size, 0)?.into_raw())
+}
+
+pub(crate) fn resize_luma_fit_pad(
+    gray: &GrayImage,
+    image_size: usize,
+    pad_value: u8,
+) -> Result<GrayImage, CxrError> {
+    if image_size == 0 {
+        return Err(CxrError::Message(
+            "image size must be greater than zero".to_string(),
+        ));
+    }
+    let (width, height) = gray.dimensions();
+    if width == 0 || height == 0 {
+        return Err(CxrError::Message(
+            "cannot resize an image with zero width or height".to_string(),
+        ));
+    }
+    let image_size_u32 = image_size as u32;
+    let scale = (image_size as f32 / width as f32).min(image_size as f32 / height as f32);
+    let resized_width = ((width as f32 * scale).round() as u32).clamp(1, image_size_u32);
+    let resized_height = ((height as f32 * scale).round() as u32).clamp(1, image_size_u32);
+    let resized =
+        image::imageops::resize(gray, resized_width, resized_height, FilterType::Triangle);
+    let mut canvas = GrayImage::from_pixel(image_size_u32, image_size_u32, Luma([pad_value]));
+    let x = ((image_size_u32 - resized_width) / 2) as i64;
+    let y = ((image_size_u32 - resized_height) / 2) as i64;
+    image::imageops::overlay(&mut canvas, &resized, x, y);
+    Ok(canvas)
+}
+
+fn validate_dicom_transfer_syntax(
+    record: &CxrRecord,
+    policy: &TransferSyntaxPolicy,
+) -> Result<(), CxrError> {
+    if policy.allow_transfer_syntaxes.is_empty() {
+        return Ok(());
+    }
+    let Some(uid) = &record.transfer_syntax_uid else {
+        return Ok(());
+    };
+    if policy
+        .allow_transfer_syntaxes
+        .iter()
+        .any(|allowed| allowed == uid)
+    {
+        return Ok(());
+    }
+    match policy.unsupported_transfer_syntax.as_str() {
+        "warn" => Ok(()),
+        "skip" => Err(CxrError::Message(format!(
+            "sample {} has unsupported transfer syntax {uid}; direct cache cannot skip split members",
+            record.sample_id
+        ))),
+        _ => Err(CxrError::Message(format!(
+            "sample {} has unsupported transfer syntax {uid}",
+            record.sample_id
+        ))),
+    }
+}
+
+fn dicom_presentation_options(
+    policy: &DicomPresentationPolicy,
+) -> Result<medkit_dicom::DicomPresentationOptions, CxrError> {
+    let voi = match policy.voi.as_str() {
+        "auto" => medkit_dicom::DicomVoiStrategy::Auto,
+        "window" => medkit_dicom::DicomVoiStrategy::Window,
+        "minmax" | "min_max" => medkit_dicom::DicomVoiStrategy::MinMax,
+        other => {
+            return Err(CxrError::Message(format!(
+                "unsupported DICOM VOI policy {other:?}; expected auto, window, or minmax"
+            )))
+        }
+    };
+    if policy.output != "mono8" {
+        return Err(CxrError::Message(format!(
+            "unsupported DICOM presentation output {:?}; expected mono8",
+            policy.output
+        )));
+    }
+    Ok(medkit_dicom::DicomPresentationOptions {
+        apply_rescale: policy.apply_rescale,
+        voi,
+        invert_monochrome1: policy.invert_monochrome1,
+    })
+}
+
+fn cache_transform_fingerprint(
+    transform_plan_hash: &str,
+    options: &CxrCacheOptions,
+) -> Result<String, CxrError> {
+    let text = serde_json::to_string(&(
+        transform_plan_hash,
+        &options.targets,
+        &options.label_policy,
+        &options.image_size_policy,
+        &options.dicom_presentation_policy,
+        &options.transfer_syntax_policy,
+    ))?;
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn effective_split_policy(
+    options: &CxrCacheOptions,
+    split_file: &SplitFile,
+) -> SplitPolicyMetadata {
+    let default_policy = SplitPolicyMetadata::default();
+    if options.split_policy != default_policy {
+        return options.split_policy.clone();
+    }
+    let audit = &split_file.split_audit;
+    let ratio = |name: &str, fallback: f64| audit.ratios.get(name).copied().unwrap_or(fallback);
+    SplitPolicyMetadata {
+        by: audit.by.clone(),
+        train: ratio("train", default_policy.train),
+        val: ratio("val", default_policy.val),
+        test: ratio("test", default_policy.test),
+        stratify: audit.stratify.clone(),
+        seed: audit.seed,
+    }
 }
 
 pub(crate) fn image_size_from_plan(plan_path: &Path) -> Result<usize, CxrError> {
