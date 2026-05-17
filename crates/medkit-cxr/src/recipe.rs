@@ -192,9 +192,12 @@ pub fn validate_cxr_dicom_recipe(recipe: &CxrDicomRecipe) -> Result<(), CxrError
         recipe.labels.uncertain.as_str(),
         recipe.labels.missing.as_str(),
     ] {
-        if !matches!(policy, "ignore" | "zero" | "fail") {
+        if !matches!(
+            policy,
+            "ignore" | "zero" | "negative" | "one" | "positive" | "fail"
+        ) {
             return Err(CxrError::Message(format!(
-                "unsupported label policy {policy:?}; expected ignore, zero, or fail"
+                "unsupported label policy {policy:?}; expected ignore, zero, negative, one, positive, or fail"
             )));
         }
     }

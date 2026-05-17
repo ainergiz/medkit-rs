@@ -1383,6 +1383,7 @@ fn parse_strategy(value: &str) -> Result<SamplingStrategy, CliError> {
 
 fn print_summary(manifest: &DatasetManifest, manifest_path: &Path, report_path: &Path) {
     println!("Dataset: {}", manifest.dataset_root);
+    println!("Layout: {}", manifest.layout.as_str());
     println!("Cases: {}", manifest.summary.total_cases);
     println!("Valid: {}", manifest.summary.valid_cases);
     println!("Invalid: {}", manifest.summary.invalid_cases);

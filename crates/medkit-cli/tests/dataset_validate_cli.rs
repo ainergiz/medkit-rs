@@ -60,6 +60,7 @@ fn dataset_validate_command_writes_manifest_and_report() {
 
     let manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["layout"], "flat");
     assert_eq!(manifest["summary"]["total_cases"], 2);
     assert_eq!(manifest["summary"]["valid_cases"], 1);
     assert_eq!(manifest["summary"]["invalid_cases"], 1);
@@ -68,6 +69,80 @@ fn dataset_validate_command_writes_manifest_and_report() {
     assert!(report.contains("Problems:"));
     assert!(report.contains("bad_spacing"));
     assert!(report.contains("GeometryMismatch"));
+}
+
+#[test]
+fn dataset_validate_command_exposes_layout_selection() {
+    let root = temp_case_dir("cli-layout");
+    let images = root.join("imagesTr");
+    let labels = root.join("labelsTr");
+    fs::create_dir_all(&images).unwrap();
+    fs::create_dir_all(&labels).unwrap();
+    write_nifti(
+        &images.join("case_a_0000.nii"),
+        &[4, 4, 4],
+        4,
+        &[1.0, 1.0, 1.0],
+    );
+    write_nifti(&labels.join("case_a.nii"), &[4, 4, 4], 2, &[1.0, 1.0, 1.0]);
+
+    let flat_manifest = root.join("flat.json");
+    let flat_report = root.join("flat.txt");
+    let flat = Command::new(env!("CARGO_BIN_EXE_medkit"))
+        .args([
+            "dataset",
+            "validate",
+            root.to_str().unwrap(),
+            "--layout",
+            "flat",
+            "--out",
+            flat_manifest.to_str().unwrap(),
+            "--report",
+            flat_report.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        flat.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&flat.stdout),
+        String::from_utf8_lossy(&flat.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&flat_manifest).unwrap()).unwrap();
+    assert_eq!(manifest["layout"], "flat");
+    assert_eq!(manifest["summary"]["total_cases"], 2);
+    assert_eq!(manifest["summary"]["valid_cases"], 0);
+
+    let nnunet_manifest = root.join("nnunet.json");
+    let nnunet_report = root.join("nnunet.txt");
+    let nnunet = Command::new(env!("CARGO_BIN_EXE_medkit"))
+        .args([
+            "dataset",
+            "validate",
+            root.to_str().unwrap(),
+            "--layout",
+            "nnunet",
+            "--out",
+            nnunet_manifest.to_str().unwrap(),
+            "--report",
+            nnunet_report.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        nnunet.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&nnunet.stdout),
+        String::from_utf8_lossy(&nnunet.stderr)
+    );
+    let stdout = String::from_utf8(nnunet.stdout).unwrap();
+    assert!(stdout.contains("Layout: nnunet"));
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&nnunet_manifest).unwrap()).unwrap();
+    assert_eq!(manifest["layout"], "nnunet");
+    assert_eq!(manifest["summary"]["total_cases"], 1);
+    assert_eq!(manifest["summary"]["valid_cases"], 1);
 }
 
 #[test]
@@ -95,6 +170,9 @@ fn dataset_validate_command_reports_parse_and_dataset_errors() {
     let unknown_flag = run_fail(["dataset", "validate", ".", "--bogus"]);
     assert!(unknown_flag.stderr.contains("unknown argument: --bogus"));
     assert!(unknown_flag.stderr.contains("Usage:"));
+
+    let bad_layout = run_fail(["dataset", "validate", ".", "--layout", "other"]);
+    assert!(bad_layout.stderr.contains("invalid --layout"));
 
     let root = temp_case_dir("dataset-error");
     let dataset_error = run_fail(["dataset", "validate", root.to_str().unwrap()]);

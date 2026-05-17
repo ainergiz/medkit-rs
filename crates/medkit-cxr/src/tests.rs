@@ -1549,6 +1549,93 @@ fn cache_build_preserves_non_binary_labels() {
 }
 
 #[test]
+fn cache_build_uses_configured_label_policy_for_uncertain_and_missing_values() {
+    let root = unique_test_dir();
+    let Fixture {
+        manifest,
+        plan,
+        cache_dir,
+        ..
+    } = build_fixture(&root);
+    let splits = root.join("all-train-splits.json");
+    split_cxr(&SplitConfig {
+        manifest_path: manifest.clone(),
+        by: "patient_id".to_string(),
+        train: 1.0,
+        val: 0.0,
+        test: 0.0,
+        stratify: Vec::new(),
+        out_path: splits.clone(),
+        seed: 0,
+    })
+    .unwrap();
+
+    let policy = LabelPolicy {
+        uncertain: "positive".to_string(),
+        missing: "zero".to_string(),
+        loss_mask: "uncertain=positive missing=zero".to_string(),
+        ..LabelPolicy::default()
+    };
+    let cache = cache_cxr_with_options(
+        &CacheConfig {
+            manifest_path: manifest.clone(),
+            splits_path: splits.clone(),
+            plan_path: plan.clone(),
+            cache_dir: cache_dir.clone(),
+        },
+        &CxrCacheOptions {
+            label_policy: policy.clone(),
+            ..CxrCacheOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(cache.label_policy, policy);
+
+    let reader = CxrCacheReader::open(&cache_dir, "train").unwrap();
+    let batch = reader.read_batch(0, reader.samples()).unwrap();
+    let row = batch
+        .records
+        .iter()
+        .position(|record| matches!(record.labels.get("Pneumonia").copied().flatten(), Some(-1)))
+        .unwrap();
+    let no_finding = reader
+        .targets()
+        .iter()
+        .position(|target| target == "No Finding")
+        .unwrap();
+    let pneumonia = reader
+        .targets()
+        .iter()
+        .position(|target| target == "Pneumonia")
+        .unwrap();
+    let row_offset = row * reader.targets().len();
+    assert_eq!(batch.labels[row_offset + pneumonia], 1.0);
+    assert_eq!(batch.masks[row_offset + pneumonia], 1.0);
+    assert_eq!(batch.labels[row_offset + no_finding], 0.0);
+    assert_eq!(batch.masks[row_offset + no_finding], 1.0);
+
+    let fail_error = cache_cxr_with_options(
+        &CacheConfig {
+            manifest_path: manifest,
+            splits_path: splits,
+            plan_path: plan,
+            cache_dir: root.join("cache-fail-policy"),
+        },
+        &CxrCacheOptions {
+            label_policy: LabelPolicy {
+                uncertain: "fail".to_string(),
+                missing: "ignore".to_string(),
+                loss_mask: "uncertain=fail missing=ignore".to_string(),
+                ..LabelPolicy::default()
+            },
+            ..CxrCacheOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(fail_error.to_string().contains("uncertain label"));
+}
+
+#[test]
 fn malformed_metadata_and_cache_io_errors_surface() {
     let root = unique_test_dir();
     fs::create_dir_all(root.join("images")).unwrap();

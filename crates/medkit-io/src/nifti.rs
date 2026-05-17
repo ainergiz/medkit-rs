@@ -15,7 +15,7 @@ use crate::{ImageMetadataReader, MedkitIoError, Result};
 const NIFTI1_HEADER_LEN: usize = 348;
 const NIFTI1_SIZEOF_HDR: i32 = 348;
 
-/// Metadata-only reader for NIfTI-1 `.nii`, `.nii.gz`, and `.hdr` files.
+/// Metadata-only reader for NIfTI-1 `.nii`, `.nii.gz`, `.hdr`, and `.hdr.gz` files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NiftiMetadataReader {
     default_modality: ImageModality,
@@ -75,7 +75,10 @@ fn looks_like_nifti(path: &Path) -> bool {
         return false;
     };
     let file_name = file_name.to_ascii_lowercase();
-    file_name.ends_with(".nii") || file_name.ends_with(".nii.gz") || file_name.ends_with(".hdr")
+    file_name.ends_with(".nii")
+        || file_name.ends_with(".nii.gz")
+        || file_name.ends_with(".hdr")
+        || file_name.ends_with(".hdr.gz")
 }
 
 fn read_header_bytes(path: &Path) -> Result<[u8; NIFTI1_HEADER_LEN]> {

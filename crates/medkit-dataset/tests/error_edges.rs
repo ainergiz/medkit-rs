@@ -6,7 +6,8 @@ use std::{error::Error, fs, io, path::PathBuf};
 use medkit_core::GeometryMismatch;
 use medkit_dataset::{
     render_report, validate_dataset, write_manifest_json, write_report, CaseManifest, CaseStatus,
-    DatasetError, DatasetManifest, Problem, ProblemCode, ValidationConfig, ValidationSummary,
+    DatasetError, DatasetLayout, DatasetManifest, Problem, ProblemCode, ValidationConfig,
+    ValidationSummary,
 };
 use support::{create_dataset_dirs, temp_case_dir, NiftiFixture};
 
@@ -223,6 +224,7 @@ fn write_manifest_json_reports_parent_creation_errors() {
         dataset_root: root.to_string_lossy().into_owned(),
         images_dir: root.join("imagesTr").to_string_lossy().into_owned(),
         labels_dir: root.join("labelsTr").to_string_lossy().into_owned(),
+        layout: DatasetLayout::Flat,
         summary: ValidationSummary::default(),
         cases: Vec::new(),
     };
@@ -245,6 +247,7 @@ fn write_report_reports_parent_creation_errors() {
         dataset_root: root.to_string_lossy().into_owned(),
         images_dir: root.join("imagesTr").to_string_lossy().into_owned(),
         labels_dir: root.join("labelsTr").to_string_lossy().into_owned(),
+        layout: DatasetLayout::Flat,
         summary: ValidationSummary::default(),
         cases: Vec::new(),
     };
@@ -264,6 +267,7 @@ fn write_artifacts_support_paths_without_real_parents() {
         dataset_root: root.to_string_lossy().into_owned(),
         images_dir: root.join("imagesTr").to_string_lossy().into_owned(),
         labels_dir: root.join("labelsTr").to_string_lossy().into_owned(),
+        layout: DatasetLayout::Flat,
         summary: ValidationSummary::default(),
         cases: Vec::new(),
     };

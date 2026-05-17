@@ -6,6 +6,7 @@ pub fn render_report(manifest: &DatasetManifest) -> String {
     report.push_str(&format!("Dataset: {}\n", manifest.dataset_root));
     report.push_str(&format!("Images: {}\n", manifest.images_dir));
     report.push_str(&format!("Labels: {}\n", manifest.labels_dir));
+    report.push_str(&format!("Layout: {}\n", manifest.layout.as_str()));
     report.push('\n');
     report.push_str(&format!("Cases: {}\n", manifest.summary.total_cases));
     report.push_str(&format!("Valid: {}\n", manifest.summary.valid_cases));

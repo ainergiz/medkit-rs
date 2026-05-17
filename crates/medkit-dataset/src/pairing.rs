@@ -1,13 +1,26 @@
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 /// Dataset image naming layout used for image/label pairing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DatasetLayout {
     /// Use full NIfTI stems as case IDs without stripping channel suffixes.
     #[default]
     Flat,
     /// Treat image stems ending in `_0000` as nnU-Net single-channel image names.
     Nnunet,
+}
+
+impl DatasetLayout {
+    /// Stable manifest and report representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Nnunet => "nnunet",
+        }
+    }
 }
 
 /// Derives a case id from an image path.
@@ -43,7 +56,9 @@ pub(crate) fn is_nifti_path(path: &Path) -> bool {
 fn nifti_stem(path: &Path) -> Option<&str> {
     let file_name = path.file_name()?.to_str()?;
     let lower = file_name.to_ascii_lowercase();
-    if lower.ends_with(".nii.gz") {
+    if lower.ends_with(".hdr.gz") {
+        Some(&file_name[..file_name.len() - ".hdr.gz".len()])
+    } else if lower.ends_with(".nii.gz") {
         Some(&file_name[..file_name.len() - ".nii.gz".len()])
     } else if lower.ends_with(".nii") {
         Some(&file_name[..file_name.len() - ".nii".len()])

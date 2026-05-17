@@ -1,8 +1,11 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use flate2::{write::GzEncoder, Compression};
 
 const HEADER_LEN: usize = 348;
 
@@ -36,6 +39,12 @@ impl NiftiFixture {
         let mut bytes = self.bytes.to_vec();
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         fs::write(path, bytes).unwrap();
+    }
+
+    pub fn write_hdr_gz(&self, path: &Path) {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&self.bytes).unwrap();
+        fs::write(path, encoder.finish().unwrap()).unwrap();
     }
 
     fn put_i32(&mut self, offset: usize, value: i32) {

@@ -106,7 +106,7 @@ pub struct CachedCase {
     pub shape: [usize; 3],
     /// Binary chunk shape in x, y, z order.
     pub chunk_shape: [usize; 3],
-    /// Foreground crop origin in source voxel coordinates.
+    /// Foreground crop origin in the voxel frame where the crop operation ran.
     pub crop_origin: [usize; 3],
     /// Applied deterministic transform operations.
     pub applied_operations: Vec<String>,
@@ -136,6 +136,7 @@ pub fn prepare_cache(config: &PrepareConfig) -> Result<CacheManifest> {
         summary.input_cases += 1;
         let cached = prepare_case(
             case,
+            &config.dataset_root,
             &plan,
             &plan_hash,
             &config.cache_dir,
@@ -183,6 +184,7 @@ fn write_cache_manifest(manifest: &CacheManifest, path: &Path) -> Result<()> {
 
 fn prepare_case(
     case: &medkit_dataset::CaseManifest,
+    dataset_root: &Path,
     plan: &TransformPlan,
     plan_hash: &str,
     cache_dir: &Path,
@@ -194,8 +196,12 @@ fn prepare_case(
     let label_path = case.label_path.as_ref().ok_or_else(|| {
         CacheError::invalid_input(format!("case {} has no label path", case.case_id))
     })?;
-    let image = nifti_pixels::load_image_f32(Path::new(image_path))?;
-    let label = nifti_pixels::load_label_u16(Path::new(label_path))?;
+    let image_path = resolve_manifest_source_path(dataset_root, image_path);
+    let label_path = resolve_manifest_source_path(dataset_root, label_path);
+    let image_path_text = image_path.to_string_lossy().into_owned();
+    let label_path_text = label_path.to_string_lossy().into_owned();
+    let image = nifti_pixels::load_image_f32(&image_path)?;
+    let label = nifti_pixels::load_label_u16(&label_path)?;
     if !image.geometry.approximately_eq(&label.geometry, 1e-6) {
         return Err(CacheError::invalid_input(format!(
             "case {} image and label source geometry differ",
@@ -213,8 +219,11 @@ fn prepare_case(
         .filter_map(|(index, value)| (*value != 0).then_some(index))
         .collect::<Vec<_>>();
     let foreground_voxels = foreground_indices.len();
+    let mut source_case = case.clone();
+    source_case.image_path = Some(image_path_text.clone());
+    source_case.label_path = Some(label_path_text.clone());
     let source_metadata_hash = source_hash(
-        case,
+        &source_case,
         &source_geometry,
         &label_geometry,
         &image.source_content_hash,
@@ -278,8 +287,8 @@ fn prepare_case(
         cache_key,
         source_metadata_hash,
         transform_plan_hash: plan_hash.to_string(),
-        image_path: image_path.clone(),
-        label_path: label_path.clone(),
+        image_path: image_path_text,
+        label_path: label_path_text,
         source_geometry,
         output_geometry: prepared.geometry,
         image_cache_path: image_cache_path.to_string_lossy().into_owned(),
@@ -302,6 +311,15 @@ fn prepare_case(
         .map_err(|source| CacheError::json(&case_json, source))?;
     fs::write(&case_json, text).map_err(|source| CacheError::io(case_json, source))?;
     Ok(cached)
+}
+
+fn resolve_manifest_source_path(dataset_root: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() || path.exists() {
+        path
+    } else {
+        dataset_root.join(path)
+    }
 }
 
 fn write_f32_volume(volume: &Volume3D<f32>, path: &Path) -> Result<()> {
@@ -497,7 +515,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use medkit_dataset::{CaseManifest, CaseStatus, DatasetManifest, ValidationSummary};
+    use medkit_dataset::{
+        CaseManifest, CaseStatus, DatasetLayout, DatasetManifest, ValidationSummary,
+    };
     use medkit_transform::Volume3D;
 
     use super::*;
@@ -822,6 +842,7 @@ mod tests {
 
         let cached = prepare_case(
             &valid_case("case_b", Some(&image_path), Some(&label_path)),
+            &root,
             &plan,
             &plan_hash,
             &cache_dir,
@@ -836,6 +857,53 @@ mod tests {
         assert_eq!(cached.label_chunk_cache_path, None);
         assert_eq!(cached.foreground_voxels, 1);
         assert_eq!(cached.bytes_written, 46);
+    }
+
+    #[test]
+    fn prepare_cache_resolves_manifest_paths_under_dataset_root() {
+        let root = temp_dir("prepare-root-relative");
+        let image_dir = root.join("images");
+        let label_dir = root.join("labels");
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::create_dir_all(&label_dir).unwrap();
+        let image_path = image_dir.join("case_c.nii");
+        let label_path = label_dir.join("case_c.nii");
+        let manifest_path = root.join("manifest.json");
+        let plan_path = root.join("plan.toml");
+        let cache_dir = root.join("cache");
+        fs::write(
+            &image_path,
+            NiftiFixture::new(&[1, 1, 1], 16, &[1.0, 1.0, 1.0]).append_f32_pixels(&[2.0]),
+        )
+        .unwrap();
+        fs::write(
+            &label_path,
+            NiftiFixture::new(&[1, 1, 1], 512, &[1.0, 1.0, 1.0]).append_u16_pixels(&[1]),
+        )
+        .unwrap();
+        write_plan(&plan_path, identity_plan());
+        write_manifest(
+            &manifest_path,
+            &root,
+            vec![valid_case(
+                "case_c",
+                Some(Path::new("images/case_c.nii")),
+                Some(Path::new("labels/case_c.nii")),
+            )],
+        );
+
+        let manifest = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path,
+            plan_path,
+            cache_dir,
+            chunk_shape: None,
+        })
+        .unwrap();
+
+        assert_eq!(manifest.summary.cached_cases, 1);
+        assert_eq!(manifest.cases[0].image_path, path_text(&image_path));
+        assert_eq!(manifest.cases[0].label_path, path_text(&label_path));
     }
 
     #[test]
@@ -924,6 +992,7 @@ mod tests {
             dataset_root: path_text(root),
             images_dir: path_text(root),
             labels_dir: path_text(root),
+            layout: DatasetLayout::Flat,
             summary: ValidationSummary {
                 total_cases: cases.len(),
                 valid_cases,

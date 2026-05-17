@@ -28,6 +28,10 @@ fn derives_case_ids_without_implicit_channel_suffix_stripping() {
         Some("liver_001")
     );
     assert_eq!(
+        case_id_from_image_path(Path::new("imagesTr/liver_001.hdr.gz")).as_deref(),
+        Some("liver_001")
+    );
+    assert_eq!(
         case_id_from_image_path(Path::new("imagesTr/liver.nii")).as_deref(),
         Some("liver")
     );
@@ -52,6 +56,7 @@ fn nnunet_layout_strips_only_explicit_image_channel_suffix() {
 
     assert_eq!(manifest.summary.total_cases, 2);
     assert_eq!(manifest.summary.valid_cases, 2);
+    assert_eq!(manifest.layout, DatasetLayout::Nnunet);
     assert!(manifest
         .cases
         .iter()
@@ -60,6 +65,20 @@ fn nnunet_layout_strips_only_explicit_image_channel_suffix() {
         .cases
         .iter()
         .any(|case| case.case_id == "patient_2024"));
+}
+
+#[test]
+fn validates_gzipped_detached_headers_consistently_with_pairing() {
+    let root = temp_case_dir("hdr-gz-layout");
+    let (images, labels) = create_dataset_dirs(&root);
+    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_hdr_gz(&images.join("case_a.hdr.gz"));
+    fixture(&[8, 8, 8], 2, &[1.0, 1.0, 1.0]).write_hdr_gz(&labels.join("case_a.hdr.gz"));
+
+    let manifest = validate_dataset(&ValidationConfig::new(&root)).unwrap();
+
+    assert_eq!(manifest.summary.total_cases, 1);
+    assert_eq!(manifest.summary.valid_cases, 1);
+    assert_eq!(manifest.cases[0].case_id, "case_a");
 }
 
 #[test]
@@ -115,6 +134,7 @@ fn validates_dataset_end_to_end_and_writes_artifacts() {
 
     let manifest = validate_dataset(&ValidationConfig::new(&root)).unwrap();
 
+    assert_eq!(manifest.layout, DatasetLayout::Flat);
     assert_eq!(manifest.summary.total_cases, 7);
     assert_eq!(manifest.summary.valid_cases, 1);
     assert_eq!(manifest.summary.invalid_cases, 6);
@@ -147,9 +167,11 @@ fn validates_dataset_end_to_end_and_writes_artifacts() {
     let loaded: DatasetManifest =
         serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
     assert_eq!(loaded.summary, manifest.summary);
+    assert_eq!(loaded.layout, DatasetLayout::Flat);
 
     let report = fs::read_to_string(&report_path).unwrap();
     assert!(report.contains("Cases: 7"));
+    assert!(report.contains("Layout: flat"));
     assert!(report.contains("Invalid: 6"));
     assert!(report.contains("shape_mismatch"));
     assert_eq!(report, render_report(&manifest));

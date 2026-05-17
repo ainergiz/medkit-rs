@@ -3,6 +3,8 @@ use std::path::Path;
 use medkit_core::{GeometryMismatch, ImageSpec};
 use serde::{Deserialize, Serialize};
 
+use crate::pairing::DatasetLayout;
+
 /// Machine-readable validation output for a dataset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatasetManifest {
@@ -12,6 +14,8 @@ pub struct DatasetManifest {
     pub images_dir: String,
     /// Label directory path.
     pub labels_dir: String,
+    /// Image naming layout used while pairing images and labels.
+    pub layout: DatasetLayout,
     /// Aggregate validation counts.
     pub summary: ValidationSummary,
     /// Per-case validation records.

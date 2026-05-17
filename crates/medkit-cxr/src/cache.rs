@@ -98,6 +98,7 @@ pub fn cache_cxr_with_options(
             &targets,
             image_size,
             &normalization,
+            &options.label_policy,
         )?;
         splits.insert(name.to_string(), split_summary);
     }
@@ -804,6 +805,7 @@ fn write_cache_split(
     targets: &[String],
     image_size: usize,
     normalization: &Normalization,
+    label_policy: &LabelPolicy,
 ) -> Result<CacheSplitSummary, CxrError> {
     let images_name = format!("{split}-images.float32.dat");
     let labels_name = format!("{split}-labels.float32.dat");
@@ -830,12 +832,7 @@ fn write_cache_split(
         }
         for target in targets {
             let value = record.labels.get(target).copied().flatten();
-            let (label, mask) = match value {
-                Some(1) => (1.0f32, 1.0f32),
-                Some(0) => (0.0f32, 1.0f32),
-                Some(-1) | None => (0.0f32, 0.0f32),
-                Some(other) => (other as f32, 1.0f32),
-            };
+            let (label, mask) = encode_label_value(value, label_policy, &record.sample_id, target)?;
             labels.write_all(&label.to_le_bytes())?;
             masks.write_all(&mask.to_le_bytes())?;
         }
@@ -856,6 +853,40 @@ fn write_cache_split(
         masks_path: masks_name,
         metadata_path: metadata_name,
     })
+}
+
+fn encode_label_value(
+    value: Option<i8>,
+    policy: &LabelPolicy,
+    sample_id: &str,
+    target: &str,
+) -> Result<(f32, f32), CxrError> {
+    match value {
+        Some(1) => Ok((1.0, 1.0)),
+        Some(0) => Ok((0.0, 1.0)),
+        Some(-1) => encode_special_label(&policy.uncertain, "uncertain", sample_id, target),
+        None => encode_special_label(&policy.missing, "missing", sample_id, target),
+        Some(other) => Ok((f32::from(other), 1.0)),
+    }
+}
+
+fn encode_special_label(
+    action: &str,
+    kind: &str,
+    sample_id: &str,
+    target: &str,
+) -> Result<(f32, f32), CxrError> {
+    match action {
+        "ignore" => Ok((0.0, 0.0)),
+        "zero" | "negative" => Ok((0.0, 1.0)),
+        "one" | "positive" => Ok((1.0, 1.0)),
+        "fail" => Err(CxrError::Message(format!(
+            "{kind} label for sample {sample_id} target {target} is disallowed by label policy"
+        ))),
+        other => Err(CxrError::Message(format!(
+            "unsupported {kind} label policy {other:?}; expected ignore, zero, negative, one, positive, or fail"
+        ))),
+    }
 }
 
 fn estimate_normalization(

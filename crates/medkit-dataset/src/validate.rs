@@ -120,6 +120,7 @@ pub fn validate_dataset(config: &ValidationConfig) -> Result<DatasetManifest> {
         dataset_root: path_string(config.root()),
         images_dir: path_string(&images_dir),
         labels_dir: path_string(&labels_dir),
+        layout: config.layout,
         summary,
         cases,
     })

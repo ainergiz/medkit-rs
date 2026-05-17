@@ -67,7 +67,7 @@ pub(crate) fn load_image_f32(path: &Path) -> Result<LoadedVolume<f32>> {
     let source = read_source(path)?;
     let source_content_hash = source_content_hash(&source);
     let header = parse_header(path, &source.header_bytes, source.storage)?;
-    let values = read_pixels(path, &source.pixel_bytes, &header, |value| value as f32)?;
+    let values = read_pixels(path, &source.pixel_bytes, &header, |value| Ok(value as f32))?;
     Ok(LoadedVolume {
         volume: Volume3D::new(header.shape, values)?,
         geometry: header.geometry,
@@ -80,7 +80,7 @@ pub(crate) fn load_label_u16(path: &Path) -> Result<LoadedVolume<u16>> {
     let source_content_hash = source_content_hash(&source);
     let header = parse_header(path, &source.header_bytes, source.storage)?;
     let values = read_pixels(path, &source.pixel_bytes, &header, |value| {
-        value.max(0.0).round() as u16
+        strict_label_value(path, value)
     })?;
     Ok(LoadedVolume {
         volume: Volume3D::new(header.shape, values)?,
@@ -299,10 +299,10 @@ fn parse_header(path: &Path, bytes: &[u8], storage: NiftiStorage) -> Result<Head
         }
     };
     let raw_vox_offset = f32_from(&bytes[108..112], endian);
-    if !raw_vox_offset.is_finite() || raw_vox_offset < 0.0 {
+    if !raw_vox_offset.is_finite() || raw_vox_offset < 0.0 || raw_vox_offset.fract() != 0.0 {
         return Err(CacheError::nifti(
             path,
-            format!("vox_offset must be finite and non-negative, got {raw_vox_offset}"),
+            format!("vox_offset must be a finite non-negative integer byte offset, got {raw_vox_offset}"),
         ));
     }
     let vox_offset = match storage {
@@ -311,8 +311,13 @@ fn parse_header(path: &Path, bytes: &[u8], storage: NiftiStorage) -> Result<Head
     };
     let raw_slope = f64::from(f32_from(&bytes[112..116], endian));
     let raw_inter = f64::from(f32_from(&bytes[116..120], endian));
-    let (scl_slope, scl_inter) = if raw_slope == 0.0 || !raw_slope.is_finite() {
+    let (scl_slope, scl_inter) = if raw_slope == 0.0 {
         (1.0, 0.0)
+    } else if !raw_slope.is_finite() {
+        return Err(CacheError::nifti(
+            path,
+            format!("scl_slope must be finite or zero, got {raw_slope}"),
+        ));
     } else if !raw_inter.is_finite() {
         return Err(CacheError::nifti(
             path,
@@ -456,11 +461,20 @@ fn read_pixels<T>(
     path: &Path,
     bytes: &[u8],
     header: &Header,
-    convert: impl Fn(f64) -> T,
+    convert: impl Fn(f64) -> Result<T>,
 ) -> Result<Vec<T>> {
-    let count = header.shape[0] * header.shape[1] * header.shape[2];
+    let count = header.shape[0]
+        .checked_mul(header.shape[1])
+        .and_then(|value| value.checked_mul(header.shape[2]))
+        .ok_or_else(|| CacheError::nifti(path, "voxel count overflow"))?;
     let bytes_per_value = bytes_per_value(header.datatype);
-    let end = header.vox_offset + count * bytes_per_value;
+    let byte_count = count
+        .checked_mul(bytes_per_value)
+        .ok_or_else(|| CacheError::nifti(path, "pixel byte count overflow"))?;
+    let end = header
+        .vox_offset
+        .checked_add(byte_count)
+        .ok_or_else(|| CacheError::nifti(path, "pixel byte range overflow"))?;
     if bytes.len() < end {
         return Err(CacheError::nifti(
             path,
@@ -474,9 +488,22 @@ fn read_pixels<T>(
     let pixel_bytes = &bytes[header.vox_offset..end];
     for chunk in pixel_bytes.chunks_exact(bytes_per_value) {
         let raw = read_value(chunk, header.datatype, header.endian);
-        out.push(convert(raw * header.scl_slope + header.scl_inter));
+        out.push(convert(raw * header.scl_slope + header.scl_inter)?);
     }
     Ok(out)
+}
+
+fn strict_label_value(path: &Path, value: f64) -> Result<u16> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > f64::from(u16::MAX) {
+        return Err(CacheError::nifti(
+            path,
+            format!(
+                "label voxel values must be finite non-negative integers <= {}, got {value}",
+                u16::MAX
+            ),
+        ));
+    }
+    Ok(value as u16)
 }
 
 fn bytes_per_value(kind: PixelKind) -> usize {
@@ -711,7 +738,7 @@ mod tests {
         fs::write(
             &label_path,
             NiftiFixture::new(Endian::Little, &[2, 2, 1], 16, &[1.5, 2.5, 3.5])
-                .append_f32_pixels(&[-1.0, 1.2, 1.6, 2.5]),
+                .append_f32_pixels(&[0.0, 1.0, 2.0, 3.0]),
         )
         .unwrap();
         let big_image_path = dir.join("big-image.nii");
@@ -731,6 +758,17 @@ mod tests {
         assert_eq!(label.volume.shape, [2, 2, 1]);
         assert_eq!(label.volume.data, vec![0, 1, 2, 3]);
         assert!(image.geometry.approximately_eq(&label.geometry, 1e-6));
+
+        fs::write(
+            &label_path,
+            NiftiFixture::new(Endian::Little, &[2, 1, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[-1.0, 1.2]),
+        )
+        .unwrap();
+        let err = load_label_u16(&label_path).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("label voxel values must be finite"));
 
         let big_image = load_image_f32(&big_image_path).unwrap();
         assert_eq!(big_image.volume.data, vec![7.5]);
@@ -869,6 +907,18 @@ mod tests {
             "pixdim[2] must be finite and positive",
         );
         assert_nifti_error(
+            NiftiFixture::new(Endian::Little, &[2, 2, 2], 16, &[1.0, 1.0, 1.0])
+                .with_vox_offset(352.5)
+                .bytes(),
+            "vox_offset must be a finite non-negative integer",
+        );
+        assert_nifti_error(
+            NiftiFixture::new(Endian::Little, &[2, 2, 2], 16, &[1.0, 1.0, 1.0])
+                .with_scaling(f32::NAN, 0.0)
+                .bytes(),
+            "scl_slope must be finite or zero",
+        );
+        assert_nifti_error(
             NiftiFixture::new(Endian::Little, &[2, 2, 2], 128, &[1.0, 1.0, 1.0]).bytes(),
             "unsupported datatype code 128",
         );
@@ -962,7 +1012,7 @@ mod tests {
             Path::new("truncated.nii"),
             &[0; VOX_OFFSET + 1],
             &header,
-            |v| v,
+            Ok,
         )
         .unwrap_err();
         assert!(err.to_string().contains("pixel data ends at byte 356"));
