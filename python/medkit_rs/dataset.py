@@ -524,8 +524,9 @@ class MedkitViewBatchIterableDataset(_IterableDatasetBase):
         for case_index, case in enumerate(self.manifest["cases"]):
             case_indices[case["case_id"]] = case_index
             x, y, z = case["shape"]
+            channels = int(case.get("image_channel_count", 1) or 1)
             image = np.fromfile(self._resolve(case["image_cache_path"]), dtype="<f4").reshape(
-                (z, y, x)
+                (channels, z, y, x)
             )
             label = np.fromfile(self._resolve(case["label_cache_path"]), dtype="<u2").astype(
                 np.float32
@@ -574,7 +575,7 @@ class MedkitViewBatchIterableDataset(_IterableDatasetBase):
                     (index + offset) % len(self.records)
                 ]
                 image, label, prefix = self._volumes[case_index]
-                images.append(image[z : z + sz, y : y + sy, x : x + sx].unsqueeze(0))
+                images.append(image[:, z : z + sz, y : y + sy, x : x + sx])
                 labels.append(label[z : z + sz, y : y + sy, x : x + sx].unsqueeze(0))
                 label_sum += _prefix_count(prefix, x, y, z, sx, sy, sz)
             yield {"image": images, "label": labels, "label_sum": label_sum}

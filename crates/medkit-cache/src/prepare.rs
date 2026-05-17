@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -188,7 +188,11 @@ fn read_dataset_manifest(path: &Path) -> Result<DatasetManifest> {
 fn write_cache_manifest(manifest: &CacheManifest, path: &Path) -> Result<()> {
     let text =
         serde_json::to_string_pretty(manifest).map_err(|source| CacheError::json(path, source))?;
-    fs::write(path, text).map_err(|source| CacheError::io(path, source))
+    let mut file = File::create(path).map_err(|source| CacheError::io(path, source))?;
+    file.write_all(text.as_bytes())
+        .map_err(|source| CacheError::io(path, source))?;
+    file.sync_all()
+        .map_err(|source| CacheError::io(path, source))
 }
 
 fn prepare_cache_in_staging(
@@ -268,30 +272,36 @@ fn promote_staged_cache(
         let staged_case_dir = staging_dir.join(&case.cache_key);
         let final_case_dir = cache_dir.join(&case.cache_key);
         if final_case_dir.exists() {
-            validate_existing_case_dir(&final_case_dir, case)?;
-            cleanup_staging(&staged_case_dir)?;
+            match existing_case_status(&final_case_dir, case)? {
+                ExistingCaseStatus::Valid => cleanup_staging(&staged_case_dir)?,
+                ExistingCaseStatus::Corrupt => {
+                    replace_case_dir(&staged_case_dir, &final_case_dir)?;
+                }
+            }
         } else {
             fs::rename(&staged_case_dir, &final_case_dir)
                 .map_err(|source| CacheError::io(&final_case_dir, source))?;
         }
     }
-    let staged_manifest = staging_dir.join(CACHE_MANIFEST);
-    let final_manifest = cache_dir.join(CACHE_MANIFEST);
-    if final_manifest.exists() {
-        fs::remove_file(&final_manifest)
-            .map_err(|source| CacheError::io(&final_manifest, source))?;
-    }
-    fs::rename(&staged_manifest, &final_manifest)
-        .map_err(|source| CacheError::io(&final_manifest, source))?;
+    promote_cache_manifest(staging_dir, cache_dir)?;
     cleanup_staging(staging_dir)
 }
 
-fn validate_existing_case_dir(final_case_dir: &Path, case: &CachedCase) -> Result<()> {
+enum ExistingCaseStatus {
+    Valid,
+    Corrupt,
+}
+
+fn existing_case_status(final_case_dir: &Path, case: &CachedCase) -> Result<ExistingCaseStatus> {
     let case_json = final_case_dir.join("case.json");
-    let text =
-        fs::read_to_string(&case_json).map_err(|source| CacheError::io(&case_json, source))?;
-    let existing: CachedCase =
-        serde_json::from_str(&text).map_err(|source| CacheError::json(&case_json, source))?;
+    let text = match fs::read_to_string(&case_json) {
+        Ok(text) => text,
+        Err(_) => return Ok(ExistingCaseStatus::Corrupt),
+    };
+    let existing: CachedCase = match serde_json::from_str(&text) {
+        Ok(existing) => existing,
+        Err(_) => return Ok(ExistingCaseStatus::Corrupt),
+    };
     if existing != *case {
         return Err(CacheError::invalid_input(format!(
             "existing cache case {} at {} does not match staged metadata; remove the case directory or rebuild into a clean cache",
@@ -299,8 +309,169 @@ fn validate_existing_case_dir(final_case_dir: &Path, case: &CachedCase) -> Resul
             final_case_dir.display()
         )));
     }
+    if validate_existing_case_artifacts(case).is_ok() {
+        Ok(ExistingCaseStatus::Valid)
+    } else {
+        Ok(ExistingCaseStatus::Corrupt)
+    }
+}
+
+fn replace_case_dir(staged_case_dir: &Path, final_case_dir: &Path) -> Result<()> {
+    let backup_dir = unique_sibling_path(final_case_dir, "replace-case");
+    if backup_dir.exists() {
+        fs::remove_dir_all(&backup_dir).map_err(|source| CacheError::io(&backup_dir, source))?;
+    }
+    fs::rename(final_case_dir, &backup_dir)
+        .map_err(|source| CacheError::io(&backup_dir, source))?;
+    match fs::rename(staged_case_dir, final_case_dir) {
+        Ok(()) => {
+            fs::remove_dir_all(&backup_dir)
+                .map_err(|source| CacheError::io(&backup_dir, source))?;
+            sync_parent_dir(final_case_dir);
+            Ok(())
+        }
+        Err(source) => {
+            let _ = fs::rename(&backup_dir, final_case_dir);
+            Err(CacheError::io(final_case_dir, source))
+        }
+    }
+}
+
+fn promote_cache_manifest(staging_dir: &Path, cache_dir: &Path) -> Result<()> {
+    let staged_manifest = staging_dir.join(CACHE_MANIFEST);
+    let final_manifest = cache_dir.join(CACHE_MANIFEST);
+    replace_manifest_file(&staged_manifest, &final_manifest)?;
+    sync_parent_dir(&final_manifest);
     Ok(())
 }
+
+#[cfg(unix)]
+fn replace_manifest_file(staged_manifest: &Path, final_manifest: &Path) -> Result<()> {
+    fs::rename(staged_manifest, final_manifest)
+        .map_err(|source| CacheError::io(final_manifest, source))
+}
+
+#[cfg(not(unix))]
+fn replace_manifest_file(staged_manifest: &Path, final_manifest: &Path) -> Result<()> {
+    if !final_manifest.exists() {
+        return fs::rename(staged_manifest, final_manifest)
+            .map_err(|source| CacheError::io(final_manifest, source));
+    }
+    let backup_manifest = unique_sibling_path(final_manifest, "replace-manifest");
+    if backup_manifest.exists() {
+        fs::remove_file(&backup_manifest)
+            .map_err(|source| CacheError::io(&backup_manifest, source))?;
+    }
+    fs::rename(final_manifest, &backup_manifest)
+        .map_err(|source| CacheError::io(&backup_manifest, source))?;
+    match fs::rename(staged_manifest, final_manifest) {
+        Ok(()) => {
+            fs::remove_file(&backup_manifest)
+                .map_err(|source| CacheError::io(&backup_manifest, source))?;
+            Ok(())
+        }
+        Err(source) => {
+            let _ = fs::rename(&backup_manifest, final_manifest);
+            Err(CacheError::io(final_manifest, source))
+        }
+    }
+}
+
+fn validate_existing_case_artifacts(case: &CachedCase) -> std::result::Result<(), String> {
+    let mut errors = Vec::new();
+    check_artifact_hash(
+        &case.image_cache_path,
+        Some(case.image_cache_sha256.as_str()),
+        "image cache",
+        &mut errors,
+    );
+    check_artifact_hash(
+        &case.label_cache_path,
+        Some(case.label_cache_sha256.as_str()),
+        "label cache",
+        &mut errors,
+    );
+    if let Some(path) = &case.foreground_indices_path {
+        check_artifact_hash(
+            path,
+            case.foreground_indices_sha256.as_deref(),
+            "foreground indices",
+            &mut errors,
+        );
+    }
+    if let Some(path) = &case.foreground_prefix_path {
+        check_artifact_hash(
+            path,
+            case.foreground_prefix_sha256.as_deref(),
+            "foreground prefix",
+            &mut errors,
+        );
+    }
+    if let Some(path) = &case.image_chunk_cache_path {
+        check_artifact_hash(
+            path,
+            case.image_chunk_cache_sha256.as_deref(),
+            "image chunk cache",
+            &mut errors,
+        );
+    }
+    if let Some(path) = &case.label_chunk_cache_path {
+        check_artifact_hash(
+            path,
+            case.label_chunk_cache_sha256.as_deref(),
+            "label chunk cache",
+            &mut errors,
+        );
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn check_artifact_hash(path: &str, expected: Option<&str>, kind: &str, errors: &mut Vec<String>) {
+    let Some(expected) = expected.filter(|value| !value.is_empty()) else {
+        errors.push(format!("{kind} is missing SHA-256 metadata"));
+        return;
+    };
+    match sha256_file(Path::new(path)) {
+        Ok(actual) if actual == expected => {}
+        Ok(actual) => errors.push(format!("{kind} has SHA-256 {actual}, expected {expected}")),
+        Err(error) => errors.push(format!("{kind} could not be hashed: {error}")),
+    }
+}
+
+fn unique_sibling_path(path: &Path, prefix: &str) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    parent.join(format!(
+        ".{prefix}-{name}-{}-{}",
+        std::process::id(),
+        unique_nanos()
+    ))
+}
+
+fn unique_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 #[derive(Debug)]
 struct SourceImage {
@@ -436,12 +607,8 @@ fn prepare_case(
     let image_cache_sha256 = sha256_file(&staging_image_cache_path)?;
     let label_cache_sha256 = sha256_file(&staging_label_cache_path)?;
     let foreground_indices_sha256 = sha256_file(&staging_foreground_indices_path)?;
-    let foreground_prefix_shape = [
-        prepared.label.shape[0] + 1,
-        prepared.label.shape[1] + 1,
-        prepared.label.shape[2] + 1,
-    ];
-    let foreground_prefix = foreground_prefix_values(&prepared.label);
+    let foreground_prefix_shape = checked_prefix_shape(prepared.label.shape)?;
+    let foreground_prefix = foreground_prefix_values(&prepared.label)?;
     write_u32_values(&foreground_prefix, &staging_foreground_prefix_path)?;
     let foreground_prefix_sha256 = sha256_file(&staging_foreground_prefix_path)?;
     let chunk_paths = if let Some(chunk_shape) = effective_chunk_shape {
@@ -473,19 +640,35 @@ fn prepare_case(
     } else {
         None
     };
-    let image_value_count = prepared
-        .images
-        .iter()
-        .map(|image| image.data.len())
-        .sum::<usize>();
-    let mut bytes_written = image_value_count * 4
-        + prepared.label.data.len() * 2
-        + foreground_indices.len() * 8
-        + foreground_prefix.len() * 4;
+    let image_value_count = prepared.images.iter().try_fold(0_usize, |sum, image| {
+        checked_add(sum, image.data.len(), "image value count")
+    })?;
+    let mut bytes_written = checked_add(
+        checked_add(
+            checked_mul(image_value_count, 4, "image cache byte count")?,
+            checked_mul(prepared.label.data.len(), 2, "label cache byte count")?,
+            "resident cache byte count",
+        )?,
+        checked_add(
+            checked_mul(foreground_indices.len(), 8, "foreground index byte count")?,
+            checked_mul(foreground_prefix.len(), 4, "foreground prefix byte count")?,
+            "foreground byte count",
+        )?,
+        "case byte count",
+    )?;
     if let Some((chunk_shape, chunk_grid, _, _, _, _)) = &chunk_paths {
-        let chunk_voxels = chunk_shape[0] * chunk_shape[1] * chunk_shape[2];
-        let chunks = chunk_grid[0] * chunk_grid[1] * chunk_grid[2];
-        bytes_written += chunks * chunk_voxels * (image_channel_count * 4 + 2);
+        let chunk_voxels = checked_value_count(*chunk_shape, "chunk voxel count")?;
+        let chunks = checked_value_count(*chunk_grid, "chunk grid count")?;
+        let image_chunk_bytes_per_voxel =
+            checked_mul(image_channel_count, 4, "image channel chunk byte count")?;
+        let chunk_bytes_per_voxel =
+            checked_add(image_chunk_bytes_per_voxel, 2, "chunk byte count per voxel")?;
+        let chunk_bytes = checked_mul(
+            checked_mul(chunks, chunk_voxels, "chunked value count")?,
+            chunk_bytes_per_voxel,
+            "chunked cache byte count",
+        )?;
+        bytes_written = checked_add(bytes_written, chunk_bytes, "case byte count")?;
     }
     let (
         chunk_shape_out,
@@ -574,16 +757,44 @@ fn image_sources_for_case(
             channel_index: None,
         }]
     };
-    sources.sort_by(|left, right| {
-        left.channel_index
-            .cmp(&right.channel_index)
-            .then_with(|| left.path_text.cmp(&right.path_text))
-    });
     if sources.is_empty() {
         return Err(CacheError::invalid_input(format!(
             "case {} has no image channels",
             case.case_id
         )));
+    }
+    let indexed_channels = sources
+        .iter()
+        .filter(|source| source.channel_index.is_some())
+        .count();
+    if indexed_channels != 0 && indexed_channels != sources.len() {
+        return Err(CacheError::invalid_input(format!(
+            "case {} mixes indexed and unindexed image channels",
+            case.case_id
+        )));
+    }
+    if indexed_channels == sources.len() {
+        sources.sort_by(|left, right| {
+            left.channel_index
+                .cmp(&right.channel_index)
+                .then_with(|| left.path_text.cmp(&right.path_text))
+        });
+        for (expected, source) in sources.iter().enumerate() {
+            let expected = u16::try_from(expected).map_err(|_| {
+                CacheError::invalid_input(format!(
+                    "case {} has too many indexed image channels",
+                    case.case_id
+                ))
+            })?;
+            if source.channel_index != Some(expected) {
+                return Err(CacheError::invalid_input(format!(
+                    "case {} image channel indices must be contiguous from 0; expected channel {expected}, found {:?}",
+                    case.case_id, source.channel_index
+                )));
+            }
+        }
+    } else {
+        sources.sort_by(|left, right| left.path_text.cmp(&right.path_text));
     }
     Ok(sources)
 }
@@ -598,9 +809,18 @@ fn resolve_manifest_source_path(dataset_root: &Path, path: &str) -> PathBuf {
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).map_err(|source| CacheError::io(path, source))?;
+    let mut file = File::open(path).map_err(|source| CacheError::io(path, source))?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| CacheError::io(path, source))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -658,10 +878,10 @@ fn write_u32_values(values: &[u32], path: &Path) -> Result<()> {
         .map_err(|source| CacheError::io(path, source))
 }
 
-fn foreground_prefix_values(label: &Volume3D<u16>) -> Vec<u32> {
+fn foreground_prefix_values(label: &Volume3D<u16>) -> Result<Vec<u32>> {
     let shape = label.shape;
-    let prefix_shape = [shape[0] + 1, shape[1] + 1, shape[2] + 1];
-    let mut values = vec![0_u32; prefix_shape[0] * prefix_shape[1] * prefix_shape[2]];
+    let prefix_shape = checked_prefix_shape(shape)?;
+    let mut values = vec![0_u32; checked_value_count(prefix_shape, "foreground prefix values")?];
     let prefix_y_stride = prefix_shape[0];
     let prefix_z_stride = prefix_shape[0] * prefix_shape[1];
     let label_y_stride = shape[0];
@@ -678,13 +898,53 @@ fn foreground_prefix_values(label: &Volume3D<u16>) -> Vec<u32> {
             let above_behind_base = previous_prefix_z_base + (y - 1) * prefix_y_stride;
             let label_row_base = label_z_base + (y - 1) * label_y_stride;
             for x in 1..prefix_shape[0] {
-                row_sum += u32::from(label.data[label_row_base + x - 1] != 0);
-                values[row_base + x] = row_sum + values[above_base + x] + values[behind_base + x]
-                    - values[above_behind_base + x];
+                row_sum = row_sum
+                    .checked_add(u32::from(label.data[label_row_base + x - 1] != 0))
+                    .ok_or_else(|| {
+                        CacheError::invalid_input("foreground prefix count overflowed u32")
+                    })?;
+                values[row_base + x] = row_sum
+                    .checked_add(values[above_base + x])
+                    .and_then(|value| value.checked_add(values[behind_base + x]))
+                    .and_then(|value| value.checked_sub(values[above_behind_base + x]))
+                    .ok_or_else(|| {
+                        CacheError::invalid_input("foreground prefix count overflowed u32")
+                    })?;
             }
         }
     }
-    values
+    Ok(values)
+}
+
+fn checked_prefix_shape(shape: [usize; 3]) -> Result<[usize; 3]> {
+    Ok([
+        shape[0]
+            .checked_add(1)
+            .ok_or_else(|| CacheError::invalid_input("foreground prefix x dimension overflow"))?,
+        shape[1]
+            .checked_add(1)
+            .ok_or_else(|| CacheError::invalid_input("foreground prefix y dimension overflow"))?,
+        shape[2]
+            .checked_add(1)
+            .ok_or_else(|| CacheError::invalid_input("foreground prefix z dimension overflow"))?,
+    ])
+}
+
+fn checked_value_count(shape: [usize; 3], what: &str) -> Result<usize> {
+    shape[0]
+        .checked_mul(shape[1])
+        .and_then(|value| value.checked_mul(shape[2]))
+        .ok_or_else(|| CacheError::invalid_input(format!("{what} overflow for shape {shape:?}")))
+}
+
+fn checked_mul(left: usize, right: usize, what: &str) -> Result<usize> {
+    left.checked_mul(right)
+        .ok_or_else(|| CacheError::invalid_input(format!("{what} overflow")))
+}
+
+fn checked_add(left: usize, right: usize, what: &str) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| CacheError::invalid_input(format!("{what} overflow")))
 }
 
 fn valid_chunk_shape(requested: [usize; 3], volume_shape: [usize; 3]) -> [usize; 3] {
@@ -1182,6 +1442,97 @@ mod tests {
     }
 
     #[test]
+    fn prepare_cache_replaces_existing_case_with_corrupt_artifacts() {
+        let root = temp_dir("prepare-replace-corrupt");
+        let image_path = root.join("case_reuse_0000.nii");
+        let label_path = root.join("case_reuse.nii");
+        let manifest_path = root.join("manifest.json");
+        let plan_path = root.join("plan.toml");
+        let cache_dir = root.join("cache");
+
+        fs::write(
+            &image_path,
+            NiftiFixture::new(&[3, 2, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        fs::write(
+            &label_path,
+            NiftiFixture::new(&[3, 2, 1], 512, &[1.0, 1.0, 1.0])
+                .append_u16_pixels(&[0, 1, 0, 2, 0, 3]),
+        )
+        .unwrap();
+        write_plan(&plan_path, identity_plan());
+        write_manifest(
+            &manifest_path,
+            &root,
+            vec![valid_case(
+                "case_reuse",
+                Some(&image_path),
+                Some(&label_path),
+            )],
+        );
+
+        let original = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path: manifest_path.clone(),
+            plan_path: plan_path.clone(),
+            cache_dir: cache_dir.clone(),
+            chunk_shape: Some([2, 2, 2]),
+        })
+        .unwrap();
+        let cached = &original.cases[0];
+        fs::write(Path::new(&cached.image_cache_path), vec![0_u8; 24]).unwrap();
+        assert_eq!(crate::validate_cache(&cache_dir).unwrap().status, "failed");
+
+        let repaired = prepare_cache(&PrepareConfig {
+            dataset_root: root,
+            manifest_path,
+            plan_path,
+            cache_dir: cache_dir.clone(),
+            chunk_shape: Some([2, 2, 2]),
+        })
+        .unwrap();
+
+        assert_eq!(repaired.cases[0], *cached);
+        assert_eq!(crate::validate_cache(&cache_dir).unwrap().status, "ok");
+        assert_eq!(
+            read_f32_values(Path::new(&cached.image_cache_path)),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn image_sources_reject_mixed_or_noncontiguous_channel_indices() {
+        let root = temp_dir("prepare-channel-index-policy");
+        let image0_path = root.join("case_multi_0000.nii");
+        let image1_path = root.join("case_multi_0001.nii");
+        let label_path = root.join("case_multi.nii");
+
+        let mut mixed =
+            multi_channel_case("case_multi", &[&image0_path, &image1_path], &label_path);
+        mixed.images[1].channel_index = None;
+        let error = image_sources_for_case(&mixed, &root).unwrap_err();
+        assert!(error.to_string().contains("mixes indexed and unindexed"));
+
+        let mut gapped =
+            multi_channel_case("case_multi", &[&image0_path, &image1_path], &label_path);
+        gapped.images[0].channel_index = Some(1);
+        gapped.images[1].channel_index = Some(2);
+        let error = image_sources_for_case(&gapped, &root).unwrap_err();
+        assert!(error.to_string().contains("contiguous from 0"));
+
+        let mut unindexed =
+            multi_channel_case("case_multi", &[&image1_path, &image0_path], &label_path);
+        for image in &mut unindexed.images {
+            image.channel_index = None;
+        }
+        let sources = image_sources_for_case(&unindexed, &root).unwrap();
+        assert_eq!(sources[0].path_text, path_text(&image0_path));
+        assert_eq!(sources[1].path_text, path_text(&image1_path));
+    }
+
+    #[test]
     fn prepare_cache_fails_on_case_errors() {
         let root = temp_dir("prepare-strict-errors");
         let image_path = root.join("case_a_0000.nii");
@@ -1447,7 +1798,7 @@ mod tests {
     #[test]
     fn foreground_prefix_values_count_3d_regions() {
         let label = Volume3D::new([2, 2, 2], vec![1, 0, 0, 1, 0, 1, 1, 0]).unwrap();
-        let prefix = foreground_prefix_values(&label);
+        let prefix = foreground_prefix_values(&label).unwrap();
         let index = |x: usize, y: usize, z: usize| x + 3 * (y + 3 * z);
 
         assert_eq!(prefix[index(0, 0, 0)], 0);

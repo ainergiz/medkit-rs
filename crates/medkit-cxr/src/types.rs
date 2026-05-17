@@ -354,9 +354,17 @@ pub struct CacheSplitSummary {
     pub samples: usize,
     pub shape: [usize; 4],
     pub images_path: String,
+    #[serde(default)]
+    pub images_sha256: String,
     pub labels_path: String,
+    #[serde(default)]
+    pub labels_sha256: String,
     pub masks_path: String,
+    #[serde(default)]
+    pub masks_sha256: String,
     pub metadata_path: String,
+    #[serde(default)]
+    pub metadata_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

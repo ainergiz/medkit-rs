@@ -752,6 +752,31 @@ fn cache_validation_reports_actionable_mismatches() {
     assert!(root.join("cache-validation.md").exists());
     assert!(root.join("cache-validation.json").exists());
 
+    let summary = read_cache_summary(&cache_dir).unwrap();
+    let train = summary.splits.get("train").unwrap();
+    assert_eq!(train.images_sha256.len(), 64);
+    assert_eq!(train.labels_sha256.len(), 64);
+    assert_eq!(train.masks_sha256.len(), 64);
+    assert_eq!(train.metadata_sha256.len(), 64);
+    let train_images_path = resolve_cache_path(&cache_dir, &train.images_path);
+    let original_train_images = fs::read(&train_images_path).unwrap();
+    fs::write(&train_images_path, vec![0_u8; original_train_images.len()]).unwrap();
+    let corrupted = validate_cache_cxr(&ValidateCacheConfig {
+        cache_dir: cache_dir.clone(),
+        split: Some("train".to_string()),
+        expected_targets: None,
+        expected_image_shape: None,
+        plan_path: None,
+        report_path: None,
+        json_path: None,
+    })
+    .unwrap();
+    assert!(corrupted
+        .errors
+        .iter()
+        .any(|error| error.contains("wrong images SHA-256")));
+    fs::write(&train_images_path, original_train_images).unwrap();
+
     fs::write(
         root.join("different-plan.toml"),
         "[image]\nsize = [16, 16]\n",
@@ -2199,9 +2224,13 @@ fn write_synthetic_cache(
         samples,
         shape: [samples, 1, image_size, image_size],
         images_path: "train-images.float32.dat".to_string(),
+        images_sha256: hash_file(&cache_dir.join("train-images.float32.dat")).unwrap(),
         labels_path: "train-labels.float32.dat".to_string(),
+        labels_sha256: hash_file(&cache_dir.join("train-labels.float32.dat")).unwrap(),
         masks_path: "train-masks.float32.dat".to_string(),
+        masks_sha256: hash_file(&cache_dir.join("train-masks.float32.dat")).unwrap(),
         metadata_path: "train-metadata.jsonl".to_string(),
+        metadata_sha256: hash_file(&cache_dir.join("train-metadata.jsonl")).unwrap(),
     };
     let summary = CacheSummary {
         cache_schema_version: CXR_CACHE_SCHEMA_VERSION,

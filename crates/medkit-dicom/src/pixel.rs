@@ -281,10 +281,10 @@ impl DecoderBackend for DicomRsDecoderBackend {
         #[cfg(not(feature = "dicom-rs-codecs"))]
         {
             let _ = expected_bytes;
-            return Err(DicomError::unsupported(
+            Err(DicomError::unsupported(
                 &dataset.path,
                 "DICOM-rs decoder backend requested but medkit-dicom was built without the dicom-rs-codecs feature",
-            ));
+            ))
         }
 
         #[cfg(feature = "dicom-rs-codecs")]

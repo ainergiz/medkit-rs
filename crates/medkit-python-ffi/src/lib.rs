@@ -155,6 +155,12 @@ struct PatchCopySpec {
     patch_size: [usize; 3],
 }
 
+struct ResidentPatchCopy<'a> {
+    spec: PatchCopySpec,
+    image: &'a [f32],
+    label_f32: &'a [f32],
+}
+
 struct ChunkedPatchCopy<'a> {
     spec: PatchCopySpec,
     image_mmap: &'a Mmap,
@@ -543,14 +549,20 @@ fn copy_patch_f32_labels(
     match &case.storage {
         CaseStorage::Resident { image, label_f32 } => {
             copy_patch_f32_labels_resident(
-                case.shape,
-                case.image_channel_count,
-                image,
-                label_f32,
-                start,
-                patch_size,
-                image_out,
-                label_out,
+                ResidentPatchCopy {
+                    spec: PatchCopySpec {
+                        shape: case.shape,
+                        image_channel_count: case.image_channel_count,
+                        start,
+                        patch_size,
+                    },
+                    image,
+                    label_f32,
+                },
+                PatchOutputs {
+                    image: image_out,
+                    label: label_out,
+                },
             );
             Ok(())
         }
@@ -580,16 +592,13 @@ fn copy_patch_f32_labels(
     }
 }
 
-fn copy_patch_f32_labels_resident(
-    shape: [usize; 3],
-    image_channel_count: usize,
-    image: &[f32],
-    label_f32: &[f32],
-    start: [usize; 3],
-    patch_size: [usize; 3],
-    image_out: &mut [f32],
-    label_out: &mut [f32],
-) {
+fn copy_patch_f32_labels_resident(request: ResidentPatchCopy<'_>, outputs: PatchOutputs<'_>) {
+    let PatchCopySpec {
+        shape,
+        image_channel_count,
+        start,
+        patch_size,
+    } = request.spec;
     let shape_voxels = shape[0] * shape[1] * shape[2];
     let patch_voxels = patch_size[0] * patch_size[1] * patch_size[2];
     for local_z in 0..patch_size[2] {
@@ -605,11 +614,11 @@ fn copy_patch_f32_labels_resident(
                 let source_channel_end = channel * shape_voxels + source_end;
                 let destination_channel_start = channel * patch_voxels + destination_start;
                 let destination_channel_end = channel * patch_voxels + destination_end;
-                image_out[destination_channel_start..destination_channel_end]
-                    .copy_from_slice(&image[source_channel_start..source_channel_end]);
+                outputs.image[destination_channel_start..destination_channel_end]
+                    .copy_from_slice(&request.image[source_channel_start..source_channel_end]);
             }
-            label_out[destination_start..destination_end]
-                .copy_from_slice(&label_f32[source_start..source_end]);
+            outputs.label[destination_start..destination_end]
+                .copy_from_slice(&request.label_f32[source_start..source_end]);
         }
     }
 }

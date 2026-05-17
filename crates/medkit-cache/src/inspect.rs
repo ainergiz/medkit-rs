@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -347,9 +348,16 @@ fn check_file_hash(
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let bytes = fs::read(path)?;
+    let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 

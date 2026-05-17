@@ -543,6 +543,7 @@ def test_view_batch_iterable_uses_tensor_views_and_prefix_counts(
     assert len(dataset) == 2
     assert len(batches) == 1
     assert len(batches[0]["image"]) == 2
+    assert batches[0]["image"][0].shape == (1, 2, 2, 1)
     assert batches[0]["label_sum"] == 4
     assert dataset._resolve("prefix.raw") == cache / "prefix.raw"
     assert dataset._resolve(str(cache / "prefix.raw")) == cache / "prefix.raw"
@@ -562,6 +563,29 @@ def test_view_batch_iterable_uses_tensor_views_and_prefix_counts(
     )
     worker_view = worker_ds.MedkitViewBatchIterableDataset(cache, patches, length=4, batch_size=1)
     assert len(list(worker_view)) == 2
+
+
+def test_view_batch_iterable_reads_multichannel_images(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ds = reload_dataset_module(monkeypatch)
+    cache, patches = write_patch_fixture(tmp_path)
+    stacked = np.concatenate(
+        [
+            np.arange(8, dtype="<f4"),
+            np.arange(8, dtype="<f4") + 100.0,
+        ]
+    )
+    stacked.tofile(cache / "image.raw")
+    manifest = json.loads((cache / "cache_manifest.json").read_text())
+    manifest["cases"][0]["image_channel_count"] = 2
+    (cache / "cache_manifest.json").write_text(json.dumps(manifest))
+
+    batch = next(iter(ds.MedkitViewBatchIterableDataset(cache, patches, length=1)))
+
+    image = batch["image"][0]
+    assert image.shape == (2, 2, 2, 1)
+    assert image.data[1, 0, 0, 0] == 100.0
 
 
 def test_low_level_helpers_cover_pointer_prefix_and_library_paths(

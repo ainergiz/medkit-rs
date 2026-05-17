@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "medkit-rs"
-version = "0.1.0a1"
+version = "0.1.0"
 description = "Rust-first medical imaging data loading and training utilities."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,7 +24,7 @@ keywords = [
     "pytorch",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",

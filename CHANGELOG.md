@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.1.0a1 - 2026-05-17
+## 0.1.0 - 2026-05-17
 
-Initial alpha release of the Python package.
+Initial release of the Python package.
 
 ### Included
 
@@ -16,5 +16,5 @@ Initial alpha release of the Python package.
 
 - NumPy is a required runtime dependency.
 - Torch is optional and available as `medkit-rs[torch]`.
-- Free-threaded CPython builds are not supported for this alpha.
-- JPEG-LS and JPEG 2000 codec stacks are not enabled in the alpha package.
+- Free-threaded CPython builds are not supported for this release.
+- JPEG-LS and JPEG 2000 codec stacks are not enabled in the default package.

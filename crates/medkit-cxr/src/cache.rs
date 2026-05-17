@@ -229,12 +229,64 @@ fn promote_staged_file(
 ) -> Result<(), CxrError> {
     let staged = staging_dir.join(relative);
     let final_path = cache_dir.join(relative);
-    if final_path.exists() {
-        fs::remove_file(&final_path)?;
-    }
+    replace_staged_file(&staged, &final_path)?;
+    sync_parent_dir(&final_path);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_staged_file(staged: &Path, final_path: &Path) -> Result<(), CxrError> {
     fs::rename(staged, final_path)?;
     Ok(())
 }
+
+#[cfg(not(unix))]
+fn replace_staged_file(staged: &Path, final_path: &Path) -> Result<(), CxrError> {
+    if !final_path.exists() {
+        fs::rename(staged, final_path)?;
+        return Ok(());
+    }
+    let backup = unique_sibling_path(final_path, "replace-cxr");
+    if backup.exists() {
+        fs::remove_file(&backup)?;
+    }
+    fs::rename(final_path, &backup)?;
+    match fs::rename(staged, final_path) {
+        Ok(()) => {
+            fs::remove_file(&backup)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&backup, final_path);
+            Err(CxrError::Io(error))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn unique_sibling_path(path: &Path, prefix: &str) -> std::path::PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    parent.join(format!(".{prefix}-{name}-{}-{nanos}", std::process::id()))
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 pub fn validate_cache_cxr(
     config: &ValidateCacheConfig,
@@ -934,14 +986,26 @@ fn write_cache_split(
     labels.flush()?;
     masks.flush()?;
     metadata.flush()?;
+    images.get_ref().sync_all()?;
+    labels.get_ref().sync_all()?;
+    masks.get_ref().sync_all()?;
+    metadata.get_ref().sync_all()?;
+    let images_sha256 = hash_file(&images_path)?;
+    let labels_sha256 = hash_file(&labels_path)?;
+    let masks_sha256 = hash_file(&masks_path)?;
+    let metadata_sha256 = hash_file(&metadata_path)?;
 
     Ok(CacheSplitSummary {
         samples: records.len(),
         shape: [records.len(), 1, image_size, image_size],
         images_path: images_name,
+        images_sha256,
         labels_path: labels_name,
+        labels_sha256,
         masks_path: masks_name,
+        masks_sha256,
         metadata_path: metadata_name,
+        metadata_sha256,
     })
 }
 
@@ -1376,18 +1440,40 @@ fn validate_cache_split_files(
         .samples
         .checked_mul(target_count)
         .ok_or_else(|| CxrError::Message(format!("label shape overflow for split {split}")))?;
+    let images_path = resolve_cache_path(cache_dir, &split_summary.images_path);
     check_file_size(
-        &resolve_cache_path(cache_dir, &split_summary.images_path),
+        &images_path,
         image_values * std::mem::size_of::<f32>(),
         split,
         "images",
         errors,
     )?;
+    check_file_hash(
+        &images_path,
+        &split_summary.images_sha256,
+        split,
+        "images",
+        errors,
+    );
     let label_bytes = label_values * std::mem::size_of::<f32>();
     let labels_path = resolve_cache_path(cache_dir, &split_summary.labels_path);
     check_file_size(&labels_path, label_bytes, split, "labels", errors)?;
+    check_file_hash(
+        &labels_path,
+        &split_summary.labels_sha256,
+        split,
+        "labels",
+        errors,
+    );
     let masks_path = resolve_cache_path(cache_dir, &split_summary.masks_path);
     check_file_size(&masks_path, label_bytes, split, "masks", errors)?;
+    check_file_hash(
+        &masks_path,
+        &split_summary.masks_sha256,
+        split,
+        "masks",
+        errors,
+    );
     let metadata_path = resolve_cache_path(cache_dir, &split_summary.metadata_path);
     match count_jsonl_records(&metadata_path) {
         Ok(count) if count == split_summary.samples => {}
@@ -1399,6 +1485,13 @@ fn validate_cache_split_files(
             "missing or unreadable metadata for split {split}: {error}"
         )),
     }
+    check_file_hash(
+        &metadata_path,
+        &split_summary.metadata_sha256,
+        split,
+        "metadata",
+        errors,
+    );
     Ok(())
 }
 
@@ -1424,6 +1517,27 @@ fn check_file_size(
         Err(error) => return Err(CxrError::Io(error)),
     }
     Ok(())
+}
+
+fn check_file_hash(path: &Path, expected: &str, split: &str, kind: &str, errors: &mut Vec<String>) {
+    if expected.is_empty() {
+        errors.push(format!(
+            "missing {kind} SHA-256 metadata for split {split}: {}",
+            path.display()
+        ));
+        return;
+    }
+    match hash_file(path) {
+        Ok(actual) if actual == expected => {}
+        Ok(actual) => errors.push(format!(
+            "wrong {kind} SHA-256 for split {split}: {} has {actual}, expected {expected}",
+            path.display()
+        )),
+        Err(error) => errors.push(format!(
+            "missing or unreadable {kind} for split {split}: {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn count_jsonl_records(path: &Path) -> Result<usize, CxrError> {

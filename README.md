@@ -82,8 +82,8 @@ cargo run -p medkit-cli --features dicom-rs-codecs -- dicom pixels --explain ima
 cargo run -p medkit-cli --features dicom-rs-codecs -- cxr cache manifest.jsonl --splits splits.json --plan recipes/cxr-512.toml --cache .medkit/cxr-cache --dicom-decoder-backend auto
 ```
 
-Native codec stacks for JPEG-LS or JPEG 2000 are intentionally not enabled for
-the alpha path until real fixtures and packaging tradeoffs are verified.
+Native codec stacks for JPEG-LS or JPEG 2000 are intentionally not enabled in
+the default package until real fixtures and packaging tradeoffs are verified.
 
 ## Python Surface
 
