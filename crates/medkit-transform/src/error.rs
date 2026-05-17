@@ -57,6 +57,11 @@ pub enum TransformError {
         /// Direction determinant.
         determinant: f64,
     },
+    /// Label resampling policy can corrupt discrete segmentation labels.
+    InvalidLabelInterpolation {
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 impl fmt::Display for TransformError {
@@ -86,6 +91,9 @@ impl fmt::Display for TransformError {
             Self::InvalidOrigin { origin } => write!(f, "invalid origin {origin:?}"),
             Self::InvalidDirection { determinant } => {
                 write!(f, "invalid direction matrix with determinant {determinant}")
+            }
+            Self::InvalidLabelInterpolation { reason } => {
+                write!(f, "invalid label interpolation: {reason}")
             }
         }
     }

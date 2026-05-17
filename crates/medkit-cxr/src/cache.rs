@@ -85,8 +85,6 @@ pub fn cache_cxr_with_options(
     let train_records = records_for_split(&records, &split_file.train)?;
     let normalization = estimate_normalization(&train_records, image_size)?;
     let mut splits = BTreeMap::new();
-    let mut failed_samples = Vec::new();
-
     for (name, ids) in [
         ("train", &split_file.train),
         ("val", &split_file.val),
@@ -100,7 +98,6 @@ pub fn cache_cxr_with_options(
             &targets,
             image_size,
             &normalization,
-            &mut failed_samples,
         )?;
         splits.insert(name.to_string(), split_summary);
     }
@@ -137,7 +134,7 @@ pub fn cache_cxr_with_options(
         transfer_syntax_policy: options.transfer_syntax_policy.clone(),
         split_policy: options.split_policy.clone(),
         splits,
-        failed_samples,
+        failed_samples: Vec::new(),
         cache_size_bytes: directory_size(&config.cache_dir)?,
     };
     write_json(&config.cache_dir.join("cache-metadata.json"), &summary)?;
@@ -807,7 +804,6 @@ fn write_cache_split(
     targets: &[String],
     image_size: usize,
     normalization: &Normalization,
-    failed_samples: &mut Vec<String>,
 ) -> Result<CacheSplitSummary, CxrError> {
     let images_name = format!("{split}-images.float32.dat");
     let labels_name = format!("{split}-labels.float32.dat");
@@ -823,18 +819,14 @@ fn write_cache_split(
     let mut metadata = BufWriter::new(File::create(&metadata_path)?);
 
     for record in records {
-        match preprocess_image(record, image_size, normalization) {
-            Ok(values) => {
-                for value in values {
-                    images.write_all(&value.to_le_bytes())?;
-                }
-            }
-            Err(error) => {
-                failed_samples.push(format!("{}: {error}", record.sample_id));
-                for _ in 0..(image_size * image_size) {
-                    images.write_all(&0.0f32.to_le_bytes())?;
-                }
-            }
+        let values = preprocess_image(record, image_size, normalization).map_err(|error| {
+            CxrError::Message(format!(
+                "failed to preprocess sample {}: {error}",
+                record.sample_id
+            ))
+        })?;
+        for value in values {
+            images.write_all(&value.to_le_bytes())?;
         }
         for target in targets {
             let value = record.labels.get(target).copied().flatten();

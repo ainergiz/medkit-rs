@@ -10,7 +10,9 @@ use medkit_io::{ImageMetadataReader, NiftiMetadataReader};
 use crate::{
     error::DatasetError,
     manifest::{path_string, summarize},
-    pairing::{case_id_from_image_path, case_id_from_label_path, is_nifti_path},
+    pairing::{
+        case_id_from_image_path_for_layout, case_id_from_label_path, is_nifti_path, DatasetLayout,
+    },
     render_report, CaseManifest, DatasetManifest, ImageRecord, Problem, ProblemCode, Result,
 };
 
@@ -20,6 +22,7 @@ pub struct ValidationConfig {
     root: PathBuf,
     images_dir: PathBuf,
     labels_dir: PathBuf,
+    layout: DatasetLayout,
 }
 
 impl ValidationConfig {
@@ -29,6 +32,7 @@ impl ValidationConfig {
             root: root.into(),
             images_dir: PathBuf::from("imagesTr"),
             labels_dir: PathBuf::from("labelsTr"),
+            layout: DatasetLayout::Flat,
         }
     }
 
@@ -41,6 +45,12 @@ impl ValidationConfig {
     /// Sets the label directory, relative to root unless absolute.
     pub fn labels_dir(mut self, labels_dir: impl Into<PathBuf>) -> Self {
         self.labels_dir = labels_dir.into();
+        self
+    }
+
+    /// Sets the dataset image naming layout.
+    pub fn layout(mut self, layout: DatasetLayout) -> Self {
+        self.layout = layout;
         self
     }
 
@@ -57,6 +67,11 @@ impl ValidationConfig {
     /// Returns the configured label directory.
     pub fn labels_dir_path(&self) -> &Path {
         &self.labels_dir
+    }
+
+    /// Returns the configured image naming layout.
+    pub fn layout_value(&self) -> DatasetLayout {
+        self.layout
     }
 
     fn resolved_images_dir(&self) -> PathBuf {
@@ -76,7 +91,9 @@ pub fn validate_dataset(config: &ValidationConfig) -> Result<DatasetManifest> {
     ensure_dir(&images_dir, "image directory")?;
     ensure_dir(&labels_dir, "label directory")?;
 
-    let image_index = collect_index(&images_dir, case_id_from_image_path)?;
+    let image_index = collect_index(&images_dir, |path| {
+        case_id_from_image_path_for_layout(path, config.layout)
+    })?;
     let label_index = collect_index(&labels_dir, case_id_from_label_path)?;
     let mut case_ids = BTreeSet::new();
     case_ids.extend(image_index.keys().cloned());
@@ -210,7 +227,7 @@ fn validate_case(
 
 fn collect_index(
     dir: &Path,
-    case_id_from_path: fn(&Path) -> Option<String>,
+    case_id_from_path: impl Fn(&Path) -> Option<String>,
 ) -> Result<BTreeMap<String, IndexedPaths>> {
     let mut index = BTreeMap::new();
     let mut paths = Vec::new();

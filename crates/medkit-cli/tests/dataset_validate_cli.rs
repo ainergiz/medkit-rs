@@ -15,15 +15,10 @@ fn dataset_validate_command_writes_manifest_and_report() {
     fs::create_dir_all(&images).unwrap();
     fs::create_dir_all(&labels).unwrap();
 
-    write_nifti(
-        &images.join("valid_0000.nii"),
-        &[8, 8, 4],
-        4,
-        &[1.0, 1.0, 2.0],
-    );
+    write_nifti(&images.join("valid.nii"), &[8, 8, 4], 4, &[1.0, 1.0, 2.0]);
     write_nifti(&labels.join("valid.nii"), &[8, 8, 4], 2, &[1.0, 1.0, 2.0]);
     write_nifti(
-        &images.join("bad_spacing_0000.nii"),
+        &images.join("bad_spacing.nii"),
         &[8, 8, 4],
         4,
         &[1.0, 1.0, 2.0],

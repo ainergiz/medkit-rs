@@ -68,7 +68,7 @@ pub struct CachedCase {
     pub case_id: String,
     /// Content-addressed cache key.
     pub cache_key: String,
-    /// Hash of source paths and metadata.
+    /// Hash of source paths, source bytes, and metadata.
     pub source_metadata_hash: String,
     /// Hash of the transform plan.
     pub transform_plan_hash: String,
@@ -134,21 +134,20 @@ pub fn prepare_cache(config: &PrepareConfig) -> Result<CacheManifest> {
         .filter(|case| case.status == CaseStatus::Valid)
     {
         summary.input_cases += 1;
-        match prepare_case(
+        let cached = prepare_case(
             case,
             &plan,
             &plan_hash,
             &config.cache_dir,
             config.chunk_shape,
-        ) {
-            Ok(cached) => {
-                summary.cached_cases += 1;
-                summary.foreground_voxels += cached.foreground_voxels;
-                summary.bytes_written += cached.bytes_written;
-                cases.push(cached);
-            }
-            Err(_) => summary.failed_cases += 1,
-        }
+        )
+        .map_err(|error| {
+            CacheError::invalid_input(format!("failed to prepare case {}: {error}", case.case_id))
+        })?;
+        summary.cached_cases += 1;
+        summary.foreground_voxels += cached.foreground_voxels;
+        summary.bytes_written += cached.bytes_written;
+        cases.push(cached);
     }
 
     let cache_manifest = CacheManifest {
@@ -214,7 +213,13 @@ fn prepare_case(
         .filter_map(|(index, value)| (*value != 0).then_some(index))
         .collect::<Vec<_>>();
     let foreground_voxels = foreground_indices.len();
-    let source_metadata_hash = source_hash(case, &source_geometry, &label_geometry)?;
+    let source_metadata_hash = source_hash(
+        case,
+        &source_geometry,
+        &label_geometry,
+        &image.source_content_hash,
+        &label.source_content_hash,
+    )?;
     let cache_key = cache_key(&case.case_id, &source_metadata_hash, plan_hash);
     let case_dir = cache_dir.join(&cache_key);
     fs::create_dir_all(&case_dir).map_err(|source| CacheError::io(&case_dir, source))?;
@@ -460,9 +465,17 @@ fn source_hash(
     case: &medkit_dataset::CaseManifest,
     image_geometry: &VolumeGeometry,
     label_geometry: &VolumeGeometry,
+    image_content_hash: &str,
+    label_content_hash: &str,
 ) -> Result<String> {
-    let text = serde_json::to_string(&(case, image_geometry, label_geometry))
-        .map_err(|source| CacheError::json(PathBuf::from("<case-source-hash>"), source))?;
+    let text = serde_json::to_string(&(
+        case,
+        image_geometry,
+        label_geometry,
+        image_content_hash,
+        label_content_hash,
+    ))
+    .map_err(|source| CacheError::json(PathBuf::from("<case-source-hash>"), source))?;
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     Ok(format!("{:x}", hasher.finalize()))
@@ -473,7 +486,7 @@ fn cache_key(case_id: &str, source_hash: &str, plan_hash: &str) -> String {
     hasher.update(case_id.as_bytes());
     hasher.update(source_hash.as_bytes());
     hasher.update(plan_hash.as_bytes());
-    format!("{}-{:x}", case_id, hasher.finalize())
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -549,7 +562,6 @@ mod tests {
         let root = temp_dir("prepare-success");
         let image_path = root.join("case_a_0000.nii");
         let label_path = root.join("case_a.nii");
-        let mismatch_label_path = root.join("case_mismatch.nii");
         let manifest_path = root.join("manifest.json");
         let plan_path = root.join("plan.toml");
         let cache_dir = root.join("cache");
@@ -566,25 +578,12 @@ mod tests {
                 .append_u16_pixels(&[0, 1, 0, 2, 0, 3]),
         )
         .unwrap();
-        fs::write(
-            &mismatch_label_path,
-            NiftiFixture::new(&[3, 2, 1], 512, &[2.0, 1.0, 1.0])
-                .append_u16_pixels(&[0, 1, 0, 2, 0, 3]),
-        )
-        .unwrap();
         write_plan(&plan_path, identity_plan());
         write_manifest(
             &manifest_path,
             &root,
             vec![
                 valid_case("case_a", Some(&image_path), Some(&label_path)),
-                valid_case("missing_image_path", None, Some(&label_path)),
-                valid_case("missing_label_path", Some(&image_path), None),
-                valid_case(
-                    "geometry_mismatch",
-                    Some(&image_path),
-                    Some(&mismatch_label_path),
-                ),
                 invalid_case("skipped_invalid"),
             ],
         );
@@ -601,9 +600,9 @@ mod tests {
         assert_eq!(
             manifest.summary,
             CacheSummary {
-                input_cases: 4,
+                input_cases: 1,
                 cached_cases: 1,
-                failed_cases: 3,
+                failed_cases: 0,
                 foreground_voxels: 3,
                 bytes_written: 204,
             }
@@ -611,7 +610,7 @@ mod tests {
         assert_eq!(manifest.cases.len(), 1);
         let cached = &manifest.cases[0];
         assert_eq!(cached.case_id, "case_a");
-        assert!(cached.cache_key.starts_with("case_a-"));
+        assert_eq!(cached.cache_key.len(), 64);
         assert_eq!(cached.source_metadata_hash.len(), 64);
         assert_eq!(cached.transform_plan_hash, manifest.transform_plan_hash);
         assert_eq!(cached.transform_plan_hash.len(), 64);
@@ -663,6 +662,84 @@ mod tests {
         let loaded_case: CachedCase =
             serde_json::from_str(&fs::read_to_string(case_json).unwrap()).unwrap();
         assert_eq!(loaded_case, *cached);
+
+        let original_source_hash = cached.source_metadata_hash.clone();
+        let original_cache_key = cached.cache_key.clone();
+        fs::write(
+            &image_path,
+            NiftiFixture::new(&[3, 2, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[9.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        let changed_manifest = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path: manifest_path.clone(),
+            plan_path: plan_path.clone(),
+            cache_dir: root.join("cache-changed"),
+            chunk_shape: Some([2, 2, 2]),
+        })
+        .unwrap();
+        assert_ne!(
+            changed_manifest.cases[0].source_metadata_hash,
+            original_source_hash
+        );
+        assert_ne!(changed_manifest.cases[0].cache_key, original_cache_key);
+    }
+
+    #[test]
+    fn prepare_cache_fails_on_case_errors() {
+        let root = temp_dir("prepare-strict-errors");
+        let image_path = root.join("case_a_0000.nii");
+        let label_path = root.join("case_a.nii");
+        let mismatch_label_path = root.join("case_mismatch.nii");
+        let manifest_path = root.join("manifest.json");
+        let plan_path = root.join("plan.toml");
+        let cache_dir = root.join("cache");
+
+        fs::write(
+            &image_path,
+            NiftiFixture::new(&[3, 2, 1], 16, &[1.0, 1.0, 1.0])
+                .append_f32_pixels(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        fs::write(
+            &label_path,
+            NiftiFixture::new(&[3, 2, 1], 512, &[1.0, 1.0, 1.0])
+                .append_u16_pixels(&[0, 1, 0, 2, 0, 3]),
+        )
+        .unwrap();
+        fs::write(
+            &mismatch_label_path,
+            NiftiFixture::new(&[3, 2, 1], 512, &[2.0, 1.0, 1.0])
+                .append_u16_pixels(&[0, 1, 0, 2, 0, 3]),
+        )
+        .unwrap();
+        write_plan(&plan_path, identity_plan());
+        write_manifest(
+            &manifest_path,
+            &root,
+            vec![
+                valid_case("case_a", Some(&image_path), Some(&label_path)),
+                valid_case(
+                    "geometry_mismatch",
+                    Some(&image_path),
+                    Some(&mismatch_label_path),
+                ),
+            ],
+        );
+
+        let error = prepare_cache(&PrepareConfig {
+            dataset_root: root.clone(),
+            manifest_path,
+            plan_path,
+            cache_dir: cache_dir.clone(),
+            chunk_shape: None,
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("failed to prepare case geometry_mismatch"));
+        assert!(message.contains("image and label source geometry differ"));
+        assert!(!cache_dir.join(CACHE_MANIFEST).exists());
     }
 
     #[test]
@@ -796,15 +873,18 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_is_stable_and_prefixed_by_case_id() {
+    fn cache_key_is_stable_hash_without_raw_case_id_prefix() {
         let first = cache_key("case_a", "source", "plan");
         let second = cache_key("case_a", "source", "plan");
         let different_plan = cache_key("case_a", "source", "other-plan");
+        let path_like = cache_key("../case_a", "source", "plan");
 
         assert_eq!(first, second);
         assert_ne!(first, different_plan);
-        assert!(first.starts_with("case_a-"));
-        assert_eq!(first.len(), "case_a-".len() + 64);
+        assert_ne!(first, path_like);
+        assert_eq!(first.len(), 64);
+        assert!(!path_like.contains('/'));
+        assert!(!path_like.contains(".."));
     }
 
     fn valid_case(

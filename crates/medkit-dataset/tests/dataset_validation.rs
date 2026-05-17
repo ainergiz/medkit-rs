@@ -4,7 +4,8 @@ use std::{fs, path::Path};
 
 use medkit_dataset::{
     case_id_from_image_path, case_id_from_label_path, render_report, validate_dataset,
-    write_manifest_json, write_report, CaseStatus, DatasetManifest, ProblemCode, ValidationConfig,
+    write_manifest_json, write_report, CaseStatus, DatasetLayout, DatasetManifest, ProblemCode,
+    ValidationConfig,
 };
 use support::{create_dataset_dirs, temp_case_dir, write_case, NiftiFixture};
 
@@ -13,10 +14,14 @@ fn fixture(dims: &[i16], dtype: i16, spacing: &[f32]) -> NiftiFixture {
 }
 
 #[test]
-fn derives_case_ids_from_regular_and_nnunet_file_names() {
+fn derives_case_ids_without_implicit_channel_suffix_stripping() {
     assert_eq!(
         case_id_from_image_path(Path::new("imagesTr/liver_001_0000.nii.gz")).as_deref(),
-        Some("liver_001")
+        Some("liver_001_0000")
+    );
+    assert_eq!(
+        case_id_from_image_path(Path::new("imagesTr/patient_2024.nii.gz")).as_deref(),
+        Some("patient_2024")
     );
     assert_eq!(
         case_id_from_image_path(Path::new("imagesTr/liver_001.nii")).as_deref(),
@@ -31,6 +36,30 @@ fn derives_case_ids_from_regular_and_nnunet_file_names() {
         Some("liver_001")
     );
     assert_eq!(case_id_from_image_path(Path::new("notes.txt")), None);
+}
+
+#[test]
+fn nnunet_layout_strips_only_explicit_image_channel_suffix() {
+    let root = temp_case_dir("nnunet-layout");
+    let (images, labels) = create_dataset_dirs(&root);
+    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("liver_001_0000.nii"));
+    fixture(&[8, 8, 8], 2, &[1.0, 1.0, 1.0]).write_nii(&labels.join("liver_001.nii"));
+    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("patient_2024.nii"));
+    fixture(&[8, 8, 8], 2, &[1.0, 1.0, 1.0]).write_nii(&labels.join("patient_2024.nii"));
+
+    let manifest =
+        validate_dataset(&ValidationConfig::new(&root).layout(DatasetLayout::Nnunet)).unwrap();
+
+    assert_eq!(manifest.summary.total_cases, 2);
+    assert_eq!(manifest.summary.valid_cases, 2);
+    assert!(manifest
+        .cases
+        .iter()
+        .any(|case| case.case_id == "liver_001"));
+    assert!(manifest
+        .cases
+        .iter()
+        .any(|case| case.case_id == "patient_2024"));
 }
 
 #[test]
@@ -80,8 +109,8 @@ fn validates_dataset_end_to_end_and_writes_artifacts() {
         Some(fixture(&[8, 8, 8], 128, &[1.0, 1.0, 1.0])),
         Some(fixture(&[8, 8, 8], 2, &[1.0, 1.0, 1.0])),
     );
-    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("duplicate_0000.nii"));
-    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("duplicate_0001.nii"));
+    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("duplicate.nii"));
+    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("duplicate.hdr"));
     fixture(&[8, 8, 8], 2, &[1.0, 1.0, 1.0]).write_nii(&labels.join("duplicate.nii"));
 
     let manifest = validate_dataset(&ValidationConfig::new(&root)).unwrap();

@@ -137,7 +137,7 @@ fn reports_label_read_error_and_recurses_nested_directories() {
     let nested_labels = labels.join("nested");
     fs::create_dir_all(&nested_images).unwrap();
     fs::create_dir_all(&nested_labels).unwrap();
-    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&nested_images.join("bad_0000.nii"));
+    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&nested_images.join("bad.nii"));
     fs::write(nested_labels.join("bad.nii"), b"not a nifti header").unwrap();
 
     let manifest = validate_dataset(&ValidationConfig::new(&root)).unwrap();
@@ -161,7 +161,7 @@ fn reports_label_read_error_and_recurses_nested_directories() {
 fn reports_duplicate_label_files_for_one_case() {
     let root = temp_case_dir("duplicate-label");
     let (images, labels) = create_dataset_dirs(&root);
-    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("dupe_0000.nii"));
+    fixture(&[8, 8, 8], 4, &[1.0, 1.0, 1.0]).write_nii(&images.join("dupe.nii"));
     fixture(&[8, 8, 8], 2, &[1.0, 1.0, 1.0]).write_nii(&labels.join("dupe.nii"));
     fixture(&[8, 8, 8], 2, &[1.0, 1.0, 1.0]).write_nii(&labels.join("dupe.hdr"));
 

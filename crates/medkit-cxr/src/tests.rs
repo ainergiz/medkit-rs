@@ -1449,7 +1449,7 @@ fn indexed_read_buffer_errors_cover_all_entry_points() {
 }
 
 #[test]
-fn cache_build_records_failed_samples_and_non_binary_labels() {
+fn cache_build_rejects_failed_samples() {
     let root = unique_test_dir();
     let Fixture {
         manifest,
@@ -1470,6 +1470,42 @@ fn cache_build_records_failed_samples_and_non_binary_labels() {
     for record in &mut records {
         if record.sample_id == failing_id {
             record.image_path = root.join("missing-cache-source.png").display().to_string();
+        }
+    }
+    write_manifest(&manifest, &records).unwrap();
+
+    let error = cache_cxr(&CacheConfig {
+        manifest_path: manifest.clone(),
+        splits_path: splits,
+        plan_path: plan,
+        cache_dir: cache_dir.clone(),
+    })
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains(&format!("failed to preprocess sample {failing_id}")));
+    assert!(!cache_dir.join("cache-metadata.json").exists());
+}
+
+#[test]
+fn cache_build_preserves_non_binary_labels() {
+    let root = unique_test_dir();
+    let Fixture {
+        manifest,
+        splits,
+        plan,
+        cache_dir,
+        ..
+    } = build_fixture(&root);
+    let split_file = read_split_file(&splits).unwrap();
+    let custom_id = split_file
+        .train
+        .first()
+        .expect("fixture has train sample")
+        .clone();
+    let mut records = read_manifest(&manifest).unwrap();
+    for record in &mut records {
+        if record.sample_id == custom_id {
             record.labels.insert("Custom".to_string(), Some(2));
         } else {
             record.labels.insert("Custom".to_string(), None);
@@ -1484,8 +1520,7 @@ fn cache_build_records_failed_samples_and_non_binary_labels() {
         cache_dir: cache_dir.clone(),
     })
     .unwrap();
-    assert_eq!(cache.failed_samples.len(), 1);
-    assert!(cache.failed_samples[0].contains(&failing_id));
+    assert!(cache.failed_samples.is_empty());
     assert!(cache.targets.contains(&"Custom".to_string()));
 
     let target_index = cache
@@ -1493,17 +1528,12 @@ fn cache_build_records_failed_samples_and_non_binary_labels() {
         .iter()
         .position(|target| target == "Custom")
         .unwrap();
-    let split_name = [("val", &split_file.val), ("test", &split_file.test)]
-        .into_iter()
-        .find(|(_name, ids)| ids.contains(&failing_id))
-        .map(|(name, _ids)| name)
-        .unwrap();
-    let reader = CxrCacheReader::open(&cache_dir, split_name).unwrap();
+    let reader = CxrCacheReader::open(&cache_dir, "train").unwrap();
     let row = reader
         .records_for_range(0, reader.samples())
         .unwrap()
         .into_iter()
-        .position(|record| record.sample_id == failing_id)
+        .position(|record| record.sample_id == custom_id)
         .unwrap();
     let mut images = vec![1.0; reader.samples() * 8 * 8];
     let mut labels = vec![0.0; reader.samples() * reader.targets().len()];
@@ -1513,7 +1543,7 @@ fn cache_build_records_failed_samples_and_non_binary_labels() {
         .unwrap();
     assert!(images[row * 64..row * 64 + 64]
         .iter()
-        .all(|value| *value == 0.0));
+        .any(|value| *value != 0.0));
     assert_eq!(labels[row * reader.targets().len() + target_index], 2.0);
     assert_eq!(masks[row * reader.targets().len() + target_index], 1.0);
 }

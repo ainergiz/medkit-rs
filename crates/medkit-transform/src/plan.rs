@@ -104,6 +104,16 @@ impl TransformPlan {
                 geometry: geometry.shape,
             });
         }
+        if self.label_interpolation != Interpolation::Nearest
+            && self
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, TransformOp::Resample { .. }))
+        {
+            return Err(TransformError::InvalidLabelInterpolation {
+                reason: "segmentation labels must use nearest-neighbor interpolation for resample operations".to_string(),
+            });
+        }
         let mut crop_origin = [0_usize; 3];
         let mut applied = Vec::new();
         for operation in &self.operations {

@@ -148,7 +148,7 @@ fn plan_validation_errors_surface_from_pad_crop_and_geometry_resample() {
 }
 
 #[test]
-fn default_plan_hash_lazy_graph_and_linear_label_resample_are_covered() {
+fn default_plan_hash_lazy_graph_and_linear_label_resample_is_rejected() {
     let default_plan = TransformPlan::ct_segmentation_default();
     let graph = default_plan.lazy_graph();
     assert_eq!(graph.operations, default_plan.operations);
@@ -169,9 +169,11 @@ fn default_plan_hash_lazy_graph_and_linear_label_resample_are_covered() {
     let image = Volume3D::new([2, 1, 1], vec![2.0, 6.0]).unwrap();
     let label = Volume3D::new([2, 1, 1], vec![0_u16, 4]).unwrap();
 
-    let prepared = plan.apply_pair(image, label).unwrap();
+    let error = plan.apply_pair(image, label).unwrap_err();
 
-    assert_eq!(prepared.image.data, vec![2.0, 6.0, 6.0]);
-    assert_eq!(prepared.label.data, vec![0, 2, 4]);
-    assert_eq!(prepared.applied_operations, vec!["resample".to_string()]);
+    assert!(matches!(
+        error,
+        TransformError::InvalidLabelInterpolation { .. }
+    ));
+    assert!(error.to_string().contains("nearest-neighbor"));
 }

@@ -1,13 +1,34 @@
 use std::path::Path;
 
+/// Dataset image naming layout used for image/label pairing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DatasetLayout {
+    /// Use full NIfTI stems as case IDs without stripping channel suffixes.
+    #[default]
+    Flat,
+    /// Treat image stems ending in `_0000` as nnU-Net single-channel image names.
+    Nnunet,
+}
+
 /// Derives a case id from an image path.
 ///
-/// This accepts regular NIfTI names such as `case_001.nii.gz` and nnU-Net-style
-/// image channel names such as `case_001_0000.nii.gz`, where the trailing
-/// channel suffix is removed.
+/// This uses the safe flat layout and preserves the full NIfTI stem.
 pub fn case_id_from_image_path(path: &Path) -> Option<String> {
+    case_id_from_image_path_for_layout(path, DatasetLayout::Flat)
+}
+
+pub(crate) fn case_id_from_image_path_for_layout(
+    path: &Path,
+    layout: DatasetLayout,
+) -> Option<String> {
     let stem = nifti_stem(path)?;
-    Some(strip_nnunet_channel_suffix(stem).to_string())
+    Some(
+        match layout {
+            DatasetLayout::Flat => stem,
+            DatasetLayout::Nnunet => strip_nnunet_channel_suffix(stem),
+        }
+        .to_string(),
+    )
 }
 
 /// Derives a case id from a label path.
@@ -37,7 +58,7 @@ fn strip_nnunet_channel_suffix(stem: &str) -> &str {
     let Some((case_id, suffix)) = stem.rsplit_once('_') else {
         return stem;
     };
-    if suffix.len() == 4 && suffix.chars().all(|character| character.is_ascii_digit()) {
+    if suffix == "0000" {
         case_id
     } else {
         stem

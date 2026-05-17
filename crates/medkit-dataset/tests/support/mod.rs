@@ -80,7 +80,7 @@ pub fn write_case(
     label: Option<NiftiFixture>,
 ) {
     if let Some(image) = image {
-        image.write_nii(&images.join(format!("{case_id}_0000.nii")));
+        image.write_nii(&images.join(format!("{case_id}.nii")));
     }
     if let Some(label) = label {
         label.write_nii(&labels.join(format!("{case_id}.nii")));

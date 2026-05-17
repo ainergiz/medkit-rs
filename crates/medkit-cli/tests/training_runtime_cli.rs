@@ -414,7 +414,7 @@ fn write_runtime_case(images: &Path, labels: &Path, case_id: &str) {
             })
         })
         .collect::<Vec<_>>();
-    write_i16_nifti(&images.join(format!("{case_id}_0000.nii")), shape, &image);
+    write_i16_nifti(&images.join(format!("{case_id}.nii")), shape, &image);
     write_u8_nifti(&labels.join(format!("{case_id}.nii")), shape, &label);
 }
 

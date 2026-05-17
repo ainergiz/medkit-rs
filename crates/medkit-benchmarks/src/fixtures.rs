@@ -8,7 +8,9 @@ use std::{
 
 use medkit_cache::{prepare_cache, CacheManifest, PrepareConfig};
 use medkit_cxr::{split_cxr, CxrRecord, SplitConfig};
-use medkit_dataset::{validate_dataset, write_manifest_json, write_report, ValidationConfig};
+use medkit_dataset::{
+    validate_dataset, write_manifest_json, write_report, DatasetLayout, ValidationConfig,
+};
 use medkit_sampler::{ForegroundPrefix, LoadedCachedCase};
 use medkit_transform::{TransformPlan, Volume3D, VolumeGeometry};
 use serde::{Deserialize, Serialize};
@@ -482,7 +484,8 @@ pub fn create_synthetic_fixture(config: &SyntheticFixtureConfig) -> Result<Synth
 /// Generates a fixture, validates it, and prepares the medkit cache.
 pub fn build_cached_fixture(config: &SyntheticFixtureConfig) -> Result<CachedBenchmarkFixture> {
     let fixture = create_synthetic_fixture(config)?;
-    let validation = validate_dataset(&ValidationConfig::new(&fixture.root))?;
+    let validation =
+        validate_dataset(&ValidationConfig::new(&fixture.root).layout(DatasetLayout::Nnunet))?;
     write_manifest_json(&validation, &fixture.manifest_path)?;
     write_report(&validation, &fixture.report_path)?;
     let cache_manifest = prepare_cache(&PrepareConfig {

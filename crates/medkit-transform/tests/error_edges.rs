@@ -60,6 +60,12 @@ fn transform_errors_have_stable_messages_and_no_sources() {
             TransformError::InvalidDirection { determinant: 0.0 },
             "invalid direction matrix with determinant 0",
         ),
+        (
+            TransformError::InvalidLabelInterpolation {
+                reason: "labels require nearest".to_string(),
+            },
+            "invalid label interpolation: labels require nearest",
+        ),
     ];
 
     for (error, expected) in errors {

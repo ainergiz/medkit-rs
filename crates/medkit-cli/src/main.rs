@@ -21,7 +21,8 @@ use medkit_cxr::{
     ValidateConfig as CxrValidateConfig, ValidationSummary as CxrValidationSummary,
 };
 use medkit_dataset::{
-    validate_dataset, write_manifest_json, write_report, DatasetManifest, ValidationConfig,
+    validate_dataset, write_manifest_json, write_report, DatasetLayout, DatasetManifest,
+    ValidationConfig,
 };
 use medkit_dicom::{
     browse_dicom, explain_pixels, inspect_dicom_file, render_unicode, scan_dicom,
@@ -47,12 +48,14 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
             root,
             images_dir,
             labels_dir,
+            layout,
             manifest_path,
             report_path,
         } => {
             let config = ValidationConfig::new(&root)
                 .images_dir(images_dir)
-                .labels_dir(labels_dir);
+                .labels_dir(labels_dir)
+                .layout(layout);
             let manifest = validate_dataset(&config)?;
             write_manifest_json(&manifest, &manifest_path)?;
             write_report(&manifest, &report_path)?;
@@ -321,6 +324,7 @@ enum Command {
         root: PathBuf,
         images_dir: PathBuf,
         labels_dir: PathBuf,
+        layout: DatasetLayout,
         manifest_path: PathBuf,
         report_path: PathBuf,
     },
@@ -1076,6 +1080,7 @@ fn parse_dataset_command(mut args: impl Iterator<Item = OsString>) -> Result<Com
     let root = PathBuf::from(root);
     let mut images_dir = PathBuf::from("imagesTr");
     let mut labels_dir = PathBuf::from("labelsTr");
+    let mut layout = DatasetLayout::Flat;
     let mut manifest_path = None;
     let mut report_path = None;
 
@@ -1084,6 +1089,7 @@ fn parse_dataset_command(mut args: impl Iterator<Item = OsString>) -> Result<Com
         match flag.to_string_lossy().as_ref() {
             "--images" => images_dir = next_path(&mut rest, "--images")?,
             "--labels" => labels_dir = next_path(&mut rest, "--labels")?,
+            "--layout" => layout = parse_dataset_layout(&next_string(&mut rest, "--layout")?)?,
             "--out" => manifest_path = Some(next_path(&mut rest, "--out")?),
             "--report" => report_path = Some(next_path(&mut rest, "--report")?),
             "--help" | "-h" => return Err(CliError::usage()),
@@ -1103,6 +1109,7 @@ fn parse_dataset_command(mut args: impl Iterator<Item = OsString>) -> Result<Com
         root,
         images_dir,
         labels_dir,
+        layout,
         manifest_path,
         report_path,
     })
@@ -1323,6 +1330,16 @@ fn parse_u64(value: &str, flag: &str) -> Result<u64, CliError> {
     value
         .parse::<u64>()
         .map_err(|_| CliError::Message(format!("invalid integer for {flag}: {value}")))
+}
+
+fn parse_dataset_layout(value: &str) -> Result<DatasetLayout, CliError> {
+    match value {
+        "flat" => Ok(DatasetLayout::Flat),
+        "nnunet" => Ok(DatasetLayout::Nnunet),
+        other => Err(CliError::Message(format!(
+            "invalid --layout {other:?}; expected flat or nnunet"
+        ))),
+    }
 }
 
 fn parse_f64(value: &str, flag: &str) -> Result<f64, CliError> {
@@ -1759,7 +1776,7 @@ impl From<serde_json::Error> for CliError {
 }
 
 fn usage() -> String {
-    "Usage:\n  medkit dataset validate <root> [--images imagesTr] [--labels labelsTr] [--out manifest.json] [--report report.txt]\n  medkit prepare <root> --manifest manifest.json --plan ct-segmentation.toml --cache .medkit/cache [--chunk 96,96,96]\n  medkit sample <cache> --patch 96,96,96 --strategy foreground-balanced --count 10000 --out patches.jsonl\n  medkit bench <cache> --patch 96,96,96 --workers 8 [--samples 10000]\n  medkit bench-plan <cache> --patches patches.jsonl --workers 8 [--samples 10000]\n  medkit cxr manifest --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr manifest --dicom-index dicom-index.jsonl [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr index --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr validate <manifest.jsonl> [--require-frontal] [--check-patient-leakage] [--check-duplicates] --report validation.md\n  medkit cxr split <manifest.jsonl> --by patient_id --train 0.8 --val 0.1 --test 0.1 [--stratify Pneumonia,view_position] [--seed 0] --out splits.json\n  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache\n  medkit cxr validate-cache <cache> [--split train] [--targets Pneumonia] [--image-shape n,c,h,w] [--plan cxr-512.toml] [--report cache-validation.md] [--json cache-validation.json]\n  medkit cxr ingest <raw-dicom> --recipe cxr-dicom-512.toml --labels labels.csv --cache .medkit/cxr-cache --workdir .medkit/cxr-ingest --report ingestion-report.md [--dry-run] [--workers 4]\n  medkit cxr benchmark [--manifest manifest.jsonl] [--splits splits.json] [--plan cxr-512.toml] [--targets Pneumonia] [--baselines pytorch_raw,monai_raw,medkit_cached_mmap] [--batch-sizes 64,128] [--workers 8,16] [--device cuda:0] [--out benchmark.json]\n  medkit dicom scan <root> --out inventory.jsonl --report dicom-report.md [--workers 4]\n  medkit dicom browse <root> --group patient,study,series --out graph.json --report graph-report.md [--workers 4]\n  medkit dicom inspect <file.dcm>\n  medkit dicom pixels --explain <file.dcm>\n  medkit dicom view <file.dcm> [--width 80]".to_string()
+    "Usage:\n  medkit dataset validate <root> [--images imagesTr] [--labels labelsTr] [--layout flat|nnunet] [--out manifest.json] [--report report.txt]\n  medkit prepare <root> --manifest manifest.json --plan ct-segmentation.toml --cache .medkit/cache [--chunk 96,96,96]\n  medkit sample <cache> --patch 96,96,96 --strategy foreground-balanced --count 10000 --out patches.jsonl\n  medkit bench <cache> --patch 96,96,96 --workers 8 [--samples 10000]\n  medkit bench-plan <cache> --patches patches.jsonl --workers 8 [--samples 10000]\n  medkit cxr manifest --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr manifest --dicom-index dicom-index.jsonl [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr index --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr validate <manifest.jsonl> [--require-frontal] [--check-patient-leakage] [--check-duplicates] --report validation.md\n  medkit cxr split <manifest.jsonl> --by patient_id --train 0.8 --val 0.1 --test 0.1 [--stratify Pneumonia,view_position] [--seed 0] --out splits.json\n  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache\n  medkit cxr validate-cache <cache> [--split train] [--targets Pneumonia] [--image-shape n,c,h,w] [--plan cxr-512.toml] [--report cache-validation.md] [--json cache-validation.json]\n  medkit cxr ingest <raw-dicom> --recipe cxr-dicom-512.toml --labels labels.csv --cache .medkit/cxr-cache --workdir .medkit/cxr-ingest --report ingestion-report.md [--dry-run] [--workers 4]\n  medkit cxr benchmark [--manifest manifest.jsonl] [--splits splits.json] [--plan cxr-512.toml] [--targets Pneumonia] [--baselines pytorch_raw,monai_raw,medkit_cached_mmap] [--batch-sizes 64,128] [--workers 8,16] [--device cuda:0] [--out benchmark.json]\n  medkit dicom scan <root> --out inventory.jsonl --report dicom-report.md [--workers 4]\n  medkit dicom browse <root> --group patient,study,series --out graph.json --report graph-report.md [--workers 4]\n  medkit dicom inspect <file.dcm>\n  medkit dicom pixels --explain <file.dcm>\n  medkit dicom view <file.dcm> [--width 80]".to_string()
 }
 
 #[cfg(test)]

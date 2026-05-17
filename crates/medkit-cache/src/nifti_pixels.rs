@@ -1,7 +1,12 @@
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::File,
+    io::{self, Read},
+    path::{Path, PathBuf},
+};
 
 use flate2::read::GzDecoder;
 use medkit_transform::{Volume3D, VolumeGeometry};
+use sha2::{Digest, Sha256};
 
 use crate::{CacheError, Result};
 
@@ -25,37 +30,84 @@ enum PixelKind {
     U32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NiftiStorage {
+    SingleFile,
+    Detached,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Header {
     endian: Endian,
     shape: [usize; 3],
     datatype: PixelKind,
     vox_offset: usize,
+    scl_slope: f64,
+    scl_inter: f64,
     geometry: VolumeGeometry,
 }
 
+#[derive(Debug, Clone)]
+struct NiftiSource {
+    storage: NiftiStorage,
+    header_path: PathBuf,
+    header_bytes: Vec<u8>,
+    pixel_path: PathBuf,
+    pixel_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
 pub(crate) struct LoadedVolume<T> {
     pub(crate) volume: Volume3D<T>,
     pub(crate) geometry: VolumeGeometry,
+    pub(crate) source_content_hash: String,
 }
 
 pub(crate) fn load_image_f32(path: &Path) -> Result<LoadedVolume<f32>> {
-    let bytes = read_all(path)?;
-    let header = parse_header(path, &bytes)?;
-    let values = read_pixels(path, &bytes, &header, |value| value as f32)?;
+    let source = read_source(path)?;
+    let source_content_hash = source_content_hash(&source);
+    let header = parse_header(path, &source.header_bytes, source.storage)?;
+    let values = read_pixels(path, &source.pixel_bytes, &header, |value| value as f32)?;
     Ok(LoadedVolume {
         volume: Volume3D::new(header.shape, values)?,
         geometry: header.geometry,
+        source_content_hash,
     })
 }
 
 pub(crate) fn load_label_u16(path: &Path) -> Result<LoadedVolume<u16>> {
-    let bytes = read_all(path)?;
-    let header = parse_header(path, &bytes)?;
-    let values = read_pixels(path, &bytes, &header, |value| value.max(0.0).round() as u16)?;
+    let source = read_source(path)?;
+    let source_content_hash = source_content_hash(&source);
+    let header = parse_header(path, &source.header_bytes, source.storage)?;
+    let values = read_pixels(path, &source.pixel_bytes, &header, |value| {
+        value.max(0.0).round() as u16
+    })?;
     Ok(LoadedVolume {
         volume: Volume3D::new(header.shape, values)?,
         geometry: header.geometry,
+        source_content_hash,
+    })
+}
+
+fn read_source(path: &Path) -> Result<NiftiSource> {
+    let header_bytes = read_all(path)?;
+    if !is_detached_header_path(path) {
+        return Ok(NiftiSource {
+            storage: NiftiStorage::SingleFile,
+            header_path: path.to_path_buf(),
+            pixel_path: path.to_path_buf(),
+            pixel_bytes: header_bytes.clone(),
+            header_bytes,
+        });
+    }
+
+    let (pixel_path, pixel_bytes) = read_detached_pixels(path)?;
+    Ok(NiftiSource {
+        storage: NiftiStorage::Detached,
+        header_path: path.to_path_buf(),
+        header_bytes,
+        pixel_path,
+        pixel_bytes,
     })
 }
 
@@ -79,7 +131,102 @@ fn read_all(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn parse_header(path: &Path, bytes: &[u8]) -> Result<Header> {
+fn read_detached_pixels(header_path: &Path) -> Result<(PathBuf, Vec<u8>)> {
+    let candidates = detached_pixel_candidates(header_path);
+    let mut missing_paths = Vec::new();
+    for candidate in candidates {
+        match read_all(&candidate) {
+            Ok(bytes) => return Ok((candidate, bytes)),
+            Err(CacheError::Io { path, source })
+                if matches!(source.kind(), io::ErrorKind::NotFound) =>
+            {
+                missing_paths.push(path);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let attempted = missing_paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(CacheError::nifti(
+        header_path,
+        format!("detached NIfTI header requires companion image file; tried {attempted}"),
+    ))
+}
+
+fn detached_pixel_candidates(header_path: &Path) -> Vec<PathBuf> {
+    let Some(file_name) = header_path.file_name().and_then(|value| value.to_str()) else {
+        return vec![header_path.with_extension("img")];
+    };
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".hdr.gz") {
+        let stem = &file_name[..file_name.len() - ".hdr.gz".len()];
+        return vec![
+            header_path.with_file_name(format!("{stem}.img.gz")),
+            header_path.with_file_name(format!("{stem}.img")),
+        ];
+    }
+    if lower.ends_with(".hdr") {
+        let stem = &file_name[..file_name.len() - ".hdr".len()];
+        return vec![
+            header_path.with_file_name(format!("{stem}.img")),
+            header_path.with_file_name(format!("{stem}.img.gz")),
+        ];
+    }
+    vec![header_path.with_extension("img")]
+}
+
+fn is_detached_header_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|file_name| {
+            let lower = file_name.to_ascii_lowercase();
+            lower.ends_with(".hdr") || lower.ends_with(".hdr.gz")
+        })
+}
+
+fn source_content_hash(source: &NiftiSource) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"medkit-nifti-source-v1");
+    match source.storage {
+        NiftiStorage::SingleFile => {
+            hasher.update(b"single-file");
+            hash_source_part(
+                &mut hasher,
+                b"nifti",
+                &source.header_path,
+                &source.header_bytes,
+            );
+        }
+        NiftiStorage::Detached => {
+            hasher.update(b"detached");
+            hash_source_part(
+                &mut hasher,
+                b"header",
+                &source.header_path,
+                &source.header_bytes,
+            );
+            hash_source_part(
+                &mut hasher,
+                b"pixels",
+                &source.pixel_path,
+                &source.pixel_bytes,
+            );
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_source_part(hasher: &mut Sha256, role: &[u8], path: &Path, bytes: &[u8]) {
+    hasher.update(role);
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update(bytes.len().to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn parse_header(path: &Path, bytes: &[u8], storage: NiftiStorage) -> Result<Header> {
     if bytes.len() < HEADER_LEN {
         return Err(CacheError::nifti(
             path,
@@ -103,8 +250,8 @@ fn parse_header(path: &Path, bytes: &[u8]) -> Result<Header> {
             format!("rank must be between 1 and 7, got {rank}"),
         ));
     }
-    let mut shape = [1_usize; 3];
-    for axis in 0..rank.min(3) as usize {
+    let mut dims = [1_usize; 7];
+    for axis in 0..rank as usize {
         let dim = i16_from(&bytes[42 + axis * 2..44 + axis * 2], endian);
         if dim <= 0 {
             return Err(CacheError::nifti(
@@ -112,8 +259,23 @@ fn parse_header(path: &Path, bytes: &[u8]) -> Result<Header> {
                 format!("dimension {} must be positive", axis + 1),
             ));
         }
-        shape[axis] = dim as usize;
+        dims[axis] = dim as usize;
     }
+    if let Some((axis, dim)) = dims[..rank as usize]
+        .iter()
+        .enumerate()
+        .skip(3)
+        .find(|(_axis, dim)| **dim != 1)
+    {
+        return Err(CacheError::nifti(
+            path,
+            format!(
+                "NIfTI rank {rank} with non-singleton dimension {}={dim} is not supported by the 3D cache loader",
+                axis + 1
+            ),
+        ));
+    }
+    let shape = [dims[0], dims[1], dims[2]];
     let mut pixdim = [0.0_f32; 8];
     for (index, value) in pixdim.iter_mut().enumerate() {
         *value = f32_from(&bytes[76 + index * 4..80 + index * 4], endian);
@@ -136,7 +298,29 @@ fn parse_header(path: &Path, bytes: &[u8]) -> Result<Header> {
             ))
         }
     };
-    let vox_offset = f32_from(&bytes[108..112], endian).max(352.0) as usize;
+    let raw_vox_offset = f32_from(&bytes[108..112], endian);
+    if !raw_vox_offset.is_finite() || raw_vox_offset < 0.0 {
+        return Err(CacheError::nifti(
+            path,
+            format!("vox_offset must be finite and non-negative, got {raw_vox_offset}"),
+        ));
+    }
+    let vox_offset = match storage {
+        NiftiStorage::SingleFile => raw_vox_offset.max(352.0) as usize,
+        NiftiStorage::Detached => raw_vox_offset as usize,
+    };
+    let raw_slope = f64::from(f32_from(&bytes[112..116], endian));
+    let raw_inter = f64::from(f32_from(&bytes[116..120], endian));
+    let (scl_slope, scl_inter) = if raw_slope == 0.0 || !raw_slope.is_finite() {
+        (1.0, 0.0)
+    } else if !raw_inter.is_finite() {
+        return Err(CacheError::nifti(
+            path,
+            format!("scl_inter must be finite when scl_slope is set, got {raw_inter}"),
+        ));
+    } else {
+        (raw_slope, raw_inter)
+    };
     let qform_code = i16_from(&bytes[252..254], endian);
     let sform_code = i16_from(&bytes[254..256], endian);
     let geometry = if sform_code > 0 {
@@ -151,6 +335,8 @@ fn parse_header(path: &Path, bytes: &[u8]) -> Result<Header> {
         shape,
         datatype,
         vox_offset,
+        scl_slope,
+        scl_inter,
         geometry,
     })
 }
@@ -287,7 +473,8 @@ fn read_pixels<T>(
     let mut out = Vec::with_capacity(count);
     let pixel_bytes = &bytes[header.vox_offset..end];
     for chunk in pixel_bytes.chunks_exact(bytes_per_value) {
-        out.push(convert(read_value(chunk, header.datatype, header.endian)));
+        let raw = read_value(chunk, header.datatype, header.endian);
+        out.push(convert(raw * header.scl_slope + header.scl_inter));
     }
     Ok(out)
 }
@@ -427,6 +614,17 @@ mod tests {
             self
         }
 
+        fn with_vox_offset(mut self, vox_offset: f32) -> Self {
+            self.put_f32(108, vox_offset);
+            self
+        }
+
+        fn with_scaling(mut self, slope: f32, intercept: f32) -> Self {
+            self.put_f32(112, slope);
+            self.put_f32(116, intercept);
+            self
+        }
+
         fn with_sform(mut self, rows: [[f32; 4]; 3]) -> Self {
             self.put_i16(254, 1);
             for (offset, row) in [(280, rows[0]), (296, rows[1]), (312, rows[2])] {
@@ -450,6 +648,17 @@ mod tests {
         }
 
         fn append_f32_pixels(mut self, values: &[f32]) -> Vec<u8> {
+            for value in values {
+                let bytes = match self.endian {
+                    Endian::Little => value.to_le_bytes(),
+                    Endian::Big => value.to_be_bytes(),
+                };
+                self.bytes.extend_from_slice(&bytes);
+            }
+            self.bytes
+        }
+
+        fn append_u16_pixels(mut self, values: &[u16]) -> Vec<u8> {
             for value in values {
                 let bytes = match self.endian {
                     Endian::Little => value.to_le_bytes(),
@@ -528,6 +737,74 @@ mod tests {
     }
 
     #[test]
+    fn applies_nifti_scaling_and_rejects_unsupported_4d_volumes() {
+        let dir = temp_dir("scaling-and-4d");
+        let scaled_path = dir.join("scaled.nii");
+        fs::write(
+            &scaled_path,
+            NiftiFixture::new(Endian::Little, &[3, 1, 1], 512, &[1.0, 1.0, 1.0])
+                .with_scaling(2.0, -10.0)
+                .append_u16_pixels(&[5, 6, 7]),
+        )
+        .unwrap();
+        let scaled = load_image_f32(&scaled_path).unwrap();
+        assert_eq!(scaled.volume.data, vec![0.0, 2.0, 4.0]);
+
+        let unsupported_path = dir.join("four-dimensional.nii");
+        fs::write(
+            &unsupported_path,
+            NiftiFixture::new(Endian::Little, &[2, 2, 2, 2], 16, &[1.0, 1.0, 1.0, 1.0])
+                .append_f32_pixels(&[0.0; 16]),
+        )
+        .unwrap();
+        let err = load_image_f32(&unsupported_path).unwrap_err();
+        assert!(err.to_string().contains("non-singleton dimension 4=2"));
+
+        let singleton_4d_path = dir.join("singleton-four-dimensional.nii");
+        fs::write(
+            &singleton_4d_path,
+            NiftiFixture::new(Endian::Little, &[2, 1, 1, 1], 16, &[1.0, 1.0, 1.0, 1.0])
+                .append_f32_pixels(&[8.0, 9.0]),
+        )
+        .unwrap();
+        let singleton = load_image_f32(&singleton_4d_path).unwrap();
+        assert_eq!(singleton.volume.shape, [2, 1, 1]);
+        assert_eq!(singleton.volume.data, vec![8.0, 9.0]);
+    }
+
+    #[test]
+    fn detached_hdr_reads_companion_img_bytes_and_hashes_both_files() {
+        let dir = temp_dir("detached-hdr");
+        let header_path = dir.join("case.hdr");
+        let image_path = dir.join("case.img");
+        fs::write(
+            &header_path,
+            NiftiFixture::new(Endian::Little, &[2, 1, 1], 16, &[1.0, 1.0, 1.0])
+                .with_vox_offset(0.0)
+                .bytes(),
+        )
+        .unwrap();
+        fs::write(
+            &image_path,
+            [3.0_f32.to_le_bytes(), 4.0_f32.to_le_bytes()].concat(),
+        )
+        .unwrap();
+
+        let first = load_image_f32(&header_path).unwrap();
+        assert_eq!(first.volume.shape, [2, 1, 1]);
+        assert_eq!(first.volume.data, vec![3.0, 4.0]);
+
+        fs::write(
+            &image_path,
+            [3.0_f32.to_le_bytes(), 5.0_f32.to_le_bytes()].concat(),
+        )
+        .unwrap();
+        let second = load_image_f32(&header_path).unwrap();
+        assert_eq!(second.volume.data, vec![3.0, 5.0]);
+        assert_ne!(first.source_content_hash, second.source_content_hash);
+    }
+
+    #[test]
     fn parses_big_endian_sform_and_little_endian_qform_geometry() {
         let sform_fixture = NiftiFixture::new(Endian::Big, &[2, 3, 4], 512, &[1.0, 1.0, 1.0])
             .with_sform([
@@ -535,7 +812,12 @@ mod tests {
                 [0.0, 3.0, 0.0, 20.0],
                 [0.0, 0.0, -4.0, 30.0],
             ]);
-        let sform = parse_header(Path::new("sform.nii"), &sform_fixture.bytes()).unwrap();
+        let sform = parse_header(
+            Path::new("sform.nii"),
+            &sform_fixture.bytes(),
+            NiftiStorage::SingleFile,
+        )
+        .unwrap();
         assert_eq!(sform.endian, Endian::Big);
         assert_eq!(sform.shape, [2, 3, 4]);
         assert_eq!(sform.datatype, PixelKind::U16);
@@ -545,7 +827,12 @@ mod tests {
 
         let qform_fixture = NiftiFixture::new(Endian::Little, &[2, 2, 2], 2, &[1.0, 2.0, 3.0])
             .with_qform([0.0, 0.0, 0.0], [10.0, 20.0, -5.0], -1.0);
-        let qform = parse_header(Path::new("qform.nii"), &qform_fixture.bytes()).unwrap();
+        let qform = parse_header(
+            Path::new("qform.nii"),
+            &qform_fixture.bytes(),
+            NiftiStorage::SingleFile,
+        )
+        .unwrap();
         assert_eq!(qform.geometry.spacing, [1.0, 2.0, 3.0]);
         assert_eq!(qform.geometry.origin, [10.0, 20.0, -5.0]);
         assert_close(qform.geometry.direction[2][2], -1.0);
@@ -554,7 +841,7 @@ mod tests {
     #[test]
     fn rejects_invalid_headers_with_specific_reasons() {
         let path = Path::new("bad.nii");
-        let err = parse_header(path, &[0; 16]).unwrap_err();
+        let err = parse_header(path, &[0; 16], NiftiStorage::SingleFile).unwrap_err();
         assert!(err.to_string().contains("shorter than a NIfTI-1 header"));
 
         assert_nifti_error(
@@ -612,6 +899,7 @@ mod tests {
                 Path::new("datatype.nii"),
                 &NiftiFixture::new(Endian::Little, &[1, 1, 1], datatype_code, &[1.0, 1.0, 1.0])
                     .bytes(),
+                NiftiStorage::SingleFile,
             )
             .unwrap();
             assert_eq!(header.datatype, expected);
@@ -666,6 +954,8 @@ mod tests {
             shape: [2, 1, 1],
             datatype: PixelKind::U16,
             vox_offset: VOX_OFFSET,
+            scl_slope: 1.0,
+            scl_inter: 0.0,
             geometry: VolumeGeometry::identity([2, 1, 1], [1.0, 1.0, 1.0]).unwrap(),
         };
         let err = read_pixels(
@@ -692,7 +982,7 @@ mod tests {
     }
 
     fn assert_nifti_error(bytes: Vec<u8>, expected: &str) {
-        let err = parse_header(Path::new("bad.nii"), &bytes).unwrap_err();
+        let err = parse_header(Path::new("bad.nii"), &bytes, NiftiStorage::SingleFile).unwrap_err();
         assert!(
             err.to_string().contains(expected),
             "expected {expected:?}, got {err}"
