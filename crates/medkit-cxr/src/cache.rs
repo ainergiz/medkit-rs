@@ -3,11 +3,13 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::Arc,
     thread,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use image::{imageops::FilterType, DynamicImage, GrayImage};
+use memmap2::Mmap;
 
 use crate::{
     error::CxrError,
@@ -71,8 +73,38 @@ pub fn cache_cxr_with_options(
     validate_split_membership(&records, &split_file)?;
     let image_size = image_size_from_plan(&config.plan_path)?;
     fs::create_dir_all(&config.cache_dir)?;
+    let staging_dir = staging_dir(&config.cache_dir);
+    fs::create_dir_all(&staging_dir)?;
+    let result = cache_cxr_in_staging(
+        config,
+        options,
+        &records,
+        &split_file,
+        image_size,
+        &staging_dir,
+    );
+    match result {
+        Ok(summary) => {
+            promote_staged_cxr_cache(&staging_dir, &config.cache_dir, &summary)?;
+            Ok(summary)
+        }
+        Err(error) => {
+            cleanup_staging(&staging_dir)?;
+            Err(error)
+        }
+    }
+}
+
+fn cache_cxr_in_staging(
+    config: &CacheConfig,
+    options: &CxrCacheOptions,
+    records: &[CxrRecord],
+    split_file: &SplitFile,
+    image_size: usize,
+    staging_dir: &Path,
+) -> Result<CacheSummary, CxrError> {
     let targets = if options.targets.is_empty() {
-        collect_targets(&records)
+        collect_targets(records)
     } else {
         options.targets.clone()
     };
@@ -82,7 +114,7 @@ pub fn cache_cxr_with_options(
     } else {
         "decode grayscale, resize square, normalize dataset mean/std"
     };
-    let train_records = records_for_split(&records, &split_file.train)?;
+    let train_records = records_for_split(records, &split_file.train)?;
     let normalization = estimate_normalization(&train_records, image_size)?;
     let mut splits = BTreeMap::new();
     for (name, ids) in [
@@ -90,9 +122,9 @@ pub fn cache_cxr_with_options(
         ("val", &split_file.val),
         ("test", &split_file.test),
     ] {
-        let split_records = records_for_split(&records, ids)?;
+        let split_records = records_for_split(records, ids)?;
         let split_summary = write_cache_split(
-            &config.cache_dir,
+            staging_dir,
             name,
             &split_records,
             &targets,
@@ -136,15 +168,70 @@ pub fn cache_cxr_with_options(
         split_policy: options.split_policy.clone(),
         splits,
         failed_samples: Vec::new(),
-        cache_size_bytes: directory_size(&config.cache_dir)?,
+        cache_size_bytes: directory_size(staging_dir)?,
     };
-    write_json(&config.cache_dir.join("cache-metadata.json"), &summary)?;
+    write_json(&staging_dir.join("cache-metadata.json"), &summary)?;
     Ok(summary)
 }
 
 pub fn read_cache_summary(cache_dir: &Path) -> Result<CacheSummary, CxrError> {
     let text = fs::read_to_string(cache_dir.join("cache-metadata.json"))?;
     Ok(serde_json::from_str(&text)?)
+}
+
+fn staging_dir(cache_dir: &Path) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    cache_dir
+        .join(".staging")
+        .join(format!("cxr-cache-{}-{nanos}", std::process::id()))
+}
+
+fn cleanup_staging(staging_dir: &Path) -> Result<(), CxrError> {
+    match fs::remove_dir_all(staging_dir) {
+        Ok(()) => {
+            if let Some(parent) = staging_dir.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CxrError::Io(error)),
+    }
+}
+
+fn promote_staged_cxr_cache(
+    staging_dir: &Path,
+    cache_dir: &Path,
+    summary: &CacheSummary,
+) -> Result<(), CxrError> {
+    for split in summary.splits.values() {
+        for relative in [
+            &split.images_path,
+            &split.labels_path,
+            &split.masks_path,
+            &split.metadata_path,
+        ] {
+            promote_staged_file(staging_dir, cache_dir, relative)?;
+        }
+    }
+    promote_staged_file(staging_dir, cache_dir, "cache-metadata.json")?;
+    cleanup_staging(staging_dir)
+}
+
+fn promote_staged_file(
+    staging_dir: &Path,
+    cache_dir: &Path,
+    relative: &str,
+) -> Result<(), CxrError> {
+    let staged = staging_dir.join(relative);
+    let final_path = cache_dir.join(relative);
+    if final_path.exists() {
+        fs::remove_file(&final_path)?;
+    }
+    fs::rename(staged, final_path)?;
+    Ok(())
 }
 
 pub fn validate_cache_cxr(
@@ -304,6 +391,9 @@ impl CxrCacheReader {
             .ok_or_else(|| CxrError::Message("image shape overflow".to_string()))?;
         let metadata_path = resolve_cache_path(&cache_dir, &split_summary.metadata_path);
         let records = read_cache_metadata(&metadata_path)?;
+        let images_path = resolve_cache_path(&cache_dir, &split_summary.images_path);
+        let labels_path = resolve_cache_path(&cache_dir, &split_summary.labels_path);
+        let masks_path = resolve_cache_path(&cache_dir, &split_summary.masks_path);
         Ok(Self {
             cache_dir,
             split,
@@ -312,6 +402,9 @@ impl CxrCacheReader {
             records,
             image_values_per_sample,
             target_count,
+            images_mmap: Arc::new(mmap_file(&images_path)?),
+            labels_mmap: Arc::new(mmap_file(&labels_path)?),
+            masks_mmap: Arc::new(mmap_file(&masks_path)?),
         })
     }
 
@@ -453,18 +546,18 @@ impl CxrCacheReader {
         let label_offset = start_index
             .checked_mul(self.target_count)
             .ok_or_else(|| CxrError::Message("label offset overflow".to_string()))?;
-        read_f32_range(
-            &resolve_cache_path(&self.cache_dir, &self.split_summary.images_path),
+        read_f32_range_from_mmap(
+            &self.images_mmap,
             image_offset,
             &mut image_out[..image_values],
         )?;
-        read_f32_range(
-            &resolve_cache_path(&self.cache_dir, &self.split_summary.labels_path),
+        read_f32_range_from_mmap(
+            &self.labels_mmap,
             label_offset,
             &mut labels_out[..label_values],
         )?;
-        read_f32_range(
-            &resolve_cache_path(&self.cache_dir, &self.split_summary.masks_path),
+        read_f32_range_from_mmap(
+            &self.masks_mmap,
             label_offset,
             &mut masks_out[..label_values],
         )?;
@@ -519,13 +612,6 @@ impl CxrCacheReader {
         }
         order.sort_unstable_by_key(|(sample_index, _)| *sample_index);
 
-        let image_path = resolve_cache_path(&self.cache_dir, &self.split_summary.images_path);
-        let labels_path = resolve_cache_path(&self.cache_dir, &self.split_summary.labels_path);
-        let masks_path = resolve_cache_path(&self.cache_dir, &self.split_summary.masks_path);
-        let mut images = File::open(image_path)?;
-        let mut labels = File::open(labels_path)?;
-        let mut masks = File::open(masks_path)?;
-
         let mut cursor = 0usize;
         while cursor < order.len() {
             let start_sample = order[cursor].0;
@@ -543,9 +629,9 @@ impl CxrCacheReader {
             let mut image_scratch = vec![0.0f32; run_samples * self.image_values_per_sample];
             let mut label_scratch = vec![0.0f32; run_samples * self.target_count];
             let mut mask_scratch = vec![0.0f32; run_samples * self.target_count];
-            read_f32_range_from(&mut images, image_offset, &mut image_scratch)?;
-            read_f32_range_from(&mut labels, label_offset, &mut label_scratch)?;
-            read_f32_range_from(&mut masks, label_offset, &mut mask_scratch)?;
+            read_f32_range_from_mmap(&self.images_mmap, image_offset, &mut image_scratch)?;
+            read_f32_range_from_mmap(&self.labels_mmap, label_offset, &mut label_scratch)?;
+            read_f32_range_from_mmap(&self.masks_mmap, label_offset, &mut mask_scratch)?;
 
             for (run_index, (_sample_index, out_index)) in order[cursor..end].iter().enumerate() {
                 let src_image_start = run_index * self.image_values_per_sample;
@@ -1232,9 +1318,36 @@ fn read_cache_metadata(path: &Path) -> Result<Vec<CxrRecord>, CxrError> {
     }
     Ok(records)
 }
-fn read_f32_range(path: &Path, start_value: usize, out: &mut [f32]) -> Result<(), CxrError> {
-    let mut file = File::open(path)?;
-    read_f32_range_from(&mut file, start_value, out)
+
+fn mmap_file(path: &Path) -> Result<Mmap, CxrError> {
+    let file = File::open(path)?;
+    // SAFETY: the mapping is read-only and all reads are bounds-checked
+    // against the mapped byte slice before decoding values.
+    unsafe { Mmap::map(&file).map_err(CxrError::Io) }
+}
+
+fn read_f32_range_from_mmap(
+    mmap: &Mmap,
+    start_value: usize,
+    out: &mut [f32],
+) -> Result<(), CxrError> {
+    let byte_offset = start_value
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| CxrError::Message("cache byte offset overflow".to_string()))?;
+    let byte_len = out
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| CxrError::Message("cache byte length overflow".to_string()))?;
+    let byte_end = byte_offset
+        .checked_add(byte_len)
+        .ok_or_else(|| CxrError::Message("cache byte range overflow".to_string()))?;
+    let bytes = mmap
+        .get(byte_offset..byte_end)
+        .ok_or_else(|| CxrError::Message("cache mmap range is out of bounds".to_string()))?;
+    for (slot, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+        *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    Ok(())
 }
 
 fn read_indexed_runs(

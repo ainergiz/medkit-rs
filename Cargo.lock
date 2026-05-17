@@ -493,6 +493,7 @@ dependencies = [
  "flate2",
  "image",
  "medkit-dicom",
+ "memmap2",
  "serde",
  "serde_json",
  "sha2",
@@ -553,6 +554,7 @@ version = "0.1.0"
 dependencies = [
  "medkit-cache",
  "medkit-transform",
+ "memmap2",
  "serde",
  "serde_json",
  "sha2",

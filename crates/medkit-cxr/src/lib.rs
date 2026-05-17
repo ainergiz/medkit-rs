@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 mod cache;
 mod error;
 mod ingest;

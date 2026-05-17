@@ -1,5 +1,6 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 pub const CXR_CACHE_SCHEMA_VERSION: u32 = 1;
@@ -419,6 +420,9 @@ pub struct CxrCacheReader {
     pub(crate) records: Vec<CxrRecord>,
     pub(crate) image_values_per_sample: usize,
     pub(crate) target_count: usize,
+    pub(crate) images_mmap: Arc<Mmap>,
+    pub(crate) labels_mmap: Arc<Mmap>,
+    pub(crate) masks_mmap: Arc<Mmap>,
 }
 
 #[derive(Debug, Clone)]

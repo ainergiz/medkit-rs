@@ -1485,6 +1485,14 @@ fn cache_build_rejects_failed_samples() {
         .to_string()
         .contains(&format!("failed to preprocess sample {failing_id}")));
     assert!(!cache_dir.join("cache-metadata.json").exists());
+    let entries = fs::read_dir(&cache_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        entries.is_empty(),
+        "failed CXR cache build should leave no promoted or staging artifacts: {entries:?}"
+    );
 }
 
 #[test]
@@ -1780,7 +1788,7 @@ fn empty_train_rgb_cache_and_remaining_fallbacks_are_covered() {
 }
 
 #[test]
-fn cache_reader_late_file_errors_and_error_display_arms_are_covered() {
+fn cache_reader_mmap_survives_unlinked_files_and_error_display_arms_are_covered() {
     let root = unique_test_dir();
     let cache_dir = root.join("cache");
     write_synthetic_cache(&cache_dir, 2, 2, &["A", "B"]);
@@ -1790,32 +1798,13 @@ fn cache_reader_late_file_errors_and_error_display_arms_are_covered() {
     let mut images = vec![0.0; 4];
     let mut labels = vec![0.0; 2];
     let mut masks = vec![0.0; 2];
-    assert!(reader
-        .fill_batch(0, 1, &mut images, &mut labels, &mut masks)
-        .unwrap_err()
-        .to_string()
-        .contains("No such file"));
-
-    write_synthetic_cache(&cache_dir, 2, 2, &["A", "B"]);
-    let reader = CxrCacheReader::open(&cache_dir, "train").unwrap();
-    fs::remove_file(cache_dir.join("train-labels.float32.dat")).unwrap();
-    assert!(reader
-        .read_batch(0, 1)
-        .unwrap_err()
-        .to_string()
-        .contains("No such file"));
-
-    write_synthetic_cache(&cache_dir, 2, 2, &["A", "B"]);
-    let reader = CxrCacheReader::open(&cache_dir, "train").unwrap();
-    fs::remove_file(cache_dir.join("train-masks.float32.dat")).unwrap();
-    let mut images = vec![0.0; 4];
-    let mut labels = vec![0.0; 2];
-    let mut masks = vec![0.0; 2];
-    assert!(reader
-        .fill_batch(0, 1, &mut images, &mut labels, &mut masks)
-        .unwrap_err()
-        .to_string()
-        .contains("No such file"));
+    assert_eq!(
+        reader
+            .fill_batch(0, 1, &mut images, &mut labels, &mut masks)
+            .unwrap(),
+        1
+    );
+    assert_eq!(reader.read_batch(0, 1).unwrap().samples, 1);
 
     write_synthetic_cache(&cache_dir, 2, 2, &["A", "B"]);
     let mut summary = read_cache_summary(&cache_dir).unwrap();

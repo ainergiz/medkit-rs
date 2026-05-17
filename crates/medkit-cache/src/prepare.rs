@@ -1,6 +1,8 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use medkit_dataset::{CaseStatus, DatasetManifest};
@@ -125,7 +127,47 @@ pub fn prepare_cache(config: &PrepareConfig) -> Result<CacheManifest> {
     let plan_hash = plan.plan_hash()?;
     fs::create_dir_all(&config.cache_dir)
         .map_err(|source| CacheError::io(&config.cache_dir, source))?;
+    let staging_dir = staging_dir(&config.cache_dir);
+    fs::create_dir_all(&staging_dir).map_err(|source| CacheError::io(&staging_dir, source))?;
 
+    let result = prepare_cache_in_staging(config, manifest, plan, plan_hash, &staging_dir);
+    match result {
+        Ok(cache_manifest) => {
+            promote_staged_cache(&staging_dir, &config.cache_dir, &cache_manifest)?;
+            Ok(cache_manifest)
+        }
+        Err(error) => {
+            cleanup_staging(&staging_dir)?;
+            Err(error)
+        }
+    }
+}
+
+/// Reads a cache manifest from a cache directory.
+pub fn read_cache_manifest(cache_dir: impl AsRef<Path>) -> Result<CacheManifest> {
+    let path = cache_dir.as_ref().join(CACHE_MANIFEST);
+    let text = fs::read_to_string(&path).map_err(|source| CacheError::io(&path, source))?;
+    serde_json::from_str(&text).map_err(|source| CacheError::json(path, source))
+}
+
+fn read_dataset_manifest(path: &Path) -> Result<DatasetManifest> {
+    let text = fs::read_to_string(path).map_err(|source| CacheError::io(path, source))?;
+    serde_json::from_str(&text).map_err(|source| CacheError::json(path, source))
+}
+
+fn write_cache_manifest(manifest: &CacheManifest, path: &Path) -> Result<()> {
+    let text =
+        serde_json::to_string_pretty(manifest).map_err(|source| CacheError::json(path, source))?;
+    fs::write(path, text).map_err(|source| CacheError::io(path, source))
+}
+
+fn prepare_cache_in_staging(
+    config: &PrepareConfig,
+    manifest: DatasetManifest,
+    plan: TransformPlan,
+    plan_hash: String,
+    staging_dir: &Path,
+) -> Result<CacheManifest> {
     let mut summary = CacheSummary::default();
     let mut cases = Vec::new();
     for case in manifest
@@ -139,6 +181,7 @@ pub fn prepare_cache(config: &PrepareConfig) -> Result<CacheManifest> {
             &config.dataset_root,
             &plan,
             &plan_hash,
+            staging_dir,
             &config.cache_dir,
             config.chunk_shape,
         )
@@ -160,26 +203,56 @@ pub fn prepare_cache(config: &PrepareConfig) -> Result<CacheManifest> {
         summary,
         cases,
     };
-    write_cache_manifest(&cache_manifest, &config.cache_dir.join(CACHE_MANIFEST))?;
+    write_cache_manifest(&cache_manifest, &staging_dir.join(CACHE_MANIFEST))?;
     Ok(cache_manifest)
 }
 
-/// Reads a cache manifest from a cache directory.
-pub fn read_cache_manifest(cache_dir: impl AsRef<Path>) -> Result<CacheManifest> {
-    let path = cache_dir.as_ref().join(CACHE_MANIFEST);
-    let text = fs::read_to_string(&path).map_err(|source| CacheError::io(&path, source))?;
-    serde_json::from_str(&text).map_err(|source| CacheError::json(path, source))
+fn staging_dir(cache_dir: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    cache_dir
+        .join(".staging")
+        .join(format!("prepare-{}-{nanos}", std::process::id()))
 }
 
-fn read_dataset_manifest(path: &Path) -> Result<DatasetManifest> {
-    let text = fs::read_to_string(path).map_err(|source| CacheError::io(path, source))?;
-    serde_json::from_str(&text).map_err(|source| CacheError::json(path, source))
+fn cleanup_staging(staging_dir: &Path) -> Result<()> {
+    match fs::remove_dir_all(staging_dir) {
+        Ok(()) => {
+            if let Some(parent) = staging_dir.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+            Ok(())
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CacheError::io(staging_dir, source)),
+    }
 }
 
-fn write_cache_manifest(manifest: &CacheManifest, path: &Path) -> Result<()> {
-    let text =
-        serde_json::to_string_pretty(manifest).map_err(|source| CacheError::json(path, source))?;
-    fs::write(path, text).map_err(|source| CacheError::io(path, source))
+fn promote_staged_cache(
+    staging_dir: &Path,
+    cache_dir: &Path,
+    manifest: &CacheManifest,
+) -> Result<()> {
+    for case in &manifest.cases {
+        let staged_case_dir = staging_dir.join(&case.cache_key);
+        let final_case_dir = cache_dir.join(&case.cache_key);
+        if final_case_dir.exists() {
+            cleanup_staging(&staged_case_dir)?;
+        } else {
+            fs::rename(&staged_case_dir, &final_case_dir)
+                .map_err(|source| CacheError::io(&final_case_dir, source))?;
+        }
+    }
+    let staged_manifest = staging_dir.join(CACHE_MANIFEST);
+    let final_manifest = cache_dir.join(CACHE_MANIFEST);
+    if final_manifest.exists() {
+        fs::remove_file(&final_manifest)
+            .map_err(|source| CacheError::io(&final_manifest, source))?;
+    }
+    fs::rename(&staged_manifest, &final_manifest)
+        .map_err(|source| CacheError::io(&final_manifest, source))?;
+    cleanup_staging(staging_dir)
 }
 
 fn prepare_case(
@@ -187,7 +260,8 @@ fn prepare_case(
     dataset_root: &Path,
     plan: &TransformPlan,
     plan_hash: &str,
-    cache_dir: &Path,
+    staging_cache_dir: &Path,
+    final_cache_dir: &Path,
     chunk_shape: Option<[usize; 3]>,
 ) -> Result<CachedCase> {
     let image_path = case.image_path.as_ref().ok_or_else(|| {
@@ -230,28 +304,44 @@ fn prepare_case(
         &label.source_content_hash,
     )?;
     let cache_key = cache_key(&case.case_id, &source_metadata_hash, plan_hash);
-    let case_dir = cache_dir.join(&cache_key);
-    fs::create_dir_all(&case_dir).map_err(|source| CacheError::io(&case_dir, source))?;
-    let image_cache_path = case_dir.join("image.f32.raw");
-    let label_cache_path = case_dir.join("label.u16.raw");
-    let foreground_indices_path = case_dir.join("foreground_indices.u64.raw");
-    let foreground_prefix_path = case_dir.join("foreground_prefix.u32.raw");
-    write_f32_volume(&prepared.image, &image_cache_path)?;
-    write_u16_volume(&prepared.label, &label_cache_path)?;
-    write_u64_indices(&foreground_indices, &foreground_indices_path)?;
+    let staging_case_dir = staging_cache_dir.join(&cache_key);
+    let final_case_dir = final_cache_dir.join(&cache_key);
+    fs::create_dir_all(&staging_case_dir)
+        .map_err(|source| CacheError::io(&staging_case_dir, source))?;
+    let staging_image_cache_path = staging_case_dir.join("image.f32.raw");
+    let staging_label_cache_path = staging_case_dir.join("label.u16.raw");
+    let staging_foreground_indices_path = staging_case_dir.join("foreground_indices.u64.raw");
+    let staging_foreground_prefix_path = staging_case_dir.join("foreground_prefix.u32.raw");
+    let image_cache_path = final_case_dir.join("image.f32.raw");
+    let label_cache_path = final_case_dir.join("label.u16.raw");
+    let foreground_indices_path = final_case_dir.join("foreground_indices.u64.raw");
+    let foreground_prefix_path = final_case_dir.join("foreground_prefix.u32.raw");
+    write_f32_volume(&prepared.image, &staging_image_cache_path)?;
+    write_u16_volume(&prepared.label, &staging_label_cache_path)?;
+    write_u64_indices(&foreground_indices, &staging_foreground_indices_path)?;
     let foreground_prefix_shape = [
         prepared.label.shape[0] + 1,
         prepared.label.shape[1] + 1,
         prepared.label.shape[2] + 1,
     ];
     let foreground_prefix = foreground_prefix_values(&prepared.label);
-    write_u32_values(&foreground_prefix, &foreground_prefix_path)?;
+    write_u32_values(&foreground_prefix, &staging_foreground_prefix_path)?;
     let chunk_shape = chunk_shape.map(|shape| valid_chunk_shape(shape, prepared.image.shape));
     let chunk_paths = if let Some(chunk_shape) = chunk_shape {
-        let image_chunk_cache_path = case_dir.join("image.chunks.f32.raw");
-        let label_chunk_cache_path = case_dir.join("label.chunks.u16.raw");
-        write_chunked_volume_f32(&prepared.image, chunk_shape, &image_chunk_cache_path)?;
-        write_chunked_volume_u16(&prepared.label, chunk_shape, &label_chunk_cache_path)?;
+        let staging_image_chunk_cache_path = staging_case_dir.join("image.chunks.f32.raw");
+        let staging_label_chunk_cache_path = staging_case_dir.join("label.chunks.u16.raw");
+        let image_chunk_cache_path = final_case_dir.join("image.chunks.f32.raw");
+        let label_chunk_cache_path = final_case_dir.join("label.chunks.u16.raw");
+        write_chunked_volume_f32(
+            &prepared.image,
+            chunk_shape,
+            &staging_image_chunk_cache_path,
+        )?;
+        write_chunked_volume_u16(
+            &prepared.label,
+            chunk_shape,
+            &staging_label_chunk_cache_path,
+        )?;
         let chunk_grid = chunk_grid(prepared.image.shape, chunk_shape);
         Some((
             chunk_shape,
@@ -306,7 +396,7 @@ fn prepare_case(
         foreground_voxels,
         bytes_written,
     };
-    let case_json = case_dir.join("case.json");
+    let case_json = staging_case_dir.join("case.json");
     let text = serde_json::to_string_pretty(&cached)
         .map_err(|source| CacheError::json(&case_json, source))?;
     fs::write(&case_json, text).map_err(|source| CacheError::io(case_json, source))?;
@@ -323,35 +413,55 @@ fn resolve_manifest_source_path(dataset_root: &Path, path: &str) -> PathBuf {
 }
 
 fn write_f32_volume(volume: &Volume3D<f32>, path: &Path) -> Result<()> {
-    let mut bytes = Vec::with_capacity(volume.data.len() * 4);
+    let mut writer =
+        BufWriter::new(File::create(path).map_err(|source| CacheError::io(path, source))?);
     for value in &volume.data {
-        bytes.extend_from_slice(&value.to_le_bytes());
+        writer
+            .write_all(&value.to_le_bytes())
+            .map_err(|source| CacheError::io(path, source))?;
     }
-    fs::write(path, bytes).map_err(|source| CacheError::io(path, source))
+    writer
+        .flush()
+        .map_err(|source| CacheError::io(path, source))
 }
 
 fn write_u16_volume(volume: &Volume3D<u16>, path: &Path) -> Result<()> {
-    let mut bytes = Vec::with_capacity(volume.data.len() * 2);
+    let mut writer =
+        BufWriter::new(File::create(path).map_err(|source| CacheError::io(path, source))?);
     for value in &volume.data {
-        bytes.extend_from_slice(&value.to_le_bytes());
+        writer
+            .write_all(&value.to_le_bytes())
+            .map_err(|source| CacheError::io(path, source))?;
     }
-    fs::write(path, bytes).map_err(|source| CacheError::io(path, source))
+    writer
+        .flush()
+        .map_err(|source| CacheError::io(path, source))
 }
 
 fn write_u64_indices(indices: &[usize], path: &Path) -> Result<()> {
-    let mut bytes = Vec::with_capacity(indices.len() * 8);
+    let mut writer =
+        BufWriter::new(File::create(path).map_err(|source| CacheError::io(path, source))?);
     for value in indices {
-        bytes.extend_from_slice(&(*value as u64).to_le_bytes());
+        writer
+            .write_all(&(*value as u64).to_le_bytes())
+            .map_err(|source| CacheError::io(path, source))?;
     }
-    fs::write(path, bytes).map_err(|source| CacheError::io(path, source))
+    writer
+        .flush()
+        .map_err(|source| CacheError::io(path, source))
 }
 
 fn write_u32_values(values: &[u32], path: &Path) -> Result<()> {
-    let mut bytes = Vec::with_capacity(values.len() * 4);
+    let mut writer =
+        BufWriter::new(File::create(path).map_err(|source| CacheError::io(path, source))?);
     for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
+        writer
+            .write_all(&value.to_le_bytes())
+            .map_err(|source| CacheError::io(path, source))?;
     }
-    fs::write(path, bytes).map_err(|source| CacheError::io(path, source))
+    writer
+        .flush()
+        .map_err(|source| CacheError::io(path, source))
 }
 
 fn foreground_prefix_values(label: &Volume3D<u16>) -> Vec<u32> {
@@ -404,17 +514,22 @@ fn write_chunked_volume_f32(
     chunk_shape: [usize; 3],
     path: &Path,
 ) -> Result<()> {
-    let mut bytes = Vec::with_capacity(chunked_value_count(volume.shape, chunk_shape) * 4);
+    let mut writer =
+        BufWriter::new(File::create(path).map_err(|source| CacheError::io(path, source))?);
     write_chunked_values(
         volume,
         chunk_shape,
         0.0_f32,
-        |value, out| {
-            out.extend_from_slice(&value.to_le_bytes());
+        |value, writer| {
+            writer.write_all(&value.to_le_bytes())?;
+            Ok(())
         },
-        &mut bytes,
-    );
-    fs::write(path, bytes).map_err(|source| CacheError::io(path, source))
+        &mut writer,
+    )
+    .map_err(|source| CacheError::io(path, source))?;
+    writer
+        .flush()
+        .map_err(|source| CacheError::io(path, source))
 }
 
 fn write_chunked_volume_u16(
@@ -422,26 +537,31 @@ fn write_chunked_volume_u16(
     chunk_shape: [usize; 3],
     path: &Path,
 ) -> Result<()> {
-    let mut bytes = Vec::with_capacity(chunked_value_count(volume.shape, chunk_shape) * 2);
+    let mut writer =
+        BufWriter::new(File::create(path).map_err(|source| CacheError::io(path, source))?);
     write_chunked_values(
         volume,
         chunk_shape,
         0_u16,
-        |value, out| {
-            out.extend_from_slice(&value.to_le_bytes());
+        |value, writer| {
+            writer.write_all(&value.to_le_bytes())?;
+            Ok(())
         },
-        &mut bytes,
-    );
-    fs::write(path, bytes).map_err(|source| CacheError::io(path, source))
+        &mut writer,
+    )
+    .map_err(|source| CacheError::io(path, source))?;
+    writer
+        .flush()
+        .map_err(|source| CacheError::io(path, source))
 }
 
 fn write_chunked_values<T: Copy>(
     volume: &Volume3D<T>,
     chunk_shape: [usize; 3],
     fill: T,
-    mut write: impl FnMut(T, &mut Vec<u8>),
-    out: &mut Vec<u8>,
-) {
+    mut write: impl FnMut(T, &mut dyn Write) -> std::io::Result<()>,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
     let grid = chunk_grid(volume.shape, chunk_shape);
     for chunk_z in 0..grid[2] {
         for chunk_y in 0..grid[1] {
@@ -465,15 +585,17 @@ fn write_chunked_values<T: Copy>(
                             } else {
                                 fill
                             };
-                            write(value, out);
+                            write(value, out)?;
                         }
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
+#[cfg(test)]
 fn chunked_value_count(shape: [usize; 3], chunk_shape: [usize; 3]) -> usize {
     let grid = chunk_grid(shape, chunk_shape);
     grid[0] * grid[1] * grid[2] * chunk_shape[0] * chunk_shape[1] * chunk_shape[2]
@@ -675,6 +797,12 @@ mod tests {
 
         let loaded_manifest = read_cache_manifest(&cache_dir).unwrap();
         assert_eq!(loaded_manifest, manifest);
+        let inspection = crate::inspect_cache(&cache_dir).unwrap();
+        assert_eq!(inspection.status, "ok");
+        assert_eq!(inspection.cases, 1);
+        assert_eq!(inspection.chunked_cases, 1);
+        assert_eq!(inspection.artifact_bytes, 204);
+        assert!(crate::validate_cache(&cache_dir).unwrap().errors.is_empty());
         let case_json = Path::new(&cached.image_cache_path)
             .parent()
             .unwrap()
@@ -760,6 +888,14 @@ mod tests {
         assert!(message.contains("failed to prepare case geometry_mismatch"));
         assert!(message.contains("image and label source geometry differ"));
         assert!(!cache_dir.join(CACHE_MANIFEST).exists());
+        let entries = fs::read_dir(&cache_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            entries.is_empty(),
+            "failed prepare should leave no promoted or staging artifacts: {entries:?}"
+        );
     }
 
     #[test]
@@ -845,6 +981,7 @@ mod tests {
             &root,
             &plan,
             &plan_hash,
+            &cache_dir,
             &cache_dir,
             None,
         )
@@ -934,9 +1071,13 @@ mod tests {
             &volume,
             [2, 2, 1],
             0,
-            |value, out| out.extend_from_slice(&value.to_le_bytes()),
+            |value, out| {
+                out.write_all(&value.to_le_bytes())?;
+                Ok(())
+            },
             &mut bytes,
-        );
+        )
+        .unwrap();
         assert_eq!(decode_u16(&bytes), vec![1, 2, 4, 5, 3, 0, 6, 0]);
     }
 

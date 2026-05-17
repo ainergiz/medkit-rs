@@ -10,7 +10,9 @@ use std::{
 };
 
 use medkit_bench::{bench_cache, bench_patch_plan, BenchConfig, BenchReport, PlanBenchConfig};
-use medkit_cache::{prepare_cache, CacheManifest, PrepareConfig};
+use medkit_cache::{
+    inspect_cache, prepare_cache, validate_cache, CacheInspection, CacheManifest, PrepareConfig,
+};
 use medkit_cxr::{
     cache_cxr, index_cxr, ingest_cxr_dicom, split_cxr, validate_cache_cxr, validate_cxr,
     CacheConfig as CxrCacheConfig, CacheSummary as CxrCacheSummary,
@@ -97,6 +99,22 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
                 worker: 0,
             })?;
             print_sample_summary(&summary, &out_path);
+            Ok(())
+        }
+        Command::CacheInspect { cache_dir } => {
+            let inspection = inspect_cache(&cache_dir)?;
+            print_cache_inspection(&inspection);
+            Ok(())
+        }
+        Command::CacheValidate { cache_dir } => {
+            let inspection = validate_cache(&cache_dir)?;
+            print_cache_inspection(&inspection);
+            if inspection.status != "ok" {
+                return Err(CliError::Message(format!(
+                    "cache validation failed with {} errors",
+                    inspection.errors.len()
+                )));
+            }
             Ok(())
         }
         Command::Bench {
@@ -342,6 +360,12 @@ enum Command {
         count: usize,
         out_path: PathBuf,
     },
+    CacheInspect {
+        cache_dir: PathBuf,
+    },
+    CacheValidate {
+        cache_dir: PathBuf,
+    },
     Bench {
         cache_dir: PathBuf,
         patch_size: [usize; 3],
@@ -475,6 +499,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliEr
     if first == "sample" {
         return parse_sample_command(args);
     }
+    if first == "cache" {
+        return parse_cache_command(args);
+    }
     if first == "bench" {
         return parse_bench_command(args);
     }
@@ -488,6 +515,28 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliEr
         return parse_dicom_command(args);
     }
     Err(CliError::usage())
+}
+
+fn parse_cache_command(mut args: impl Iterator<Item = OsString>) -> Result<Command, CliError> {
+    let Some(action) = args.next() else {
+        return Err(CliError::usage());
+    };
+    if action == "--help" || action == "-h" {
+        return Err(CliError::usage());
+    }
+    let Some(cache_dir) = args.next() else {
+        return Err(CliError::usage());
+    };
+    let cache_dir = PathBuf::from(cache_dir);
+    reject_trailing_args(args, "cache")?;
+    match action.to_string_lossy().as_ref() {
+        "inspect" => Ok(Command::CacheInspect { cache_dir }),
+        "validate" => Ok(Command::CacheValidate { cache_dir }),
+        other => Err(CliError::Message(format!(
+            "unknown cache command: {other}\n\n{}",
+            usage()
+        ))),
+    }
 }
 
 fn parse_dicom_command(mut args: impl Iterator<Item = OsString>) -> Result<Command, CliError> {
@@ -1407,6 +1456,24 @@ fn print_sample_summary(summary: &SampleSummary, out_path: &Path) {
     println!("Wrote samples: {}", out_path.display());
 }
 
+fn print_cache_inspection(inspection: &CacheInspection) {
+    println!("Cache: {}", inspection.cache_dir);
+    println!("Status: {}", inspection.status);
+    println!("Schema version: {}", inspection.version);
+    println!("Cases: {}", inspection.cases);
+    println!("Chunked cases: {}", inspection.chunked_cases);
+    println!("Artifact bytes: {}", inspection.artifact_bytes);
+    println!("Transform plan hash: {}", inspection.transform_plan_hash);
+    if inspection.errors.is_empty() {
+        println!("Errors: 0");
+    } else {
+        println!("Errors: {}", inspection.errors.len());
+        for error in inspection.errors.iter().take(10) {
+            println!("- {error}");
+        }
+    }
+}
+
 fn print_bench_report(report: &BenchReport) {
     println!("Cache: {}", report.cache_dir);
     println!("Patch: {:?}", report.patch_size);
@@ -1777,7 +1844,7 @@ impl From<serde_json::Error> for CliError {
 }
 
 fn usage() -> String {
-    "Usage:\n  medkit dataset validate <root> [--images imagesTr] [--labels labelsTr] [--layout flat|nnunet] [--out manifest.json] [--report report.txt]\n  medkit prepare <root> --manifest manifest.json --plan ct-segmentation.toml --cache .medkit/cache [--chunk 96,96,96]\n  medkit sample <cache> --patch 96,96,96 --strategy foreground-balanced --count 10000 --out patches.jsonl\n  medkit bench <cache> --patch 96,96,96 --workers 8 [--samples 10000]\n  medkit bench-plan <cache> --patches patches.jsonl --workers 8 [--samples 10000]\n  medkit cxr manifest --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr manifest --dicom-index dicom-index.jsonl [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr index --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr validate <manifest.jsonl> [--require-frontal] [--check-patient-leakage] [--check-duplicates] --report validation.md\n  medkit cxr split <manifest.jsonl> --by patient_id --train 0.8 --val 0.1 --test 0.1 [--stratify Pneumonia,view_position] [--seed 0] --out splits.json\n  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache\n  medkit cxr validate-cache <cache> [--split train] [--targets Pneumonia] [--image-shape n,c,h,w] [--plan cxr-512.toml] [--report cache-validation.md] [--json cache-validation.json]\n  medkit cxr ingest <raw-dicom> --recipe cxr-dicom-512.toml --labels labels.csv --cache .medkit/cxr-cache --workdir .medkit/cxr-ingest --report ingestion-report.md [--dry-run] [--workers 4]\n  medkit cxr benchmark [--manifest manifest.jsonl] [--splits splits.json] [--plan cxr-512.toml] [--targets Pneumonia] [--baselines pytorch_raw,monai_raw,medkit_cached_mmap] [--batch-sizes 64,128] [--workers 8,16] [--device cuda:0] [--out benchmark.json]\n  medkit dicom scan <root> --out inventory.jsonl --report dicom-report.md [--workers 4]\n  medkit dicom browse <root> --group patient,study,series --out graph.json --report graph-report.md [--workers 4]\n  medkit dicom inspect <file.dcm>\n  medkit dicom pixels --explain <file.dcm>\n  medkit dicom view <file.dcm> [--width 80]".to_string()
+    "Usage:\n  medkit dataset validate <root> [--images imagesTr] [--labels labelsTr] [--layout flat|nnunet] [--out manifest.json] [--report report.txt]\n  medkit prepare <root> --manifest manifest.json --plan ct-segmentation.toml --cache .medkit/cache [--chunk 96,96,96]\n  medkit sample <cache> --patch 96,96,96 --strategy foreground-balanced --count 10000 --out patches.jsonl\n  medkit cache inspect <cache>\n  medkit cache validate <cache>\n  medkit bench <cache> --patch 96,96,96 --workers 8 [--samples 10000]\n  medkit bench-plan <cache> --patches patches.jsonl --workers 8 [--samples 10000]\n  medkit cxr manifest --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr manifest --dicom-index dicom-index.jsonl [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr index --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr validate <manifest.jsonl> [--require-frontal] [--check-patient-leakage] [--check-duplicates] --report validation.md\n  medkit cxr split <manifest.jsonl> --by patient_id --train 0.8 --val 0.1 --test 0.1 [--stratify Pneumonia,view_position] [--seed 0] --out splits.json\n  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache\n  medkit cxr validate-cache <cache> [--split train] [--targets Pneumonia] [--image-shape n,c,h,w] [--plan cxr-512.toml] [--report cache-validation.md] [--json cache-validation.json]\n  medkit cxr ingest <raw-dicom> --recipe cxr-dicom-512.toml --labels labels.csv --cache .medkit/cxr-cache --workdir .medkit/cxr-ingest --report ingestion-report.md [--dry-run] [--workers 4]\n  medkit cxr benchmark [--manifest manifest.jsonl] [--splits splits.json] [--plan cxr-512.toml] [--targets Pneumonia] [--baselines pytorch_raw,monai_raw,medkit_cached_mmap] [--batch-sizes 64,128] [--workers 8,16] [--device cuda:0] [--out benchmark.json]\n  medkit dicom scan <root> --out inventory.jsonl --report dicom-report.md [--workers 4]\n  medkit dicom browse <root> --group patient,study,series --out graph.json --report graph-report.md [--workers 4]\n  medkit dicom inspect <file.dcm>\n  medkit dicom pixels --explain <file.dcm>\n  medkit dicom view <file.dcm> [--width 80]".to_string()
 }
 
 #[cfg(test)]

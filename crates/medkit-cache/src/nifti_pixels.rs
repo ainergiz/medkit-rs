@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use flate2::read::GzDecoder;
@@ -51,9 +52,9 @@ struct Header {
 struct NiftiSource {
     storage: NiftiStorage,
     header_path: PathBuf,
-    header_bytes: Vec<u8>,
+    header_bytes: Arc<[u8]>,
     pixel_path: PathBuf,
-    pixel_bytes: Vec<u8>,
+    pixel_bytes: Arc<[u8]>,
 }
 
 #[derive(Debug)]
@@ -111,7 +112,7 @@ fn read_source(path: &Path) -> Result<NiftiSource> {
     })
 }
 
-fn read_all(path: &Path) -> Result<Vec<u8>> {
+fn read_all(path: &Path) -> Result<Arc<[u8]>> {
     let file = File::open(path).map_err(|source| CacheError::io(path, source))?;
     let mut bytes = Vec::new();
     if path
@@ -128,10 +129,10 @@ fn read_all(path: &Path) -> Result<Vec<u8>> {
         file.read_to_end(&mut bytes)
             .map_err(|source| CacheError::io(path, source))?;
     }
-    Ok(bytes)
+    Ok(bytes.into())
 }
 
-fn read_detached_pixels(header_path: &Path) -> Result<(PathBuf, Vec<u8>)> {
+fn read_detached_pixels(header_path: &Path) -> Result<(PathBuf, Arc<[u8]>)> {
     let candidates = detached_pixel_candidates(header_path);
     let mut missing_paths = Vec::new();
     for candidate in candidates {

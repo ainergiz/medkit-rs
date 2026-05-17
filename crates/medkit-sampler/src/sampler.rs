@@ -1,10 +1,12 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
 
 use medkit_cache::{read_cache_manifest, CachedCase};
 use medkit_transform::Volume3D;
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -97,6 +99,32 @@ pub struct LoadedCachedCase {
     pub foreground_prefix: ForegroundPrefix,
 }
 
+/// Memory-mapped resident cache case.
+#[derive(Debug)]
+pub struct MmapCachedCase {
+    /// Cached case metadata.
+    pub metadata: CachedCase,
+    /// Cached volume shape in x, y, z order.
+    pub shape: [usize; 3],
+    image_mmap: Mmap,
+    label_mmap: Mmap,
+}
+
+/// Memory-mapped fixed-size chunked cache case.
+#[derive(Debug)]
+pub struct ChunkedCachedCase {
+    /// Cached case metadata.
+    pub metadata: CachedCase,
+    /// Cached volume shape in x, y, z order.
+    pub shape: [usize; 3],
+    /// Fixed chunk shape in x, y, z order.
+    pub chunk_shape: [usize; 3],
+    /// Chunk grid in x, y, z order.
+    pub chunk_grid: [usize; 3],
+    image_mmap: Mmap,
+    label_mmap: Mmap,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct SamplingCase {
     metadata: CachedCase,
@@ -131,6 +159,18 @@ pub fn load_cached_cases(cache_dir: impl AsRef<Path>) -> Result<Vec<LoadedCached
     manifest.cases.iter().map(load_case).collect()
 }
 
+/// Loads resident cache files as memory maps without materializing full volumes.
+pub fn load_mmap_cached_cases(cache_dir: impl AsRef<Path>) -> Result<Vec<MmapCachedCase>> {
+    let manifest = read_cache_manifest(cache_dir)?;
+    manifest.cases.iter().map(load_mmap_case).collect()
+}
+
+/// Loads fixed-size chunked cache files as memory maps.
+pub fn load_chunked_cached_cases(cache_dir: impl AsRef<Path>) -> Result<Vec<ChunkedCachedCase>> {
+    let manifest = read_cache_manifest(cache_dir)?;
+    manifest.cases.iter().map(load_chunked_case).collect()
+}
+
 /// Samples patch records from a cache and writes JSONL.
 pub fn sample_cache(config: &SampleConfig) -> Result<SampleSummary> {
     validate_patch(config.patch_size)?;
@@ -145,7 +185,9 @@ pub fn sample_cache(config: &SampleConfig) -> Result<SampleSummary> {
     {
         fs::create_dir_all(parent).map_err(|source| SamplerError::io(parent, source))?;
     }
-    let mut text = String::new();
+    let file = File::create(&config.out_path)
+        .map_err(|source| SamplerError::io(&config.out_path, source))?;
+    let mut writer = BufWriter::new(file);
     let mut summary = SampleSummary {
         records: config.count,
         foreground_records: 0,
@@ -160,10 +202,13 @@ pub fn sample_cache(config: &SampleConfig) -> Result<SampleSummary> {
         } else {
             summary.background_records += 1;
         }
-        text.push_str(&serde_json::to_string(&record)?);
-        text.push('\n');
+        serde_json::to_writer(&mut writer, &record)?;
+        writer
+            .write_all(b"\n")
+            .map_err(|source| SamplerError::io(&config.out_path, source))?;
     }
-    fs::write(&config.out_path, text)
+    writer
+        .flush()
         .map_err(|source| SamplerError::io(&config.out_path, source))?;
     Ok(summary)
 }
@@ -236,6 +281,95 @@ pub fn extract_patch_pair_into(
     copy_patch_rows(&case.image, start, patch_size, image_out);
     copy_patch_rows(&case.label, start, patch_size, label_out);
     Ok(case.foreground_prefix.count(start, patch_size) != 0)
+}
+
+/// Extracts an aligned image/label patch from memory-mapped resident cache files.
+pub fn extract_patch_pair_mmap_into(
+    case: &MmapCachedCase,
+    start: [usize; 3],
+    patch_size: [usize; 3],
+    image_out: &mut [f32],
+    label_out: &mut [u16],
+) -> Result<bool> {
+    validate_patch_outputs(
+        case.shape,
+        start,
+        patch_size,
+        image_out.len(),
+        label_out.len(),
+    )?;
+    for local_z in 0..patch_size[2] {
+        let source_z = start[2] + local_z;
+        for local_y in 0..patch_size[1] {
+            let source_y = start[1] + local_y;
+            let source_start = flat_index(case.shape, start[0], source_y, source_z);
+            let destination_start = patch_size[0] * (local_y + patch_size[1] * local_z);
+            read_f32_values_from_mmap(
+                &case.image_mmap,
+                source_start,
+                &mut image_out[destination_start..destination_start + patch_size[0]],
+            )?;
+            read_u16_values_from_mmap(
+                &case.label_mmap,
+                source_start,
+                &mut label_out[destination_start..destination_start + patch_size[0]],
+            )?;
+        }
+    }
+    Ok(label_out.iter().any(|value| *value != 0))
+}
+
+/// Extracts an aligned image/label patch from memory-mapped chunked cache files.
+pub fn extract_patch_pair_chunked_into(
+    case: &ChunkedCachedCase,
+    start: [usize; 3],
+    patch_size: [usize; 3],
+    image_out: &mut [f32],
+    label_out: &mut [u16],
+) -> Result<bool> {
+    validate_patch_outputs(
+        case.shape,
+        start,
+        patch_size,
+        image_out.len(),
+        label_out.len(),
+    )?;
+    image_out.fill(0.0);
+    label_out.fill(0);
+    let end = [
+        start[0] + patch_size[0],
+        start[1] + patch_size[1],
+        start[2] + patch_size[2],
+    ];
+    let chunk_min = [
+        start[0] / case.chunk_shape[0],
+        start[1] / case.chunk_shape[1],
+        start[2] / case.chunk_shape[2],
+    ];
+    let chunk_max = [
+        (end[0] - 1) / case.chunk_shape[0],
+        (end[1] - 1) / case.chunk_shape[1],
+        (end[2] - 1) / case.chunk_shape[2],
+    ];
+    let chunk_voxels = patch_voxels(case.chunk_shape);
+    for chunk_z in chunk_min[2]..=chunk_max[2] {
+        for chunk_y in chunk_min[1]..=chunk_max[1] {
+            for chunk_x in chunk_min[0]..=chunk_max[0] {
+                let chunk_index =
+                    chunk_x + case.chunk_grid[0] * (chunk_y + case.chunk_grid[1] * chunk_z);
+                copy_chunk_overlap_from_mmap(
+                    case,
+                    [chunk_x, chunk_y, chunk_z],
+                    chunk_index * chunk_voxels,
+                    start,
+                    patch_size,
+                    image_out,
+                    label_out,
+                )?;
+            }
+        }
+    }
+    Ok(label_out.iter().any(|value| *value != 0))
 }
 
 /// Counts foreground label voxels in a patch without materializing the patch.
@@ -320,6 +454,50 @@ fn load_case(case: &CachedCase) -> Result<LoadedCachedCase> {
         label,
         foreground_indices,
         foreground_prefix,
+    })
+}
+
+fn load_mmap_case(case: &CachedCase) -> Result<MmapCachedCase> {
+    let image_path = Path::new(&case.image_cache_path);
+    let label_path = Path::new(&case.label_cache_path);
+    let image_mmap = mmap_file(image_path)?;
+    let label_mmap = mmap_file(label_path)?;
+    validate_mmap_len(image_path, &image_mmap, value_count(case.shape)?, 4)?;
+    validate_mmap_len(label_path, &label_mmap, value_count(case.shape)?, 2)?;
+    Ok(MmapCachedCase {
+        metadata: case.clone(),
+        shape: case.shape,
+        image_mmap,
+        label_mmap,
+    })
+}
+
+fn load_chunked_case(case: &CachedCase) -> Result<ChunkedCachedCase> {
+    let image_path = case.image_chunk_cache_path.as_deref().ok_or_else(|| {
+        SamplerError::invalid_input(format!("missing image chunk cache for {}", case.case_id))
+    })?;
+    let label_path = case.label_chunk_cache_path.as_deref().ok_or_else(|| {
+        SamplerError::invalid_input(format!("missing label chunk cache for {}", case.case_id))
+    })?;
+    let chunk_grid = case.chunk_grid.ok_or_else(|| {
+        SamplerError::invalid_input(format!("missing chunk grid for {}", case.case_id))
+    })?;
+    let image_path = Path::new(image_path);
+    let label_path = Path::new(label_path);
+    let image_mmap = mmap_file(image_path)?;
+    let label_mmap = mmap_file(label_path)?;
+    let chunk_values = value_count(chunk_grid)?
+        .checked_mul(value_count(case.chunk_shape)?)
+        .ok_or_else(|| SamplerError::invalid_input("chunked value count overflow"))?;
+    validate_mmap_len(image_path, &image_mmap, chunk_values, 4)?;
+    validate_mmap_len(label_path, &label_mmap, chunk_values, 2)?;
+    Ok(ChunkedCachedCase {
+        metadata: case.clone(),
+        shape: case.shape,
+        chunk_shape: case.chunk_shape,
+        chunk_grid,
+        image_mmap,
+        label_mmap,
     })
 }
 
@@ -517,6 +695,159 @@ fn copy_patch_rows<T: Copy>(
                 .copy_from_slice(&volume.data[source_start..source_start + row]);
         }
     }
+}
+
+fn copy_chunk_overlap_from_mmap(
+    case: &ChunkedCachedCase,
+    chunk_index: [usize; 3],
+    chunk_value_offset: usize,
+    patch_start: [usize; 3],
+    patch_size: [usize; 3],
+    image_out: &mut [f32],
+    label_out: &mut [u16],
+) -> Result<()> {
+    let chunk_start = [
+        chunk_index[0] * case.chunk_shape[0],
+        chunk_index[1] * case.chunk_shape[1],
+        chunk_index[2] * case.chunk_shape[2],
+    ];
+    let patch_end = [
+        patch_start[0] + patch_size[0],
+        patch_start[1] + patch_size[1],
+        patch_start[2] + patch_size[2],
+    ];
+    let overlap_start = [
+        patch_start[0].max(chunk_start[0]),
+        patch_start[1].max(chunk_start[1]),
+        patch_start[2].max(chunk_start[2]),
+    ];
+    let overlap_end = [
+        patch_end[0].min((chunk_start[0] + case.chunk_shape[0]).min(case.shape[0])),
+        patch_end[1].min((chunk_start[1] + case.chunk_shape[1]).min(case.shape[1])),
+        patch_end[2].min((chunk_start[2] + case.chunk_shape[2]).min(case.shape[2])),
+    ];
+    if overlap_start[0] >= overlap_end[0]
+        || overlap_start[1] >= overlap_end[1]
+        || overlap_start[2] >= overlap_end[2]
+    {
+        return Ok(());
+    }
+    let row = overlap_end[0] - overlap_start[0];
+    for z in overlap_start[2]..overlap_end[2] {
+        for y in overlap_start[1]..overlap_end[1] {
+            let chunk_source = (overlap_start[0] - chunk_start[0])
+                + case.chunk_shape[0]
+                    * ((y - chunk_start[1]) + case.chunk_shape[1] * (z - chunk_start[2]));
+            let patch_dest = (overlap_start[0] - patch_start[0])
+                + patch_size[0] * ((y - patch_start[1]) + patch_size[1] * (z - patch_start[2]));
+            read_f32_values_from_mmap(
+                &case.image_mmap,
+                chunk_value_offset + chunk_source,
+                &mut image_out[patch_dest..patch_dest + row],
+            )?;
+            read_u16_values_from_mmap(
+                &case.label_mmap,
+                chunk_value_offset + chunk_source,
+                &mut label_out[patch_dest..patch_dest + row],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn read_f32_values_from_mmap(mmap: &Mmap, value_offset: usize, out: &mut [f32]) -> Result<()> {
+    let bytes = mmap_bytes(mmap, value_offset, out.len(), 4)?;
+    for (slot, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+        *slot = f32::from_le_bytes(chunk.try_into().expect("chunk length"));
+    }
+    Ok(())
+}
+
+fn read_u16_values_from_mmap(mmap: &Mmap, value_offset: usize, out: &mut [u16]) -> Result<()> {
+    let bytes = mmap_bytes(mmap, value_offset, out.len(), 2)?;
+    for (slot, chunk) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        *slot = u16::from_le_bytes(chunk.try_into().expect("chunk length"));
+    }
+    Ok(())
+}
+
+fn mmap_bytes(
+    mmap: &Mmap,
+    value_offset: usize,
+    values: usize,
+    bytes_per_value: usize,
+) -> Result<&[u8]> {
+    let byte_offset = value_offset
+        .checked_mul(bytes_per_value)
+        .ok_or_else(|| SamplerError::invalid_input("mmap byte offset overflow"))?;
+    let byte_len = values
+        .checked_mul(bytes_per_value)
+        .ok_or_else(|| SamplerError::invalid_input("mmap byte length overflow"))?;
+    let byte_end = byte_offset
+        .checked_add(byte_len)
+        .ok_or_else(|| SamplerError::invalid_input("mmap byte range overflow"))?;
+    mmap.get(byte_offset..byte_end)
+        .ok_or_else(|| SamplerError::invalid_input("mmap range is out of bounds"))
+}
+
+fn mmap_file(path: &Path) -> Result<Mmap> {
+    let file = File::open(path).map_err(|source| SamplerError::io(path, source))?;
+    // SAFETY: the mapping is read-only and the file handle is kept alive until
+    // the OS mapping is created. Callers validate length before reading.
+    unsafe { Mmap::map(&file).map_err(|source| SamplerError::io(path, source)) }
+}
+
+fn validate_mmap_len(
+    path: &Path,
+    mmap: &Mmap,
+    values: usize,
+    bytes_per_value: usize,
+) -> Result<()> {
+    let expected = values
+        .checked_mul(bytes_per_value)
+        .ok_or_else(|| SamplerError::invalid_input("mmap byte length overflow"))?;
+    if mmap.len() != expected {
+        return Err(SamplerError::invalid_input(format!(
+            "{} has {} bytes, expected {expected}",
+            path.display(),
+            mmap.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_patch_outputs(
+    shape: [usize; 3],
+    start: [usize; 3],
+    patch_size: [usize; 3],
+    image_len: usize,
+    label_len: usize,
+) -> Result<()> {
+    validate_patch(patch_size)?;
+    validate_patch_start(shape, start, patch_size)?;
+    let voxels = patch_voxels(patch_size);
+    if image_len != voxels {
+        return Err(SamplerError::invalid_input(format!(
+            "image output buffer has {image_len} values, expected {voxels}"
+        )));
+    }
+    if label_len != voxels {
+        return Err(SamplerError::invalid_input(format!(
+            "label output buffer has {label_len} values, expected {voxels}"
+        )));
+    }
+    Ok(())
+}
+
+fn value_count(shape: [usize; 3]) -> Result<usize> {
+    shape[0]
+        .checked_mul(shape[1])
+        .and_then(|value| value.checked_mul(shape[2]))
+        .ok_or_else(|| SamplerError::invalid_input("volume value count overflow"))
+}
+
+fn flat_index(shape: [usize; 3], x: usize, y: usize, z: usize) -> usize {
+    x + shape[0] * (y + shape[1] * z)
 }
 
 fn patch_voxels(size: [usize; 3]) -> usize {

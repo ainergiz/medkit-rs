@@ -86,6 +86,22 @@ fn prepare_sample_and_bench_workflow_runs_end_to_end() {
         assert!(Path::new(path).exists(), "{key} should exist at {path}");
     }
 
+    let inspect = run_ok(Command::new(env!("CARGO_BIN_EXE_medkit")).args([
+        "cache",
+        "inspect",
+        cache_dir.to_str().unwrap(),
+    ]));
+    assert!(inspect.contains("Status: ok"));
+    assert!(inspect.contains("Cases: 2"));
+    assert!(inspect.contains("Chunked cases: 2"));
+
+    let validate = run_ok(Command::new(env!("CARGO_BIN_EXE_medkit")).args([
+        "cache",
+        "validate",
+        cache_dir.to_str().unwrap(),
+    ]));
+    assert!(validate.contains("Errors: 0"));
+
     let patches_path = root.join("patches.jsonl");
     let sample = run_ok(Command::new(env!("CARGO_BIN_EXE_medkit")).args([
         "sample",
@@ -276,6 +292,17 @@ fn runtime_commands_report_parse_and_legacy_alias_errors() {
         "patches.jsonl",
     ]);
     assert!(!sample_cache_error.stderr.trim().is_empty());
+
+    let cache_no_args = run_fail(["cache"]);
+    assert!(cache_no_args.stderr.contains("Usage:"));
+
+    let cache_unknown = run_fail(["cache", "unknown", "cache-dir"]);
+    assert!(cache_unknown
+        .stderr
+        .contains("unknown cache command: unknown"));
+
+    let cache_inspect_missing = run_fail(["cache", "inspect", "missing-cache"]);
+    assert!(!cache_inspect_missing.stderr.trim().is_empty());
 
     let bench_no_args = run_fail(["bench"]);
     assert!(bench_no_args.stderr.contains("Usage:"));
