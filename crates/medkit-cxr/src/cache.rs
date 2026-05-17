@@ -8,7 +8,6 @@ use std::{
 };
 
 use image::{imageops::FilterType, DynamicImage, GrayImage};
-use serde_json;
 
 use crate::{
     error::CxrError,
@@ -35,7 +34,19 @@ struct CxrIndexedRunRead {
     masks: Vec<f32>,
 }
 
-#[derive(Debug, Clone)]
+struct CacheSplitPaths<'a> {
+    images: &'a Path,
+    labels: &'a Path,
+    masks: &'a Path,
+}
+
+struct CacheSplitBuffers<'a> {
+    images: &'a mut [f32],
+    labels: &'a mut [f32],
+    masks: &'a mut [f32],
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct CxrCacheOptions {
     pub targets: Vec<String>,
     pub recipe_hash: String,
@@ -45,21 +56,6 @@ pub struct CxrCacheOptions {
     pub dicom_presentation_policy: DicomPresentationPolicy,
     pub transfer_syntax_policy: TransferSyntaxPolicy,
     pub split_policy: SplitPolicyMetadata,
-}
-
-impl Default for CxrCacheOptions {
-    fn default() -> Self {
-        Self {
-            targets: Vec::new(),
-            recipe_hash: String::new(),
-            recipe_path: String::new(),
-            label_policy: LabelPolicy::default(),
-            image_size_policy: ImageSizePolicy::default(),
-            dicom_presentation_policy: DicomPresentationPolicy::default(),
-            transfer_syntax_policy: TransferSyntaxPolicy::default(),
-            split_policy: SplitPolicyMetadata::default(),
-        }
-    }
 }
 
 pub fn cache_cxr(config: &CacheConfig) -> Result<CacheSummary, CxrError> {
@@ -617,12 +613,16 @@ impl CxrCacheReader {
         if worker_count == 1 {
             return self.fill_indexed_runs_streaming(
                 &runs,
-                &image_path,
-                &labels_path,
-                &masks_path,
-                image_out,
-                labels_out,
-                masks_out,
+                CacheSplitPaths {
+                    images: &image_path,
+                    labels: &labels_path,
+                    masks: &masks_path,
+                },
+                CacheSplitBuffers {
+                    images: image_out,
+                    labels: labels_out,
+                    masks: masks_out,
+                },
             );
         }
 
@@ -691,16 +691,12 @@ impl CxrCacheReader {
     fn fill_indexed_runs_streaming(
         &self,
         runs: &[CxrIndexedRun],
-        image_path: &Path,
-        labels_path: &Path,
-        masks_path: &Path,
-        image_out: &mut [f32],
-        labels_out: &mut [f32],
-        masks_out: &mut [f32],
+        paths: CacheSplitPaths<'_>,
+        outputs: CacheSplitBuffers<'_>,
     ) -> Result<CxrIndexedReadMetrics, CxrError> {
-        let mut images = File::open(image_path)?;
-        let mut labels = File::open(labels_path)?;
-        let mut masks = File::open(masks_path)?;
+        let mut images = File::open(paths.images)?;
+        let mut labels = File::open(paths.labels)?;
+        let mut masks = File::open(paths.masks)?;
         let mut samples = 0usize;
         let mut read_micros = 0u128;
         let mut scatter_micros = 0u128;
@@ -728,19 +724,21 @@ impl CxrCacheReader {
             for (run_index, out_index) in run.out_indices.iter().copied().enumerate() {
                 let src_image_start = run_index * self.image_values_per_sample;
                 let dst_image_start = out_index * self.image_values_per_sample;
-                image_out[dst_image_start..dst_image_start + self.image_values_per_sample]
+                outputs.images[dst_image_start..dst_image_start + self.image_values_per_sample]
                     .copy_from_slice(
                         &image_scratch
                             [src_image_start..src_image_start + self.image_values_per_sample],
                     );
                 let src_label_start = run_index * self.target_count;
                 let dst_label_start = out_index * self.target_count;
-                labels_out[dst_label_start..dst_label_start + self.target_count].copy_from_slice(
-                    &label_scratch[src_label_start..src_label_start + self.target_count],
-                );
-                masks_out[dst_label_start..dst_label_start + self.target_count].copy_from_slice(
-                    &mask_scratch[src_label_start..src_label_start + self.target_count],
-                );
+                outputs.labels[dst_label_start..dst_label_start + self.target_count]
+                    .copy_from_slice(
+                        &label_scratch[src_label_start..src_label_start + self.target_count],
+                    );
+                outputs.masks[dst_label_start..dst_label_start + self.target_count]
+                    .copy_from_slice(
+                        &mask_scratch[src_label_start..src_label_start + self.target_count],
+                    );
             }
             scatter_micros += scatter_start.elapsed().as_micros();
         }

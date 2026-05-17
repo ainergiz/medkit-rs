@@ -46,6 +46,13 @@ impl DatasetHandle {
         self.patch_size
     }
 
+    /// Fills caller-owned image and u16 label buffers with contiguous patches.
+    ///
+    /// # Safety
+    ///
+    /// `image_out` and `label_out` must be non-null and point to writable
+    /// buffers large enough for `batch_size * patch_x * patch_y * patch_z`
+    /// values of their respective element types.
     pub unsafe fn fill_batch_u16_ptr(
         &self,
         start_index: usize,
@@ -74,6 +81,13 @@ impl DatasetHandle {
         Ok(batch_size)
     }
 
+    /// Fills caller-owned image and f32 label buffers with contiguous patches.
+    ///
+    /// # Safety
+    ///
+    /// `image_out` and `label_out` must be non-null and point to writable
+    /// buffers large enough for `batch_size * patch_x * patch_y * patch_z`
+    /// `f32` values.
     pub unsafe fn fill_batch_f32_ptr(
         &self,
         start_index: usize,
@@ -117,6 +131,36 @@ struct LoadedCase {
     case_id: String,
     shape: [usize; 3],
     storage: CaseStorage,
+}
+
+#[derive(Clone, Copy)]
+struct PatchCopySpec {
+    shape: [usize; 3],
+    start: [usize; 3],
+    patch_size: [usize; 3],
+}
+
+struct ChunkedPatchCopy<'a> {
+    spec: PatchCopySpec,
+    image_mmap: &'a Mmap,
+    label_mmap: &'a Mmap,
+    chunk_shape: [usize; 3],
+    chunk_grid: [usize; 3],
+}
+
+struct ChunkOverlap<'a> {
+    shape: [usize; 3],
+    chunk_shape: [usize; 3],
+    chunk_index: [usize; 3],
+    patch_start: [usize; 3],
+    patch_size: [usize; 3],
+    image_chunk: &'a [f32],
+    label_chunk: &'a [u16],
+}
+
+struct PatchOutputs<'a> {
+    image: &'a mut [f32],
+    label: &'a mut [f32],
 }
 
 #[derive(Debug)]
@@ -443,15 +487,21 @@ fn copy_patch_f32_labels(
             chunk_shape,
             chunk_grid,
         } => copy_patch_f32_labels_chunked(
-            case.shape,
-            image_mmap,
-            label_mmap,
-            *chunk_shape,
-            *chunk_grid,
-            start,
-            patch_size,
-            image_out,
-            label_out,
+            ChunkedPatchCopy {
+                spec: PatchCopySpec {
+                    shape: case.shape,
+                    start,
+                    patch_size,
+                },
+                image_mmap,
+                label_mmap,
+                chunk_shape: *chunk_shape,
+                chunk_grid: *chunk_grid,
+            },
+            PatchOutputs {
+                image: image_out,
+                label: label_out,
+            },
         ),
     }
 }
@@ -482,51 +532,53 @@ fn copy_patch_f32_labels_resident(
 }
 
 fn copy_patch_f32_labels_chunked(
-    shape: [usize; 3],
-    image_mmap: &Mmap,
-    label_mmap: &Mmap,
-    chunk_shape: [usize; 3],
-    chunk_grid: [usize; 3],
-    start: [usize; 3],
-    patch_size: [usize; 3],
-    image_out: &mut [f32],
-    label_out: &mut [f32],
+    request: ChunkedPatchCopy<'_>,
+    mut outputs: PatchOutputs<'_>,
 ) -> Result<(), String> {
-    image_out.fill(0.0);
-    label_out.fill(0.0);
+    outputs.image.fill(0.0);
+    outputs.label.fill(0.0);
+    let PatchCopySpec {
+        shape,
+        start,
+        patch_size,
+    } = request.spec;
     let end = [
         start[0] + patch_size[0],
         start[1] + patch_size[1],
         start[2] + patch_size[2],
     ];
     let chunk_min = [
-        start[0] / chunk_shape[0],
-        start[1] / chunk_shape[1],
-        start[2] / chunk_shape[2],
+        start[0] / request.chunk_shape[0],
+        start[1] / request.chunk_shape[1],
+        start[2] / request.chunk_shape[2],
     ];
     let chunk_max = [
-        (end[0] - 1) / chunk_shape[0],
-        (end[1] - 1) / chunk_shape[1],
-        (end[2] - 1) / chunk_shape[2],
+        (end[0] - 1) / request.chunk_shape[0],
+        (end[1] - 1) / request.chunk_shape[1],
+        (end[2] - 1) / request.chunk_shape[2],
     ];
-    let chunk_voxels = chunk_shape[0] * chunk_shape[1] * chunk_shape[2];
+    let chunk_voxels = request.chunk_shape[0] * request.chunk_shape[1] * request.chunk_shape[2];
     for chunk_z in chunk_min[2]..=chunk_max[2] {
         for chunk_y in chunk_min[1]..=chunk_max[1] {
             for chunk_x in chunk_min[0]..=chunk_max[0] {
-                let chunk_index = chunk_x + chunk_grid[0] * (chunk_y + chunk_grid[1] * chunk_z);
+                let chunk_index =
+                    chunk_x + request.chunk_grid[0] * (chunk_y + request.chunk_grid[1] * chunk_z);
                 let chunk_value_offset = chunk_index * chunk_voxels;
-                let image_chunk = f32_mmap_values(image_mmap, chunk_value_offset, chunk_voxels)?;
-                let label_chunk = u16_mmap_values(label_mmap, chunk_value_offset, chunk_voxels)?;
+                let image_chunk =
+                    f32_mmap_values(request.image_mmap, chunk_value_offset, chunk_voxels)?;
+                let label_chunk =
+                    u16_mmap_values(request.label_mmap, chunk_value_offset, chunk_voxels)?;
                 copy_chunk_overlap(
-                    shape,
-                    chunk_shape,
-                    [chunk_x, chunk_y, chunk_z],
-                    start,
-                    patch_size,
-                    image_chunk,
-                    label_chunk,
-                    image_out,
-                    label_out,
+                    ChunkOverlap {
+                        shape,
+                        chunk_shape: request.chunk_shape,
+                        chunk_index: [chunk_x, chunk_y, chunk_z],
+                        patch_start: start,
+                        patch_size,
+                        image_chunk,
+                        label_chunk,
+                    },
+                    &mut outputs,
                 );
             }
         }
@@ -534,17 +586,16 @@ fn copy_patch_f32_labels_chunked(
     Ok(())
 }
 
-fn copy_chunk_overlap(
-    shape: [usize; 3],
-    chunk_shape: [usize; 3],
-    chunk_index: [usize; 3],
-    patch_start: [usize; 3],
-    patch_size: [usize; 3],
-    image_chunk: &[f32],
-    label_chunk: &[u16],
-    image_out: &mut [f32],
-    label_out: &mut [f32],
-) {
+fn copy_chunk_overlap(overlap: ChunkOverlap<'_>, outputs: &mut PatchOutputs<'_>) {
+    let ChunkOverlap {
+        shape,
+        chunk_shape,
+        chunk_index,
+        patch_start,
+        patch_size,
+        image_chunk,
+        label_chunk,
+    } = overlap;
     let chunk_start = [
         chunk_index[0] * chunk_shape[0],
         chunk_index[1] * chunk_shape[1],
@@ -578,10 +629,10 @@ fn copy_chunk_overlap(
                 + chunk_shape[0] * ((y - chunk_start[1]) + chunk_shape[1] * (z - chunk_start[2]));
             let patch_dest = (overlap_start[0] - patch_start[0])
                 + patch_size[0] * ((y - patch_start[1]) + patch_size[1] * (z - patch_start[2]));
-            image_out[patch_dest..patch_dest + row]
+            outputs.image[patch_dest..patch_dest + row]
                 .copy_from_slice(&image_chunk[chunk_source..chunk_source + row]);
             for offset in 0..row {
-                label_out[patch_dest + offset] = f32::from(label_chunk[chunk_source + offset]);
+                outputs.label[patch_dest + offset] = f32::from(label_chunk[chunk_source + offset]);
             }
         }
     }
@@ -628,6 +679,30 @@ fn mmap_values(
         .ok_or_else(|| "mmap chunk range is out of bounds".to_string())
 }
 
+fn mmap_file(path: &Path) -> Result<Mmap, String> {
+    let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    unsafe { Mmap::map(&file).map_err(|error| format!("{}: {error}", path.display())) }
+}
+
+fn resident_case(case: &LoadedCase) -> Result<(&[f32], &[f32]), String> {
+    match &case.storage {
+        CaseStorage::Resident { image, label_f32 } => Ok((image, label_f32)),
+        CaseStorage::Chunked { .. } => {
+            Err("u16 pointer fill is not implemented for chunked storage".to_string())
+        }
+    }
+}
+
+unsafe fn c_path(value: *const c_char) -> Result<PathBuf, String> {
+    if value.is_null() {
+        return Err("null path".to_string());
+    }
+    let text = CStr::from_ptr(value)
+        .to_str()
+        .map_err(|error| error.to_string())?;
+    Ok(PathBuf::from(text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,42 +737,22 @@ mod tests {
         let mut label_out = [0.0_f32; 1];
 
         copy_chunk_overlap(
-            [2, 1, 1],
-            [1, 1, 1],
-            [0, 0, 0],
-            [1, 0, 0],
-            [1, 1, 1],
-            &image_chunk,
-            &label_chunk,
-            &mut image_out,
-            &mut label_out,
+            ChunkOverlap {
+                shape: [2, 1, 1],
+                chunk_shape: [1, 1, 1],
+                chunk_index: [0, 0, 0],
+                patch_start: [1, 0, 0],
+                patch_size: [1, 1, 1],
+                image_chunk: &image_chunk,
+                label_chunk: &label_chunk,
+            },
+            &mut PatchOutputs {
+                image: &mut image_out,
+                label: &mut label_out,
+            },
         );
 
         assert_eq!(image_out, [0.0]);
         assert_eq!(label_out, [0.0]);
     }
-}
-
-fn mmap_file(path: &Path) -> Result<Mmap, String> {
-    let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    unsafe { Mmap::map(&file).map_err(|error| format!("{}: {error}", path.display())) }
-}
-
-fn resident_case(case: &LoadedCase) -> Result<(&[f32], &[f32]), String> {
-    match &case.storage {
-        CaseStorage::Resident { image, label_f32 } => Ok((image, label_f32)),
-        CaseStorage::Chunked { .. } => {
-            Err("u16 pointer fill is not implemented for chunked storage".to_string())
-        }
-    }
-}
-
-unsafe fn c_path(value: *const c_char) -> Result<PathBuf, String> {
-    if value.is_null() {
-        return Err("null path".to_string());
-    }
-    let text = CStr::from_ptr(value)
-        .to_str()
-        .map_err(|error| error.to_string())?;
-    Ok(PathBuf::from(text))
 }

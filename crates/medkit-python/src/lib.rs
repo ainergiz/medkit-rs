@@ -1,3 +1,7 @@
+// PyO3's generated wrappers currently trigger this lint on valid `PyResult`
+// method signatures.
+#![allow(clippy::useless_conversion)]
+
 use std::{
     path::PathBuf,
     slice,

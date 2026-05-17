@@ -13,10 +13,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - uses: astral-sh/setup-uv@v5
       - uses: Swatinem/rust-cache@v2
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --exclude medkit-python
+      - name: Run medkit-python Rust tests
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import sys
+          import sysconfig
+
+          config_path = Path("target/ci-pyo3-config.txt")
+          config_path.parent.mkdir(parents=True, exist_ok=True)
+
+          libdir = sysconfig.get_config_var("LIBDIR") or ""
+          ldlibrary = sysconfig.get_config_var("LDLIBRARY") or ""
+          lib_name = ldlibrary.removeprefix("lib")
+          for suffix in (".dylib", ".so", ".a", ".dll"):
+              lib_name = lib_name.removesuffix(suffix)
+
+          version = sysconfig.get_config_var("VERSION") or f"{sys.version_info.major}.{sys.version_info.minor}"
+          config_path.write_text(
+              "\n".join(
+                  [
+                      "implementation=CPython",
+                      f"version={version}",
+                      "shared=true",
+                      "abi3=true",
+                      f"lib_name={lib_name}",
+                      f"lib_dir={libdir}",
+                      f"executable={sys.executable}",
+                      "pointer_width=64",
+                      "build_flags=",
+                      "suppress_build_script_link_lines=false",
+                  ]
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          PYTHONHOME="$(python - <<'PY'
+          import sys
+          print(sys.base_prefix)
+          PY
+          )" PYO3_CONFIG_FILE="$GITHUB_WORKSPACE/target/ci-pyo3-config.txt" \
+            cargo test -p medkit-python --no-default-features --lib --locked
 
   python-contract:
     name: Python import and API contract

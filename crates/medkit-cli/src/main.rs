@@ -250,7 +250,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
             print_cxr_ingest_summary(&summary);
             ensure_cxr_ingest_cache_validation_ok(&summary.cache_validation_status)
         }
-        Command::CxrBenchmark(config) => run_cxr_benchmark_bridge(config),
+        Command::CxrBenchmark(config) => run_cxr_benchmark_bridge(*config),
         Command::DicomScan {
             root,
             out_path,
@@ -400,7 +400,7 @@ enum Command {
         dry_run: bool,
         workers: usize,
     },
-    CxrBenchmark(CxrBenchmarkBridgeConfig),
+    CxrBenchmark(Box<CxrBenchmarkBridgeConfig>),
     DicomScan {
         root: PathBuf,
         out_path: PathBuf,
@@ -765,7 +765,7 @@ fn parse_cxr_benchmark_command(args: impl Iterator<Item = OsString>) -> Result<C
             }
         }
     }
-    Ok(Command::CxrBenchmark(CxrBenchmarkBridgeConfig {
+    Ok(Command::CxrBenchmark(Box::new(CxrBenchmarkBridgeConfig {
         manifest_path,
         splits_path,
         plan_path,
@@ -792,7 +792,7 @@ fn parse_cxr_benchmark_command(args: impl Iterator<Item = OsString>) -> Result<C
         smoke,
         force_cache,
         force_rematerialize,
-    }))
+    })))
 }
 
 fn parse_cxr_index_command(args: impl Iterator<Item = OsString>) -> Result<Command, CliError> {

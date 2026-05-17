@@ -212,9 +212,7 @@ impl DicomDataSet {
             rescale_slope: self.f32_value((0x0028, 0x1053)),
             window_center: self.f32_value((0x0028, 0x1050)),
             window_width: self.f32_value((0x0028, 0x1051)),
-            pixel_hash: self
-                .element((0x7FE0, 0x0010))
-                .map(|value| sha256_hex(value)),
+            pixel_hash: self.element((0x7FE0, 0x0010)).map(sha256_hex),
             decoder_backend: None,
             decoder_version: None,
             warnings,

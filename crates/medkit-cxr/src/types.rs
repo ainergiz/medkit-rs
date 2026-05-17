@@ -215,25 +215,13 @@ fn default_label_policy() -> LabelPolicy {
     LabelPolicy::default()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ImageSizePolicy {
     pub channels: usize,
     pub height: usize,
     pub width: usize,
     pub dtype: String,
     pub transform: String,
-}
-
-impl Default for ImageSizePolicy {
-    fn default() -> Self {
-        Self {
-            channels: 0,
-            height: 0,
-            width: 0,
-            dtype: String::new(),
-            transform: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

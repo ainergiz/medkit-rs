@@ -346,7 +346,7 @@ mod tests {
         let closed = root.join("closed");
         fs::create_dir_all(&closed).unwrap();
         let original_permissions = fs::metadata(&closed).unwrap().permissions();
-        fs::set_permissions(&closed, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o0)).unwrap();
 
         let config = DicomScanConfig {
             root: root.clone(),
@@ -364,7 +364,7 @@ mod tests {
     fn directory_entry_errors_keep_root_context() {
         let error = dir_entry_path(
             Path::new("root-dir"),
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "entry lost")),
+            Err(std::io::Error::other("entry lost")),
         )
         .unwrap_err();
 

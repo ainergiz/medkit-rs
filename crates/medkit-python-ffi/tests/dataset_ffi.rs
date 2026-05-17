@@ -524,7 +524,7 @@ fn chunk_grid(shape: [usize; 3], chunk_shape: [usize; 3]) -> [usize; 3] {
 }
 
 fn div_ceil(value: usize, divisor: usize) -> usize {
-    (value + divisor - 1) / divisor
+    value.div_ceil(divisor)
 }
 
 fn flat_index(x: usize, y: usize, z: usize, shape: [usize; 3]) -> usize {

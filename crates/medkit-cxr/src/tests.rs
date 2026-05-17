@@ -1639,7 +1639,7 @@ fn empty_train_rgb_cache_and_remaining_fallbacks_are_covered() {
     assert_eq!(cache.normalization.std, 0.25);
     assert_eq!(cache.splits["train"].samples, 0);
     assert_eq!(cache.splits["val"].samples, 1);
-    assert_eq!(directory_size(&root).unwrap() > 0, true);
+    assert!(directory_size(&root).unwrap() > 0);
 
     fs::write(
         root.join("second-op-size.toml"),
@@ -1729,10 +1729,7 @@ fn cache_reader_late_file_errors_and_error_display_arms_are_covered() {
         .iter()
         .any(|error| error.contains("missing or unreadable metadata")));
 
-    let csv_error = CxrError::from(csv::Error::from(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "csv-display",
-    )));
+    let csv_error = CxrError::from(csv::Error::from(std::io::Error::other("csv-display")));
     assert!(csv_error.to_string().contains("csv-display"));
     let json_error = CxrError::from(serde_json::from_str::<CxrRecord>("not json").unwrap_err());
     assert!(!json_error.to_string().is_empty());

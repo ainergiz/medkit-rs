@@ -338,10 +338,11 @@ fn decode_rle_lossless(
         planes.push(plane);
     }
     let mut decoded = Vec::with_capacity(expected_bytes);
-    for pixel in 0..pixels {
-        for byte_index in (0..bytes_per_sample).rev() {
-            decoded.push(planes[byte_index][pixel]);
-        }
+    let plane_slices = &planes[..bytes_per_sample];
+    for pixel_bytes in
+        (0..pixels).map(|pixel| plane_slices.iter().rev().map(move |plane| plane[pixel]))
+    {
+        decoded.extend(pixel_bytes);
     }
     if decoded.len() != expected_bytes {
         return Err(DicomError::parse(

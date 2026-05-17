@@ -106,11 +106,7 @@ impl From<medkit_transform::TransformError> for CacheError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        error::Error as _,
-        io::{self, ErrorKind},
-        path::PathBuf,
-    };
+    use std::{error::Error as _, io, path::PathBuf};
 
     use medkit_transform::TransformError;
 
@@ -118,7 +114,7 @@ mod tests {
 
     #[test]
     fn display_messages_include_error_context() {
-        let io_error = CacheError::io("cache/out.raw", io::Error::new(ErrorKind::Other, "denied"));
+        let io_error = CacheError::io("cache/out.raw", io::Error::other("denied"));
         assert_eq!(
             io_error.to_string(),
             "filesystem error at cache/out.raw: denied"
@@ -148,7 +144,7 @@ mod tests {
 
     #[test]
     fn source_returns_wrapped_errors_when_available() {
-        let io_error = CacheError::io("cache", io::Error::new(ErrorKind::NotFound, "missing"));
+        let io_error = CacheError::io("cache", io::Error::new(io::ErrorKind::NotFound, "missing"));
         assert_eq!(io_error.source().unwrap().to_string(), "missing");
 
         let json_source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();

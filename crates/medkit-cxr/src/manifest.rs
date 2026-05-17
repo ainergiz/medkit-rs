@@ -14,6 +14,8 @@ use crate::{
     util::{add_label_count, hash_file, overlap_count},
 };
 
+type LabelMap = HashMap<(String, String), BTreeMap<String, Option<i8>>>;
+
 pub fn index_cxr(config: &IndexConfig) -> Result<IndexSummary, CxrError> {
     let label_map = match &config.labels_path {
         Some(path) => read_label_csv(path)?,
@@ -99,7 +101,7 @@ pub fn validate_cxr(config: &ValidateConfig) -> Result<ValidationSummary, CxrErr
 fn records_from_metadata(
     metadata_path: &Path,
     image_map: &HashMap<String, PathBuf>,
-    label_map: &HashMap<(String, String), BTreeMap<String, Option<i8>>>,
+    label_map: &LabelMap,
     config: &IndexConfig,
 ) -> Result<Vec<CxrRecord>, CxrError> {
     let mut reader = csv_reader(metadata_path)?;
@@ -200,7 +202,7 @@ fn records_from_images(
 
 fn records_from_dicom_index(
     dicom_index_path: &Path,
-    label_map: &HashMap<(String, String), BTreeMap<String, Option<i8>>>,
+    label_map: &LabelMap,
     config: &IndexConfig,
 ) -> Result<Vec<CxrRecord>, CxrError> {
     let mut records = Vec::new();
@@ -281,9 +283,7 @@ fn read_dicom_index(path: &Path) -> Result<Vec<DicomInventoryRecord>, CxrError> 
     Ok(records)
 }
 
-pub(crate) fn read_label_csv(
-    labels_path: &Path,
-) -> Result<HashMap<(String, String), BTreeMap<String, Option<i8>>>, CxrError> {
+pub(crate) fn read_label_csv(labels_path: &Path) -> Result<LabelMap, CxrError> {
     let mut reader = csv_reader(labels_path)?;
     let headers = reader.headers()?.clone();
     let index = HeaderIndex::new(&headers);
