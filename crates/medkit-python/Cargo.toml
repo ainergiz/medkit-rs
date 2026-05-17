@@ -21,7 +21,7 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 medkit-cxr = { path = "../medkit-cxr" }
 medkit-python-ffi = { path = "../medkit-python-ffi" }
-pyo3 = { version = "0.22.6", features = ["abi3-py311"] }
+pyo3 = { version = "0.22.6", features = ["abi3-py311", "generate-import-lib"] }
 
 [dev-dependencies]
 sha2.workspace = true
