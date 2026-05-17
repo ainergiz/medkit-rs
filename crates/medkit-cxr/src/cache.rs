@@ -15,9 +15,9 @@ use crate::{
     manifest::{is_dicom_record, read_manifest},
     types::{
         CacheConfig, CacheSplitSummary, CacheSummary, CacheValidationSummary, CxrCacheBatch,
-        CxrCacheReader, CxrIndexedReadMetrics, CxrRecord, ImageSizePolicy, LabelPolicy,
-        Normalization, SplitFile, ValidateCacheConfig, CXR_CACHE_SCHEMA_VERSION,
-        CXR_REPORT_SCHEMA_VERSION,
+        CxrCacheReader, CxrIndexedReadMetrics, CxrRecord, DicomPresentationPolicy, ImageSizePolicy,
+        LabelPolicy, Normalization, SplitFile, SplitPolicyMetadata, TransferSyntaxPolicy,
+        ValidateCacheConfig, CXR_CACHE_SCHEMA_VERSION, CXR_REPORT_SCHEMA_VERSION,
     },
     util::{collect_targets, directory_size, hash_file, resolve_cache_path, write_json},
 };
@@ -35,13 +35,51 @@ struct CxrIndexedRunRead {
     masks: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CxrCacheOptions {
+    pub targets: Vec<String>,
+    pub recipe_hash: String,
+    pub recipe_path: String,
+    pub label_policy: LabelPolicy,
+    pub image_size_policy: ImageSizePolicy,
+    pub dicom_presentation_policy: DicomPresentationPolicy,
+    pub transfer_syntax_policy: TransferSyntaxPolicy,
+    pub split_policy: SplitPolicyMetadata,
+}
+
+impl Default for CxrCacheOptions {
+    fn default() -> Self {
+        Self {
+            targets: Vec::new(),
+            recipe_hash: String::new(),
+            recipe_path: String::new(),
+            label_policy: LabelPolicy::default(),
+            image_size_policy: ImageSizePolicy::default(),
+            dicom_presentation_policy: DicomPresentationPolicy::default(),
+            transfer_syntax_policy: TransferSyntaxPolicy::default(),
+            split_policy: SplitPolicyMetadata::default(),
+        }
+    }
+}
+
 pub fn cache_cxr(config: &CacheConfig) -> Result<CacheSummary, CxrError> {
+    cache_cxr_with_options(config, &CxrCacheOptions::default())
+}
+
+pub fn cache_cxr_with_options(
+    config: &CacheConfig,
+    options: &CxrCacheOptions,
+) -> Result<CacheSummary, CxrError> {
     let records = read_manifest(&config.manifest_path)?;
     let split_file = read_split_file(&config.splits_path)?;
     validate_split_membership(&records, &split_file)?;
     let image_size = image_size_from_plan(&config.plan_path)?;
     fs::create_dir_all(&config.cache_dir)?;
-    let targets = collect_targets(&records);
+    let targets = if options.targets.is_empty() {
+        collect_targets(&records)
+    } else {
+        options.targets.clone()
+    };
     let transform_plan_hash = hash_file(&config.plan_path)?;
     let transform_description = if records.iter().any(is_dicom_record) {
         "medkit-dicom presentation to MONOCHROME2 u8, resize square, normalize dataset mean/std"
@@ -80,19 +118,28 @@ pub fn cache_cxr(config: &CacheConfig) -> Result<CacheSummary, CxrError> {
         channels: 1,
         dtype: "float32".to_string(),
         targets,
-        label_policy: LabelPolicy::default(),
+        label_policy: options.label_policy.clone(),
         normalization,
         transform_fingerprint: transform_plan_hash.clone(),
         transform_plan_hash,
+        recipe_hash: options.recipe_hash.clone(),
+        recipe_path: options.recipe_path.clone(),
         source_manifest_checksum: hash_file(&config.manifest_path)?,
         split_names,
-        image_size_policy: ImageSizePolicy {
-            channels: 1,
-            height: image_size,
-            width: image_size,
-            dtype: "float32".to_string(),
-            transform: transform_description.to_string(),
+        image_size_policy: if options.image_size_policy.height > 0 {
+            options.image_size_policy.clone()
+        } else {
+            ImageSizePolicy {
+                channels: 1,
+                height: image_size,
+                width: image_size,
+                dtype: "float32".to_string(),
+                transform: transform_description.to_string(),
+            }
         },
+        dicom_presentation_policy: options.dicom_presentation_policy.clone(),
+        transfer_syntax_policy: options.transfer_syntax_policy.clone(),
+        split_policy: options.split_policy.clone(),
         splits,
         failed_samples,
         cache_size_bytes: directory_size(&config.cache_dir)?,
@@ -209,6 +256,7 @@ pub fn validate_cache_cxr(
         } else {
             summary.transform_fingerprint
         },
+        recipe_hash: summary.recipe_hash,
         source_manifest_checksum: summary.source_manifest_checksum,
         cache_size_bytes: directory_size(&config.cache_dir)?,
     };
@@ -1022,6 +1070,7 @@ fn write_cache_validation_report(
         "- transform fingerprint: {}\n",
         summary.transform_fingerprint
     ));
+    report.push_str(&format!("- recipe hash: {}\n", summary.recipe_hash));
     report.push_str(&format!(
         "- source manifest checksum: {}\n",
         summary.source_manifest_checksum

@@ -237,6 +237,391 @@ fn dicom_index_manifest_validates_splits_caches_and_reads_batch() {
 }
 
 #[test]
+fn recipe_driven_dicom_ingest_writes_artifacts_metadata_report_and_is_deterministic() {
+    let root = unique_test_dir();
+    let raw = root.join("raw-dicom");
+    write_dicom_fixture_custom(
+        &raw.join("p1/image.dc"),
+        DicomFixtureSpec {
+            patient_id: "P1",
+            study_uid: "1.2.826.0.1",
+            sop_uid: "1.2.826.0.1.1",
+            view_position: Some("PA"),
+            transfer_syntax: medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN,
+            pixels: vec![0, 64, 128, 255],
+            ..DicomFixtureSpec::default()
+        },
+    );
+    write_dicom_fixture_custom(
+        &raw.join("p2/image.dc"),
+        DicomFixtureSpec {
+            patient_id: "P2",
+            study_uid: "1.2.826.0.2",
+            sop_uid: "1.2.826.0.2.1",
+            view_position: Some("AP"),
+            transfer_syntax: medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN,
+            pixels: vec![0, 64, 128, 255],
+            ..DicomFixtureSpec::default()
+        },
+    );
+    write_dicom_fixture_custom(
+        &raw.join("p3/missing-view.dc"),
+        DicomFixtureSpec {
+            patient_id: "P3",
+            study_uid: "1.2.826.0.3",
+            sop_uid: "1.2.826.0.3.1",
+            view_position: None,
+            transfer_syntax: medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN,
+            pixels: vec![9, 10, 11, 12],
+            ..DicomFixtureSpec::default()
+        },
+    );
+    write_dicom_fixture_custom(
+        &raw.join("p4/unsupported.dc"),
+        DicomFixtureSpec {
+            patient_id: "P4",
+            study_uid: "1.2.826.0.4",
+            sop_uid: "1.2.826.0.4.1",
+            view_position: Some("PA"),
+            transfer_syntax: "1.2.840.10008.1.2.4.91",
+            pixels: vec![1, 2, 3, 4],
+            ..DicomFixtureSpec::default()
+        },
+    );
+    write_dicom_fixture_custom(
+        &raw.join("p5/rle.dc"),
+        DicomFixtureSpec {
+            patient_id: "P5",
+            study_uid: "1.2.826.0.5",
+            sop_uid: "1.2.826.0.5.1",
+            view_position: Some("PA"),
+            transfer_syntax: medkit_dicom::RLE_LOSSLESS,
+            pixels: rle_single_segment_pixels(&[5, 10, 15, 20]),
+            ..DicomFixtureSpec::default()
+        },
+    );
+    fs::write(
+        root.join("labels.csv"),
+        "patient_id,study_instance_uid,No Finding,Pneumonia\nP1,1.2.826.0.1,0,1\nP5,1.2.826.0.5,1,0\n",
+    )
+    .unwrap();
+    let recipe = root.join("recipe.toml");
+    write_recipe(
+        &recipe,
+        r#"
+name = "cxr-dicom-4"
+
+[dicom]
+modalities = ["CR", "DX"]
+views = ["PA", "AP"]
+require_single_frame = true
+allow_transfer_syntaxes = ["1.2.840.10008.1.2.1", "1.2.840.10008.1.2.5"]
+unsupported_transfer_syntax = "warn"
+
+[presentation]
+apply_rescale = true
+voi = "auto"
+invert_monochrome1 = true
+output = "mono8"
+
+[image]
+size = [4, 4]
+resize = "fit"
+pad_value = 0
+normalize = "train_split_mean_std"
+
+[labels]
+targets = ["No Finding", "Pneumonia"]
+uncertain = "ignore"
+missing = "ignore"
+
+[split]
+by = "patient_id"
+train = 1.0
+val = 0.0
+test = 0.0
+stratify = []
+seed = 0
+"#,
+    );
+
+    let config = IngestConfig {
+        raw_root: raw.clone(),
+        recipe_path: recipe.clone(),
+        labels_path: root.join("labels.csv"),
+        cache_dir: root.join("cache"),
+        workdir: root.join("work"),
+        report_path: root.join("ingestion-report.md"),
+        dry_run: false,
+        workers: 2,
+    };
+    let first = ingest_cxr_dicom(&config).unwrap();
+    assert_eq!(first.status, "ok");
+    assert_eq!(first.counts.dicom_records_scanned, 5);
+    assert_eq!(first.counts.manifest_records, 3);
+    assert_eq!(first.counts.unsupported_or_skipped_images, 2);
+    assert_eq!(first.missing_label_counts["No Finding"], 1);
+    assert_eq!(first.missing_label_counts["Pneumonia"], 1);
+    assert_eq!(first.duplicate_pixel_hash_count, 1);
+    assert_eq!(first.cache_validation_status, "ok");
+    assert_eq!(
+        first.transfer_syntax_distribution[medkit_dicom::RLE_LOSSLESS],
+        1
+    );
+    assert!(first
+        .skipped_samples
+        .iter()
+        .any(|issue| issue.code == "unsupported_transfer_syntax"));
+    assert!(first
+        .skipped_samples
+        .iter()
+        .any(|issue| issue.code == "filtered_view_position"));
+
+    for path in [
+        &first.paths.dicom_index,
+        &first.paths.recipe_dicom_index,
+        &first.paths.manifest,
+        &first.paths.validation_report,
+        &first.paths.splits,
+        &first.paths.cache_validation_report,
+        &first.paths.cache_validation_json,
+        &first.paths.ingest_report,
+        &first.paths.ingest_summary_json,
+        &first.paths.resume_state,
+    ] {
+        assert!(Path::new(path).exists(), "missing artifact {path}");
+    }
+    let metadata = read_cache_summary(&config.cache_dir).unwrap();
+    assert_eq!(metadata.recipe_hash, first.recipe_hash);
+    assert_eq!(metadata.recipe_path, recipe.display().to_string());
+    assert_eq!(metadata.dicom_presentation_policy.output, "mono8");
+    assert_eq!(
+        metadata.transfer_syntax_policy.unsupported_transfer_syntax,
+        "warn"
+    );
+    assert_eq!(metadata.split_policy.by, "patient_id");
+    assert_eq!(
+        metadata.source_manifest_checksum,
+        hash_file(Path::new(&first.paths.manifest)).unwrap()
+    );
+
+    let report = fs::read_to_string(&first.paths.ingest_report).unwrap();
+    assert!(report.contains("Transfer Syntax Distribution"));
+    assert!(report.contains("Missing Labels"));
+    assert!(report.contains("skipped"));
+    assert!(report.contains("cache validation status: ok"));
+    assert!(report.contains("resume state"));
+
+    let second = ingest_cxr_dicom(&config).unwrap();
+    let first_split: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&first.paths.splits).unwrap()).unwrap();
+    let second_split: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&second.paths.splits).unwrap()).unwrap();
+    assert_eq!(
+        read_cache_summary(&config.cache_dir)
+            .unwrap()
+            .source_manifest_checksum,
+        metadata.source_manifest_checksum
+    );
+    assert_eq!(first_split["train"], second_split["train"]);
+    assert_eq!(
+        first.cache_transform_fingerprint,
+        second.cache_transform_fingerprint
+    );
+    assert_eq!(second.cache_validation_status, "ok");
+
+    fs::write(
+        root.join("labels.csv"),
+        "patient_id,study_instance_uid,No Finding,Pneumonia\nP1,1.2.826.0.1,1,0\n",
+    )
+    .unwrap();
+    let stale_workdir = ingest_cxr_dicom(&config).unwrap_err();
+    assert!(stale_workdir.to_string().contains("resume state"));
+    assert!(config.cache_dir.join("cache-metadata.json").exists());
+
+    fs::write(
+        root.join("different-recipe.toml"),
+        fs::read_to_string(&recipe)
+            .unwrap()
+            .replace("[4, 4]", "[8, 8]"),
+    )
+    .unwrap();
+    let stale = validate_cache_cxr(&ValidateCacheConfig {
+        cache_dir: config.cache_dir.clone(),
+        split: Some("train".to_string()),
+        expected_targets: Some(vec!["No Finding".to_string(), "Pneumonia".to_string()]),
+        expected_image_shape: None,
+        plan_path: Some(root.join("different-recipe.toml")),
+        report_path: None,
+        json_path: None,
+    })
+    .unwrap();
+    assert_eq!(stale.status, "failed");
+    assert!(stale
+        .errors
+        .iter()
+        .any(|error| error.contains("stale transform fingerprint")));
+}
+
+#[test]
+fn ingest_rejects_invalid_recipes_and_supports_dry_run_without_cache_tensors() {
+    let root = unique_test_dir();
+    let raw = root.join("raw-dicom");
+    write_dicom_fixture(
+        &raw.join("p1/image.dc"),
+        "P1",
+        "1.2.826.0.1",
+        "1.2.826.0.1.1",
+    );
+    fs::write(
+        root.join("labels.csv"),
+        "patient_id,study_instance_uid,No Finding,Pneumonia\nP1,1.2.826.0.1,0,1\n",
+    )
+    .unwrap();
+    let recipe = root.join("recipe.toml");
+    write_recipe(
+        &recipe,
+        r#"
+name = "dry-run"
+[image]
+size = [4, 4]
+[labels]
+targets = ["No Finding", "Pneumonia"]
+[split]
+train = 1.0
+val = 0.0
+test = 0.0
+"#,
+    );
+
+    let dry = ingest_cxr_dicom(&IngestConfig {
+        raw_root: raw.clone(),
+        recipe_path: recipe.clone(),
+        labels_path: root.join("labels.csv"),
+        cache_dir: root.join("dry-cache"),
+        workdir: root.join("dry-work"),
+        report_path: root.join("dry-report.md"),
+        dry_run: true,
+        workers: 1,
+    })
+    .unwrap();
+    assert_eq!(dry.status, "planned");
+    assert!(Path::new(&dry.paths.ingest_summary_json).exists());
+    assert!(fs::read_to_string(&dry.paths.ingest_report)
+        .unwrap()
+        .contains("dry run: true"));
+    assert!(!root.join("dry-cache/cache-metadata.json").exists());
+    let dry_work_blocker = root.join("dry-work-blocker");
+    fs::write(&dry_work_blocker, b"file blocks dry-run summary dir").unwrap();
+    assert!(ingest_cxr_dicom(&IngestConfig {
+        raw_root: raw.clone(),
+        recipe_path: recipe.clone(),
+        labels_path: root.join("labels.csv"),
+        cache_dir: root.join("dry-error-cache"),
+        workdir: dry_work_blocker,
+        report_path: root.join("dry-error-report.md"),
+        dry_run: true,
+        workers: 1,
+    })
+    .unwrap_err()
+    .to_string()
+    .contains("File exists"));
+
+    let invalid = root.join("invalid.toml");
+    write_recipe(
+        &invalid,
+        r#"
+name = "invalid"
+[image]
+size = [0, 4]
+[labels]
+targets = ["Pneumonia"]
+"#,
+    );
+    let error = ingest_cxr_dicom(&IngestConfig {
+        raw_root: raw.clone(),
+        recipe_path: invalid,
+        labels_path: root.join("labels.csv"),
+        cache_dir: root.join("invalid-cache"),
+        workdir: root.join("invalid-work"),
+        report_path: root.join("invalid-report.md"),
+        dry_run: false,
+        workers: 1,
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("image.size"));
+    assert!(!root.join("invalid-cache/cache-metadata.json").exists());
+
+    let fail_recipe = root.join("fail-unsupported.toml");
+    write_recipe(
+        &fail_recipe,
+        r#"
+name = "fail-unsupported"
+[dicom]
+allow_transfer_syntaxes = ["1.2.840.10008.1.2.2"]
+unsupported_transfer_syntax = "fail"
+[image]
+size = [4, 4]
+[labels]
+targets = ["No Finding", "Pneumonia"]
+[split]
+train = 1.0
+val = 0.0
+test = 0.0
+"#,
+    );
+    let unsupported = ingest_cxr_dicom(&IngestConfig {
+        raw_root: raw.clone(),
+        recipe_path: fail_recipe,
+        labels_path: root.join("labels.csv"),
+        cache_dir: root.join("fail-cache"),
+        workdir: root.join("fail-work"),
+        report_path: root.join("fail-report.md"),
+        dry_run: false,
+        workers: 1,
+    })
+    .unwrap_err();
+    assert!(unsupported
+        .to_string()
+        .contains("transfer syntax 1.2.840.10008.1.2.1"));
+    assert!(!root.join("fail-cache/cache-metadata.json").exists());
+
+    let empty_recipe = root.join("empty-after-filter.toml");
+    write_recipe(
+        &empty_recipe,
+        r#"
+name = "empty-after-filter"
+[dicom]
+allow_transfer_syntaxes = ["1.2.840.10008.1.2.2"]
+unsupported_transfer_syntax = "skip"
+[image]
+size = [4, 4]
+[labels]
+targets = ["No Finding", "Pneumonia"]
+[split]
+train = 1.0
+val = 0.0
+test = 0.0
+"#,
+    );
+    let empty = ingest_cxr_dicom(&IngestConfig {
+        raw_root: raw.clone(),
+        recipe_path: empty_recipe,
+        labels_path: root.join("labels.csv"),
+        cache_dir: root.join("empty-cache"),
+        workdir: root.join("empty-work"),
+        report_path: root.join("empty-report.md"),
+        dry_run: false,
+        workers: 1,
+    })
+    .unwrap_err();
+    assert!(empty
+        .to_string()
+        .contains("filters removed all DICOM records"));
+    assert!(!root.join("empty-cache/cache-metadata.json").exists());
+}
+
+#[test]
 fn stratified_patient_split_balances_labels_and_metadata_without_leakage() {
     let root = unique_test_dir();
     let manifest = root.join("manifest.jsonl");
@@ -1523,21 +1908,57 @@ fn write_png(path: &Path, value: u8) {
     image.save(path).unwrap();
 }
 
+#[derive(Clone)]
+struct DicomFixtureSpec<'a> {
+    patient_id: &'a str,
+    study_uid: &'a str,
+    series_uid: &'a str,
+    sop_uid: &'a str,
+    modality: &'a str,
+    view_position: Option<&'a str>,
+    transfer_syntax: &'a str,
+    pixels: Vec<u8>,
+}
+
+impl Default for DicomFixtureSpec<'_> {
+    fn default() -> Self {
+        Self {
+            patient_id: "patient-1",
+            study_uid: "1.2.826.0.1",
+            series_uid: "1.2.826.0.1.99",
+            sop_uid: "1.2.826.0.1.1",
+            modality: "DX",
+            view_position: Some("PA"),
+            transfer_syntax: medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN,
+            pixels: vec![0, 64, 128, 255],
+        }
+    }
+}
+
 fn write_dicom_fixture(path: &Path, patient_id: &str, study_uid: &str, sop_uid: &str) {
+    write_dicom_fixture_custom(
+        path,
+        DicomFixtureSpec {
+            patient_id,
+            study_uid,
+            sop_uid,
+            ..DicomFixtureSpec::default()
+        },
+    );
+}
+
+fn write_dicom_fixture_custom(path: &Path, spec: DicomFixtureSpec<'_>) {
     let mut bytes = vec![0u8; 128];
     bytes.extend_from_slice(b"DICM");
-    push_text(
-        &mut bytes,
-        (0x0002, 0x0010),
-        "UI",
-        medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN,
-    );
-    push_text(&mut bytes, (0x0010, 0x0020), "LO", patient_id);
-    push_text(&mut bytes, (0x0020, 0x000D), "UI", study_uid);
-    push_text(&mut bytes, (0x0020, 0x000E), "UI", "1.2.826.0.1.99");
-    push_text(&mut bytes, (0x0008, 0x0018), "UI", sop_uid);
-    push_text(&mut bytes, (0x0008, 0x0060), "CS", "DX");
-    push_text(&mut bytes, (0x0018, 0x5101), "CS", "PA");
+    push_text(&mut bytes, (0x0002, 0x0010), "UI", spec.transfer_syntax);
+    push_text(&mut bytes, (0x0010, 0x0020), "LO", spec.patient_id);
+    push_text(&mut bytes, (0x0020, 0x000D), "UI", spec.study_uid);
+    push_text(&mut bytes, (0x0020, 0x000E), "UI", spec.series_uid);
+    push_text(&mut bytes, (0x0008, 0x0018), "UI", spec.sop_uid);
+    push_text(&mut bytes, (0x0008, 0x0060), "CS", spec.modality);
+    if let Some(view_position) = spec.view_position {
+        push_text(&mut bytes, (0x0018, 0x5101), "CS", view_position);
+    }
     push_text(&mut bytes, (0x0028, 0x0030), "DS", "0.5\\0.5");
     push_text(&mut bytes, (0x0028, 0x0004), "CS", "MONOCHROME2");
     push_u16(&mut bytes, (0x0028, 0x0002), 1);
@@ -1547,9 +1968,22 @@ fn write_dicom_fixture(path: &Path, patient_id: &str, study_uid: &str, sop_uid: 
     push_u16(&mut bytes, (0x0028, 0x0101), 8);
     push_u16(&mut bytes, (0x0028, 0x0102), 7);
     push_u16(&mut bytes, (0x0028, 0x0103), 0);
-    push_element(&mut bytes, (0x7FE0, 0x0010), "OB", vec![0, 64, 128, 255]);
+    push_element(&mut bytes, (0x7FE0, 0x0010), "OB", spec.pixels);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
+}
+
+fn write_recipe(path: &Path, text: &str) {
+    fs::write(path, text.trim_start()).unwrap();
+}
+
+fn rle_single_segment_pixels(raw: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0u8; 64];
+    bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&64u32.to_le_bytes());
+    bytes.push((raw.len() as u8).saturating_sub(1));
+    bytes.extend_from_slice(raw);
+    bytes
 }
 
 fn push_text(out: &mut Vec<u8>, tag: (u16, u16), vr: &str, value: &str) {
@@ -1667,6 +2101,8 @@ fn write_synthetic_cache(
         },
         transform_plan_hash: "hash".to_string(),
         transform_fingerprint: "hash".to_string(),
+        recipe_hash: String::new(),
+        recipe_path: String::new(),
         source_manifest_checksum: "manifest".to_string(),
         split_names: vec!["train".to_string()],
         image_size_policy: ImageSizePolicy {
@@ -1676,6 +2112,9 @@ fn write_synthetic_cache(
             dtype: "float32".to_string(),
             transform: "synthetic".to_string(),
         },
+        dicom_presentation_policy: DicomPresentationPolicy::default(),
+        transfer_syntax_policy: TransferSyntaxPolicy::default(),
+        split_policy: SplitPolicyMetadata::default(),
         splits: BTreeMap::from([("train".to_string(), split)]),
         failed_samples: Vec::new(),
         cache_size_bytes: directory_size(cache_dir).unwrap(),

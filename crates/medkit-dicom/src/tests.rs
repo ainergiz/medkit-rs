@@ -5,7 +5,10 @@ use std::{
 
 use crate::{
     parser::DicomDataSet,
-    pixel::{explain_pixels, present_dicom_pixels},
+    pixel::{
+        explain_pixels, present_dicom_pixels, present_dicom_pixels_with_backend,
+        NativeDecoderBackend,
+    },
     scan::write_scan_outputs,
     types::{
         DicomFileConfig, DicomScanConfig, DicomViewConfig, EXPLICIT_VR_BIG_ENDIAN,
@@ -263,6 +266,215 @@ fn pixel_errors_are_specific() {
 }
 
 #[test]
+fn rle_lossless_fixture_decodes_through_native_backend() {
+    let root = unique_test_dir();
+    let rle = root.join("rle.dcm");
+    write_fixture(
+        &rle,
+        FixtureSpec {
+            transfer_syntax: RLE_LOSSLESS,
+            pixels: rle_single_segment_pixels(&[0, 64, 128, 255]),
+            ..FixtureSpec::default()
+        },
+    );
+
+    let image = present_dicom_pixels(&rle).unwrap();
+    let image_with_backend =
+        present_dicom_pixels_with_backend(&rle, &NativeDecoderBackend).unwrap();
+    assert_eq!(image_with_backend.width, image.width);
+    assert_eq!(image.width, 2);
+    assert_eq!(image.height, 2);
+    assert!(image.explanation.compressed);
+    assert_eq!(image.explanation.decoder_backend, "medkit-native");
+    assert!(image
+        .explanation
+        .steps
+        .iter()
+        .any(|step| step.contains("RLE Lossless")));
+}
+
+#[test]
+fn parallel_scan_is_byte_stable_and_graph_summarizes_duplicates_and_warnings() {
+    let root = unique_test_dir();
+    write_fixture(
+        &root.join("b/second.dcm"),
+        FixtureSpec {
+            patient_id: "p2",
+            study_uid: "study-2",
+            series_uid: "series-2",
+            sop_uid: "duplicate-sop",
+            modality: "CR",
+            pixels: vec![0, 1, 2, 3],
+            ..FixtureSpec::default()
+        },
+    );
+    write_fixture(
+        &root.join("a/first.dcm"),
+        FixtureSpec {
+            patient_id: "p1",
+            study_uid: "study-1",
+            series_uid: "series-1",
+            sop_uid: "duplicate-sop",
+            modality: "DX",
+            rows: 2,
+            columns: 2,
+            pixels: vec![0, 1, 2, 3],
+            ..FixtureSpec::default()
+        },
+    );
+    write_fixture(
+        &root.join("a/third.dcm"),
+        FixtureSpec {
+            patient_id: "p1",
+            study_uid: "study-1",
+            series_uid: "series-1",
+            sop_uid: "third-sop",
+            modality: "CR",
+            rows: 2,
+            columns: 3,
+            pixels: vec![0, 1, 2, 3, 4, 5],
+            ..FixtureSpec::default()
+        },
+    );
+    fs::write(root.join("broken.dcm"), b"not a part10 file").unwrap();
+
+    let config = DicomScanConfig {
+        root: root.clone(),
+        out_path: root.join("scan.jsonl"),
+        report_path: root.join("scan.md"),
+    };
+    let (serial, serial_records) = scan_dicom(&config).unwrap();
+    let (parallel, mut parallel_records) = scan_dicom_with_workers(&config, 3).unwrap();
+    assert_eq!(parallel.records, serial.records);
+    assert_eq!(parallel.errors.len(), serial.errors.len());
+    assert_eq!(
+        parallel_records
+            .iter()
+            .map(|record| record.path.clone())
+            .collect::<Vec<_>>(),
+        serial_records
+            .iter()
+            .map(|record| record.path.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(parallel.duplicate_sop_instance_uids, 1);
+    assert_eq!(parallel.duplicate_pixel_hashes, 1);
+
+    parallel_records[2].series_instance_uid = None;
+    let graph = construct_dicom_graph(&root, &parallel_records);
+    assert_eq!(graph.patients, 2);
+    assert_eq!(graph.instances, 3);
+    assert_eq!(graph.duplicate_sop_instance_uids, 1);
+    assert_eq!(graph.duplicate_pixel_hashes, 1);
+    for code in [
+        "duplicate_sop_instance_uid",
+        "duplicate_pixel_hash",
+        "missing_series_instance_uid",
+        "mixed_modality",
+        "mixed_dimensions",
+    ] {
+        assert!(
+            graph.warnings.iter().any(|warning| warning.code == code),
+            "missing graph warning {code}"
+        );
+    }
+    let mut missing_sop_records = parallel_records.clone();
+    missing_sop_records[0].sop_instance_uid = None;
+    let missing_sop_graph = construct_dicom_graph(&root, &missing_sop_records);
+    assert!(missing_sop_graph
+        .warnings
+        .iter()
+        .any(|warning| warning.code == "missing_sop_instance_uid"));
+
+    let graph_json = root.join("nested-output/graph.json");
+    let graph_report = root.join("nested-output/graph.md");
+    write_graph_outputs(&graph, &graph_json, &graph_report).unwrap();
+    assert!(fs::read_to_string(graph_report)
+        .unwrap()
+        .contains("DICOM Graph Report"));
+    let graph_value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(graph_json).unwrap()).unwrap();
+    assert_eq!(graph_value["instances"], 3);
+
+    let blocked_graph_parent = root.join("blocked-graph-parent");
+    fs::write(&blocked_graph_parent, b"file blocks graph json").unwrap();
+    assert!(write_graph_outputs(
+        &graph,
+        blocked_graph_parent.join("graph.json"),
+        root.join("ok-report.md")
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("File exists"));
+    let blocked_report_parent = root.join("blocked-report-parent");
+    fs::write(&blocked_report_parent, b"file blocks graph report").unwrap();
+    assert!(write_graph_outputs(
+        &graph,
+        root.join("ok-graph.json"),
+        blocked_report_parent.join("graph.md")
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("File exists"));
+
+    let browsed = browse_dicom(&DicomBrowseConfig {
+        root: root.clone(),
+        group: vec![
+            "patient".to_string(),
+            "study".to_string(),
+            "series".to_string(),
+        ],
+        out_path: unique_test_dir().join("browse/graph.json"),
+        report_path: unique_test_dir().join("browse/graph.md"),
+        workers: 2,
+    })
+    .unwrap();
+    assert_eq!(browsed.instances, 3);
+
+    let blocked = root.join("blocked-parent");
+    fs::write(&blocked, b"file blocks output parent").unwrap();
+    assert!(browse_dicom(&DicomBrowseConfig {
+        root,
+        group: vec!["patient".to_string()],
+        out_path: blocked.join("graph.json"),
+        report_path: blocked.join("graph.md"),
+        workers: 1,
+    })
+    .unwrap_err()
+    .to_string()
+    .contains("File exists"));
+}
+
+#[test]
+fn optional_pydicom_fixtures_scan_browse_and_decode_real_rle_when_available() {
+    let root = Path::new("data/dicom-fixtures/pydicom");
+    if !root.exists() {
+        return;
+    }
+
+    let config = DicomScanConfig {
+        root: root.to_path_buf(),
+        out_path: unique_test_dir().join("pydicom-index.jsonl"),
+        report_path: unique_test_dir().join("pydicom-report.md"),
+    };
+    let (summary, records) = scan_dicom_with_workers(&config, 2).unwrap();
+    assert!(summary.records >= 6);
+    assert!(records
+        .iter()
+        .any(|record| record.transfer_syntax_uid == RLE_LOSSLESS));
+
+    let graph = construct_dicom_graph(root, &records);
+    assert!(graph.patients >= 2);
+    assert!(graph.duplicate_sop_instance_uids >= 1);
+
+    let rle = root.join("MR_small_RLE.dcm");
+    let image = present_dicom_pixels(&rle).unwrap();
+    assert_eq!(image.width, 64);
+    assert_eq!(image.height, 64);
+    assert!(image.explanation.compressed);
+}
+
+#[test]
 fn unicode_view_renders_metadata_and_validates_width() {
     let root = unique_test_dir();
     let path = root.join("view.dcm");
@@ -514,6 +726,15 @@ fn write_fixture(path: &Path, spec: FixtureSpec<'_>) {
     push_pixel_data(&mut bytes, &spec.pixels, implicit, be);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
+}
+
+fn rle_single_segment_pixels(raw: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0u8; 64];
+    bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&64u32.to_le_bytes());
+    bytes.push((raw.len() as u8).saturating_sub(1));
+    bytes.extend_from_slice(raw);
+    bytes
 }
 
 fn push_text(out: &mut Vec<u8>, tag: (u16, u16), vr: &str, value: &str, implicit: bool, be: bool) {

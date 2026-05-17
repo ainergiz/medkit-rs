@@ -55,6 +55,18 @@ pub struct ValidateCacheConfig {
     pub json_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub struct IngestConfig {
+    pub raw_root: PathBuf,
+    pub recipe_path: PathBuf,
+    pub labels_path: PathBuf,
+    pub cache_dir: PathBuf,
+    pub workdir: PathBuf,
+    pub report_path: PathBuf,
+    pub dry_run: bool,
+    pub workers: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CxrRecord {
     pub sample_id: String,
@@ -158,11 +170,21 @@ pub struct CacheSummary {
     #[serde(default)]
     pub transform_fingerprint: String,
     #[serde(default)]
+    pub recipe_hash: String,
+    #[serde(default)]
+    pub recipe_path: String,
+    #[serde(default)]
     pub source_manifest_checksum: String,
     #[serde(default)]
     pub split_names: Vec<String>,
     #[serde(default)]
     pub image_size_policy: ImageSizePolicy,
+    #[serde(default)]
+    pub dicom_presentation_policy: DicomPresentationPolicy,
+    #[serde(default)]
+    pub transfer_syntax_policy: TransferSyntaxPolicy,
+    #[serde(default)]
+    pub split_policy: SplitPolicyMetadata,
     pub splits: BTreeMap<String, CacheSplitSummary>,
     pub failed_samples: Vec<String>,
     pub cache_size_bytes: u64,
@@ -214,6 +236,72 @@ impl Default for ImageSizePolicy {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DicomPresentationPolicy {
+    pub apply_rescale: bool,
+    pub voi: String,
+    pub invert_monochrome1: bool,
+    pub output: String,
+    pub decoder_backend: String,
+    pub decoder_version: String,
+}
+
+impl Default for DicomPresentationPolicy {
+    fn default() -> Self {
+        Self {
+            apply_rescale: true,
+            voi: "auto".to_string(),
+            invert_monochrome1: true,
+            output: "mono8".to_string(),
+            decoder_backend: "medkit-native".to_string(),
+            decoder_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferSyntaxPolicy {
+    pub allow_transfer_syntaxes: Vec<String>,
+    pub unsupported_transfer_syntax: String,
+}
+
+impl Default for TransferSyntaxPolicy {
+    fn default() -> Self {
+        Self {
+            allow_transfer_syntaxes: vec![
+                medkit_dicom::IMPLICIT_VR_LITTLE_ENDIAN.to_string(),
+                medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+                medkit_dicom::EXPLICIT_VR_BIG_ENDIAN.to_string(),
+                medkit_dicom::RLE_LOSSLESS.to_string(),
+            ],
+            unsupported_transfer_syntax: "fail".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SplitPolicyMetadata {
+    pub by: String,
+    pub train: f64,
+    pub val: f64,
+    pub test: f64,
+    pub stratify: Vec<String>,
+    pub seed: u64,
+}
+
+impl Default for SplitPolicyMetadata {
+    fn default() -> Self {
+        Self {
+            by: "patient_id".to_string(),
+            train: 0.8,
+            val: 0.1,
+            test: 0.1,
+            stratify: Vec::new(),
+            seed: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Normalization {
     pub mean: f32,
@@ -245,8 +333,93 @@ pub struct CacheValidationSummary {
     pub checked_splits: Vec<String>,
     pub image_size_policy: ImageSizePolicy,
     pub transform_fingerprint: String,
+    pub recipe_hash: String,
     pub source_manifest_checksum: String,
     pub cache_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestPaths {
+    pub recipe: String,
+    pub raw_dicom_root: String,
+    pub labels: String,
+    pub workdir: String,
+    pub dicom_index: String,
+    pub dicom_scan_report: String,
+    pub recipe_dicom_index: String,
+    pub manifest: String,
+    pub validation_report: String,
+    pub splits: String,
+    pub cache_dir: String,
+    pub cache_validation_report: String,
+    pub cache_validation_json: String,
+    pub ingest_report: String,
+    pub ingest_summary_json: String,
+    pub resume_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestSummary {
+    pub dry_run: bool,
+    pub status: String,
+    pub recipe_name: String,
+    pub recipe_hash: String,
+    pub paths: IngestPaths,
+    pub planned_actions: Vec<String>,
+    pub validation_rules: Vec<String>,
+    pub counts: IngestCounts,
+    pub modality_distribution: BTreeMap<String, usize>,
+    pub view_position_distribution: BTreeMap<String, usize>,
+    pub transfer_syntax_distribution: BTreeMap<String, usize>,
+    pub rows_summary: NumericSummary,
+    pub columns_summary: NumericSummary,
+    pub pixel_spacing_summary: PixelSpacingSummary,
+    pub missing_identifier_counts: BTreeMap<String, usize>,
+    pub missing_label_counts: BTreeMap<String, usize>,
+    pub label_distribution: BTreeMap<String, LabelCount>,
+    pub label_distribution_by_split: BTreeMap<String, BTreeMap<String, LabelCount>>,
+    pub patient_counts_by_split: BTreeMap<String, usize>,
+    pub patient_overlap_count: usize,
+    pub skipped_samples: Vec<IngestSampleIssue>,
+    pub failed_preprocessing_samples: Vec<String>,
+    pub scan_error_counts: BTreeMap<String, usize>,
+    pub warning_counts: BTreeMap<String, usize>,
+    pub duplicate_sop_instance_uid_count: usize,
+    pub duplicate_pixel_hash_count: usize,
+    pub cache_transform_fingerprint: String,
+    pub cache_validation_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IngestCounts {
+    pub patients: usize,
+    pub studies: usize,
+    pub series: usize,
+    pub images: usize,
+    pub dicom_records_scanned: usize,
+    pub manifest_records: usize,
+    pub unsupported_or_skipped_images: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NumericSummary {
+    pub count: usize,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub mean: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PixelSpacingSummary {
+    pub row_spacing: NumericSummary,
+    pub column_spacing: NumericSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestSampleIssue {
+    pub path: String,
+    pub reason: String,
+    pub code: String,
 }
 
 #[derive(Debug, Clone)]

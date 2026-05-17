@@ -558,3 +558,97 @@ pub fn read_manifest(path: &Path) -> Result<Vec<CxrRecord>, CxrError> {
     }
     Ok(records)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn dicom_index_fallbacks_blank_lines_and_hash_fallback_are_covered() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        let dicom_path = root.join("Patient One:Study.dcm");
+        fs::write(&dicom_path, b"pixels").unwrap();
+        let index_path = root.join("dicom-index.jsonl");
+        let record = dicom_record(&dicom_path);
+        fs::write(
+            &index_path,
+            format!("\n{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+        let config = IndexConfig {
+            images_root: root.clone(),
+            dicom_index_path: Some(index_path.clone()),
+            metadata_path: None,
+            labels_path: None,
+            reports_root: Some(root.join("reports")),
+            out_path: root.join("manifest.jsonl"),
+        };
+
+        let records = records_from_dicom_index(&index_path, &HashMap::new(), &config).unwrap();
+        assert_eq!(records[0].image_id, "Patient One:Study");
+        assert_eq!(records[0].patient_id, "Patient One:Study");
+        assert!(records[0].sample_id.contains("Patient_One_Study"));
+        assert!(records[0]
+            .report_path
+            .as_deref()
+            .unwrap()
+            .contains("unknown-study"));
+
+        assert_eq!(read_dicom_index(&index_path).unwrap().len(), 1);
+        assert_eq!(manifest_component(""), "unknown");
+        assert_eq!(duplicate_hash(&records[0]).unwrap(), "pixel");
+        let mut no_hash = records[0].clone();
+        no_hash.pixel_hash = None;
+        no_hash.sha256 = None;
+        no_hash.source_format = "png".to_string();
+        assert_eq!(duplicate_hash(&no_hash).unwrap().len(), 64);
+    }
+
+    fn dicom_record(path: &Path) -> DicomInventoryRecord {
+        DicomInventoryRecord {
+            path: path.display().to_string(),
+            sha256: "sha".to_string(),
+            patient_id: None,
+            study_instance_uid: None,
+            series_instance_uid: Some("series".to_string()),
+            sop_instance_uid: None,
+            modality: Some("CR".to_string()),
+            body_part_examined: None,
+            view_position: Some("PA".to_string()),
+            laterality: None,
+            rows: Some(4),
+            columns: Some(4),
+            samples_per_pixel: Some(1),
+            bits_allocated: Some(8),
+            bits_stored: Some(8),
+            high_bit: Some(7),
+            pixel_representation: Some("unsigned".to_string()),
+            photometric_interpretation: Some("MONOCHROME2".to_string()),
+            transfer_syntax_uid: medkit_dicom::EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+            pixel_spacing: None,
+            imager_pixel_spacing: None,
+            rescale_intercept: None,
+            rescale_slope: None,
+            window_center: None,
+            window_width: None,
+            pixel_hash: Some("pixel".to_string()),
+            decoder_backend: None,
+            decoder_version: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn unique_test_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "medkit-cxr-manifest-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+}

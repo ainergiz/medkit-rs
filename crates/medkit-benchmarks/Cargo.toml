@@ -30,6 +30,7 @@ harness = false
 [dependencies]
 medkit-bench = { path = "../medkit-bench" }
 medkit-cache = { path = "../medkit-cache" }
+medkit-cxr = { path = "../medkit-cxr" }
 medkit-dataset = { path = "../medkit-dataset" }
 medkit-sampler = { path = "../medkit-sampler" }
 medkit-transform = { path = "../medkit-transform" }

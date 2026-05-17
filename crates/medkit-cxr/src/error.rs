@@ -60,3 +60,15 @@ impl From<toml::de::Error> for CxrError {
         Self::Toml(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dicom_error_display_and_conversion_are_covered() {
+        let dicom = medkit_dicom::inspect_dicom_file("definitely-missing.dcm").unwrap_err();
+        let error = CxrError::from(dicom);
+        assert!(!error.to_string().is_empty());
+    }
+}

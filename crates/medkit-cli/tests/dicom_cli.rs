@@ -123,6 +123,62 @@ fn dicom_cli_scans_inspects_explains_and_views_fixture() {
         root.join("plan.toml").to_str().unwrap(),
     ]);
     assert!(validation.stdout.contains("Status: ok"));
+
+    let graph = root.join("graph.json");
+    let graph_report = root.join("graph.md");
+    let browse = run_medkit([
+        "dicom",
+        "browse",
+        dicoms.to_str().unwrap(),
+        "--group",
+        "patient,study,series",
+        "--out",
+        graph.to_str().unwrap(),
+        "--report",
+        graph_report.to_str().unwrap(),
+        "--workers",
+        "2",
+    ]);
+    assert!(browse.stdout.contains("Instances: 1"));
+    let graph_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(graph).unwrap()).unwrap();
+    assert_eq!(graph_json["instances"], 1);
+    assert!(fs::read_to_string(graph_report)
+        .unwrap()
+        .contains("DICOM Graph Report"));
+
+    fs::write(
+        root.join("recipe.toml"),
+        "name = \"cxr-dicom-cli-ingest\"\n[dicom]\nmodalities = [\"DX\"]\nviews = [\"PA\"]\nallow_transfer_syntaxes = [\"1.2.840.10008.1.2.1\"]\nunsupported_transfer_syntax = \"fail\"\n[image]\nsize = [4, 4]\n[labels]\ntargets = [\"Pneumonia\"]\nmissing = \"ignore\"\nuncertain = \"ignore\"\n[split]\nby = \"patient_id\"\ntrain = 1.0\nval = 0.0\ntest = 0.0\nseed = 0\n",
+    )
+    .unwrap();
+    let ingest_cache = root.join("ingest-cache");
+    let ingest_work = root.join("ingest-work");
+    let ingest_report = root.join("ingest-report.md");
+    let ingest = run_medkit([
+        "cxr",
+        "ingest",
+        dicoms.to_str().unwrap(),
+        "--recipe",
+        root.join("recipe.toml").to_str().unwrap(),
+        "--labels",
+        root.join("labels.csv").to_str().unwrap(),
+        "--cache",
+        ingest_cache.to_str().unwrap(),
+        "--workdir",
+        ingest_work.to_str().unwrap(),
+        "--report",
+        ingest_report.to_str().unwrap(),
+        "--workers",
+        "2",
+    ]);
+    assert!(ingest.stdout.contains("CXR ingest status: ok"));
+    assert!(ingest_cache.join("cache-metadata.json").exists());
+    assert!(ingest_work.join("dicom-index.jsonl").exists());
+    assert!(ingest_work.join("ingestion-summary.json").exists());
+    assert!(fs::read_to_string(ingest_report)
+        .unwrap()
+        .contains("cache validation status: ok"));
 }
 
 #[test]
@@ -131,7 +187,25 @@ fn dicom_cli_reports_usage_and_render_errors() {
     assert!(missing_action.stderr.contains("Usage:"));
 
     let unknown = run_medkit_fail(["dicom", "browse"]);
-    assert!(unknown.stderr.contains("unknown dicom command"));
+    assert!(unknown.stderr.contains("Usage:"));
+
+    let browse_missing_out = run_medkit_fail(["dicom", "browse", ".", "--report", "graph.md"]);
+    assert!(browse_missing_out.stderr.contains("missing --out"));
+
+    let browse_bad_workers = run_medkit_fail([
+        "dicom",
+        "browse",
+        ".",
+        "--out",
+        "graph.json",
+        "--report",
+        "graph.md",
+        "--workers",
+        "many",
+    ]);
+    assert!(browse_bad_workers
+        .stderr
+        .contains("invalid integer for --workers: many"));
 
     let missing_scan_output = run_medkit_fail(["dicom", "scan", "."]);
     assert!(missing_scan_output.stderr.contains("missing --out"));

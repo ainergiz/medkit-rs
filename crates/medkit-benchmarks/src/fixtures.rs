@@ -1,17 +1,24 @@
 use std::{
-    fs,
+    collections::BTreeMap,
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use medkit_cache::{prepare_cache, CacheManifest, PrepareConfig};
+use medkit_cxr::{split_cxr, CxrRecord, SplitConfig};
 use medkit_dataset::{validate_dataset, write_manifest_json, write_report, ValidationConfig};
 use medkit_sampler::{ForegroundPrefix, LoadedCachedCase};
 use medkit_transform::{TransformPlan, Volume3D, VolumeGeometry};
+use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
 const HEADER_LEN: usize = 348;
+
+/// Canonical CXR manifest sizes used for scale fixture runs.
+pub const CXR_MANIFEST_SCALE_RECORD_COUNTS: [usize; 3] = [1_000, 10_000, 100_000];
 
 /// Configuration for a synthetic nnU-Net-shaped CT segmentation fixture.
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +89,353 @@ pub fn temp_fixture_root(name: &str) -> PathBuf {
         "medkit-benchmarks-{name}-{}-{nanos}",
         std::process::id()
     ))
+}
+
+/// Configuration for a synthetic CXR DICOM manifest scale fixture.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CxrManifestScaleConfig {
+    /// Root directory that will contain the manifest, split file, and report artifacts.
+    pub root: PathBuf,
+    /// Number of manifest records to generate.
+    pub records: usize,
+    /// Label targets to include in each synthetic record.
+    pub targets: Vec<String>,
+    /// Image size in width, height order.
+    pub image_size: [u32; 2],
+    /// Train split ratio.
+    pub train: f64,
+    /// Validation split ratio.
+    pub val: f64,
+    /// Test split ratio.
+    pub test: f64,
+    /// Patient-level split seed.
+    pub seed: u64,
+}
+
+impl CxrManifestScaleConfig {
+    /// Creates a CXR scale fixture config with benchmark-friendly defaults.
+    pub fn new(root: impl Into<PathBuf>, records: usize) -> Self {
+        Self {
+            root: root.into(),
+            records,
+            targets: vec!["Pneumonia".to_string(), "No Finding".to_string()],
+            image_size: [512, 512],
+            train: 0.8,
+            val: 0.1,
+            test: 0.1,
+            seed: 0,
+        }
+    }
+}
+
+/// Paths and workload dimensions produced for a CXR manifest scale fixture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CxrManifestScaleFixture {
+    /// Root directory.
+    pub root: PathBuf,
+    /// JSONL CXR manifest path.
+    pub manifest_path: PathBuf,
+    /// Patient-level split file path.
+    pub splits_path: PathBuf,
+    /// Default benchmark report path.
+    pub report_path: PathBuf,
+    /// Number of manifest records.
+    pub records: usize,
+    /// Number of synthetic patients.
+    pub patients: usize,
+    /// Label targets included in the fixture.
+    pub targets: Vec<String>,
+    /// Image size in width, height order.
+    pub image_size: [u32; 2],
+}
+
+/// Timings and byte counts measured by a CXR scale benchmark run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CxrScaleBenchmarkMetrics {
+    /// DICOM records scanned.
+    pub scan_records: usize,
+    /// Scan elapsed wall time in milliseconds.
+    pub scan_elapsed_ms: f64,
+    /// Images preprocessed into cache tensors.
+    pub preprocessed_images: usize,
+    /// Preprocessing elapsed wall time in milliseconds.
+    pub preprocessing_elapsed_ms: f64,
+    /// Final cache size in bytes.
+    pub cache_size_bytes: u64,
+    /// Cache or manifest validation elapsed wall time in milliseconds.
+    pub validation_elapsed_ms: f64,
+    /// Python batches read.
+    pub python_batches: usize,
+    /// Python samples read.
+    pub python_samples: usize,
+    /// Python batch-read elapsed wall time in milliseconds.
+    pub python_elapsed_ms: f64,
+}
+
+/// JSON benchmark report for CXR DICOM/manifest scale runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CxrScaleBenchmarkReport {
+    /// Report schema version.
+    pub schema_version: u32,
+    /// Workload dimensions and artifact paths.
+    pub workload: CxrScaleWorkload,
+    /// DICOM scan throughput.
+    pub scan: CxrScanThroughput,
+    /// Preprocessing/cache-build throughput.
+    pub preprocessing: CxrPreprocessingThroughput,
+    /// Final cache size in bytes.
+    pub cache_size_bytes: u64,
+    /// Validation timing.
+    pub validation: CxrValidationTiming,
+    /// Python batch-read throughput.
+    pub python_batch: CxrPythonBatchThroughput,
+}
+
+/// Workload dimensions and artifact paths in a CXR scale benchmark report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CxrScaleWorkload {
+    /// Number of manifest records.
+    pub records: usize,
+    /// Number of synthetic patients.
+    pub patients: usize,
+    /// Image size in width, height order.
+    pub image_size: [u32; 2],
+    /// Label targets.
+    pub targets: Vec<String>,
+    /// JSONL CXR manifest path.
+    pub manifest_path: String,
+    /// Patient-level split file path.
+    pub splits_path: String,
+}
+
+/// DICOM scan throughput metric.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CxrScanThroughput {
+    /// Records scanned.
+    pub records: usize,
+    /// Elapsed wall time in milliseconds.
+    pub elapsed_ms: f64,
+    /// Records scanned per second.
+    pub records_per_second: f64,
+}
+
+/// CXR preprocessing throughput metric.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CxrPreprocessingThroughput {
+    /// Images preprocessed.
+    pub images: usize,
+    /// Elapsed wall time in milliseconds.
+    pub elapsed_ms: f64,
+    /// Images preprocessed per second.
+    pub images_per_second: f64,
+}
+
+/// Validation elapsed-time metric.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CxrValidationTiming {
+    /// Elapsed wall time in milliseconds.
+    pub elapsed_ms: f64,
+}
+
+/// Python cache batch-read throughput metric.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CxrPythonBatchThroughput {
+    /// Batches read from Python.
+    pub batches: usize,
+    /// Samples read from Python.
+    pub samples: usize,
+    /// Elapsed wall time in milliseconds.
+    pub elapsed_ms: f64,
+    /// Python batches read per second.
+    pub batches_per_second: f64,
+    /// Python samples read per second.
+    pub samples_per_second: f64,
+}
+
+/// Generates a synthetic CXR manifest and deterministic patient-level splits.
+pub fn create_cxr_manifest_scale_fixture(
+    config: &CxrManifestScaleConfig,
+) -> Result<CxrManifestScaleFixture> {
+    validate_cxr_manifest_scale_config(config)?;
+    fs::create_dir_all(&config.root)?;
+    let manifest_path = config.root.join("cxr-manifest.jsonl");
+    let splits_path = config.root.join("cxr-splits.json");
+    let report_path = config.root.join("cxr-scale-benchmark-report.json");
+
+    write_cxr_scale_manifest(&manifest_path, config)?;
+    split_cxr(&SplitConfig {
+        manifest_path: manifest_path.clone(),
+        by: "patient_id".to_string(),
+        train: config.train,
+        val: config.val,
+        test: config.test,
+        stratify: Vec::new(),
+        out_path: splits_path.clone(),
+        seed: config.seed,
+    })?;
+
+    Ok(CxrManifestScaleFixture {
+        root: config.root.clone(),
+        manifest_path,
+        splits_path,
+        report_path,
+        records: config.records,
+        patients: cxr_scale_patient_count(config.records),
+        targets: config.targets.clone(),
+        image_size: config.image_size,
+    })
+}
+
+/// Builds a JSON report for measured CXR DICOM/manifest scale metrics.
+pub fn cxr_scale_benchmark_report(
+    fixture: &CxrManifestScaleFixture,
+    metrics: CxrScaleBenchmarkMetrics,
+) -> CxrScaleBenchmarkReport {
+    CxrScaleBenchmarkReport {
+        schema_version: 1,
+        workload: CxrScaleWorkload {
+            records: fixture.records,
+            patients: fixture.patients,
+            image_size: fixture.image_size,
+            targets: fixture.targets.clone(),
+            manifest_path: fixture.manifest_path.display().to_string(),
+            splits_path: fixture.splits_path.display().to_string(),
+        },
+        scan: CxrScanThroughput {
+            records: metrics.scan_records,
+            elapsed_ms: metrics.scan_elapsed_ms,
+            records_per_second: per_second(metrics.scan_records, metrics.scan_elapsed_ms),
+        },
+        preprocessing: CxrPreprocessingThroughput {
+            images: metrics.preprocessed_images,
+            elapsed_ms: metrics.preprocessing_elapsed_ms,
+            images_per_second: per_second(
+                metrics.preprocessed_images,
+                metrics.preprocessing_elapsed_ms,
+            ),
+        },
+        cache_size_bytes: metrics.cache_size_bytes,
+        validation: CxrValidationTiming {
+            elapsed_ms: metrics.validation_elapsed_ms,
+        },
+        python_batch: CxrPythonBatchThroughput {
+            batches: metrics.python_batches,
+            samples: metrics.python_samples,
+            elapsed_ms: metrics.python_elapsed_ms,
+            batches_per_second: per_second(metrics.python_batches, metrics.python_elapsed_ms),
+            samples_per_second: per_second(metrics.python_samples, metrics.python_elapsed_ms),
+        },
+    }
+}
+
+/// Writes a CXR scale benchmark report as pretty JSON.
+pub fn write_cxr_scale_benchmark_report(
+    path: &Path,
+    report: &CxrScaleBenchmarkReport,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(report)?)?;
+    Ok(())
+}
+
+fn validate_cxr_manifest_scale_config(config: &CxrManifestScaleConfig) -> Result<()> {
+    if config.records == 0 {
+        return Err("records must be greater than zero".into());
+    }
+    if config.targets.is_empty() {
+        return Err("targets must contain at least one label target".into());
+    }
+    if config.targets.iter().any(|target| target.trim().is_empty()) {
+        return Err("targets must not contain empty names".into());
+    }
+    if config.image_size.contains(&0) {
+        return Err(format!("image_size must be non-zero, got {:?}", config.image_size).into());
+    }
+    let ratio_sum = config.train + config.val + config.test;
+    if !ratio_sum.is_finite() || (ratio_sum - 1.0).abs() > 1.0e-6 {
+        return Err(format!("train+val+test must equal 1.0, got {ratio_sum}").into());
+    }
+    Ok(())
+}
+
+fn write_cxr_scale_manifest(path: &Path, config: &CxrManifestScaleConfig) -> Result<()> {
+    let mut file = File::create(path)?;
+    for index in 0..config.records {
+        let record = synthetic_cxr_scale_record(config, index);
+        serde_json::to_writer(&mut file, &record)?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn synthetic_cxr_scale_record(config: &CxrManifestScaleConfig, index: usize) -> CxrRecord {
+    let patient_index = index / 2;
+    let study_index = index / 2;
+    let series_index = index / 4;
+    let image_id = format!("synthetic-cxr-{index:08}");
+    let patient_id = format!("synthetic-patient-{patient_index:06}");
+    let study_id = format!("synthetic-study-{study_index:06}");
+    let sample_id = format!("{patient_id}/{study_id}/{image_id}");
+    let image_path = config
+        .root
+        .join("raw-dicom")
+        .join(&patient_id)
+        .join(format!("{image_id}.dcm"))
+        .display()
+        .to_string();
+    CxrRecord {
+        sample_id,
+        patient_id,
+        study_id,
+        image_id,
+        image_path,
+        source_format: "dicom".to_string(),
+        modality: Some(if index % 3 == 0 { "DX" } else { "CR" }.to_string()),
+        view_position: Some(if index % 2 == 0 { "PA" } else { "AP" }.to_string()),
+        laterality: Some(if index % 2 == 0 { "L" } else { "R" }.to_string()),
+        width: Some(config.image_size[0]),
+        height: Some(config.image_size[1]),
+        photometric_interpretation: Some("MONOCHROME2".to_string()),
+        series_instance_uid: Some(format!("1.2.826.0.1.3680043.10.5432.1.{series_index}")),
+        sop_instance_uid: Some(format!("1.2.826.0.1.3680043.10.5432.2.{index}")),
+        transfer_syntax_uid: Some("1.2.840.10008.1.2.1".to_string()),
+        pixel_hash: Some(format!("synthetic-pixel-hash-{index:016x}")),
+        labels: synthetic_cxr_scale_labels(&config.targets, index),
+        label_source: Some("synthetic-scale-fixture".to_string()),
+        report_path: None,
+        split: None,
+        sha256: Some(format!("synthetic-dicom-hash-{index:016x}")),
+    }
+}
+
+fn synthetic_cxr_scale_labels(targets: &[String], index: usize) -> BTreeMap<String, Option<i8>> {
+    targets
+        .iter()
+        .enumerate()
+        .map(|(target_index, target)| {
+            let value = match (index + target_index) % 5 {
+                0 => Some(1),
+                1 | 2 => Some(0),
+                3 => Some(-1),
+                _ => None,
+            };
+            (target.clone(), value)
+        })
+        .collect()
+}
+
+fn cxr_scale_patient_count(records: usize) -> usize {
+    records.div_ceil(2)
+}
+
+fn per_second(items: usize, elapsed_ms: f64) -> f64 {
+    if items == 0 || !elapsed_ms.is_finite() || elapsed_ms <= 0.0 {
+        0.0
+    } else {
+        items as f64 / (elapsed_ms / 1000.0)
+    }
 }
 
 /// Generates synthetic image/label NIfTI files and a transform plan.

@@ -3,7 +3,13 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{parser::DicomDataSet, DicomError, Result};
+use crate::{
+    parser::DicomDataSet,
+    types::{
+        EXPLICIT_VR_BIG_ENDIAN, EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN, RLE_LOSSLESS,
+    },
+    DicomError, Result,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PixelExplanation {
@@ -14,6 +20,9 @@ pub struct PixelExplanation {
     pub photometric_interpretation: String,
     pub source_pixel_hash: String,
     pub presented_pixel_hash: String,
+    pub decoder_backend: String,
+    pub decoder_version: String,
+    pub compressed: bool,
     pub min_value: f32,
     pub max_value: f32,
     pub steps: Vec<String>,
@@ -27,6 +36,112 @@ pub struct PresentedImage {
     pub explanation: PixelExplanation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPixelData {
+    pub bytes: Vec<u8>,
+    pub source_pixel_hash: String,
+    pub backend: String,
+    pub backend_version: String,
+    pub compressed: bool,
+    pub steps: Vec<String>,
+}
+
+pub trait DecoderBackend {
+    fn name(&self) -> &'static str;
+    fn version(&self) -> &'static str;
+    fn supports_transfer_syntax(&self, transfer_syntax_uid: &str) -> bool;
+    fn decode_pixels(
+        &self,
+        dataset: &DicomDataSet,
+        expected_bytes: usize,
+    ) -> Result<DecodedPixelData>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NativeDecoderBackend;
+
+impl DecoderBackend for NativeDecoderBackend {
+    fn name(&self) -> &'static str {
+        "medkit-native"
+    }
+
+    fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn supports_transfer_syntax(&self, transfer_syntax_uid: &str) -> bool {
+        matches!(
+            transfer_syntax_uid,
+            EXPLICIT_VR_LITTLE_ENDIAN
+                | IMPLICIT_VR_LITTLE_ENDIAN
+                | EXPLICIT_VR_BIG_ENDIAN
+                | RLE_LOSSLESS
+        )
+    }
+
+    fn decode_pixels(
+        &self,
+        dataset: &DicomDataSet,
+        expected_bytes: usize,
+    ) -> Result<DecodedPixelData> {
+        let pixel_data = dataset
+            .element((0x7FE0, 0x0010))
+            .ok_or_else(|| DicomError::parse(&dataset.path, "missing PixelData"))?;
+        if !self.supports_transfer_syntax(&dataset.transfer_syntax_uid) {
+            return Err(DicomError::unsupported(
+                &dataset.path,
+                format!(
+                    "unsupported transfer syntax {}",
+                    dataset.transfer_syntax_uid
+                ),
+            ));
+        }
+        let source_pixel_hash = sha256_hex(pixel_data);
+        if dataset.transfer_syntax_uid == RLE_LOSSLESS {
+            let bits_allocated = dataset.u16_value((0x0028, 0x0100)).unwrap_or(8);
+            let samples_per_pixel = dataset.u16_value((0x0028, 0x0002)).unwrap_or(1);
+            let bytes = decode_rle_lossless(
+                pixel_data,
+                expected_bytes,
+                bits_allocated,
+                samples_per_pixel,
+                &dataset.path,
+            )?;
+            return Ok(DecodedPixelData {
+                bytes,
+                source_pixel_hash,
+                backend: self.name().to_string(),
+                backend_version: self.version().to_string(),
+                compressed: true,
+                steps: vec![
+                    format!("decode transfer syntax {}", dataset.transfer_syntax_uid),
+                    "decode RLE Lossless pixel segment".to_string(),
+                ],
+            });
+        }
+        if pixel_data.len() != expected_bytes {
+            return Err(DicomError::parse(
+                &dataset.path,
+                format!(
+                    "PixelData length mismatch: expected {expected_bytes} bytes, got {}",
+                    pixel_data.len()
+                ),
+            ));
+        }
+        Ok(DecodedPixelData {
+            bytes: pixel_data.to_vec(),
+            source_pixel_hash,
+            backend: self.name().to_string(),
+            backend_version: self.version().to_string(),
+            compressed: false,
+            steps: vec![format!(
+                "decode transfer syntax {}",
+                dataset.transfer_syntax_uid
+            )],
+        })
+    }
+}
+
 pub fn explain_pixels(path: impl AsRef<Path>) -> Result<PixelExplanation> {
     Ok(present_dicom_pixels(path)?.explanation)
 }
@@ -36,16 +151,22 @@ pub fn present_dicom_pixels(path: impl AsRef<Path>) -> Result<PresentedImage> {
     present_dataset_pixels(&dataset)
 }
 
+pub fn present_dicom_pixels_with_backend(
+    path: impl AsRef<Path>,
+    backend: &dyn DecoderBackend,
+) -> Result<PresentedImage> {
+    let dataset = DicomDataSet::from_file(path.as_ref())?;
+    present_dataset_pixels_with_backend(&dataset, backend)
+}
+
 pub(crate) fn present_dataset_pixels(dataset: &DicomDataSet) -> Result<PresentedImage> {
-    if !dataset.is_supported_transfer_syntax() {
-        return Err(DicomError::unsupported(
-            &dataset.path,
-            format!(
-                "unsupported transfer syntax {}",
-                dataset.transfer_syntax_uid
-            ),
-        ));
-    }
+    present_dataset_pixels_with_backend(dataset, &NativeDecoderBackend)
+}
+
+pub(crate) fn present_dataset_pixels_with_backend(
+    dataset: &DicomDataSet,
+    backend: &dyn DecoderBackend,
+) -> Result<PresentedImage> {
     let rows = required_u16(dataset, (0x0028, 0x0010), "Rows")? as usize;
     let columns = required_u16(dataset, (0x0028, 0x0011), "Columns")? as usize;
     if rows == 0 || columns == 0 {
@@ -72,26 +193,15 @@ pub(crate) fn present_dataset_pixels(dataset: &DicomDataSet) -> Result<Presented
         ));
     }
     let signed = dataset.u16_value((0x0028, 0x0103)).unwrap_or(0) != 0;
-    let pixel_data = dataset
-        .element((0x7FE0, 0x0010))
-        .ok_or_else(|| DicomError::parse(&dataset.path, "missing PixelData"))?;
     let expected = rows * columns * (bits_allocated as usize).div_ceil(8);
-    if pixel_data.len() != expected {
-        return Err(DicomError::parse(
-            &dataset.path,
-            format!(
-                "PixelData length mismatch: expected {expected} bytes, got {}",
-                pixel_data.len()
-            ),
-        ));
-    }
+    let decoded = backend.decode_pixels(dataset, expected)?;
 
-    let mut steps = vec![
-        format!("decode transfer syntax {}", dataset.transfer_syntax_uid),
-        format!("unpack {bits_allocated}-bit pixels with {bits_stored} stored bits"),
-    ];
+    let mut steps = decoded.steps.clone();
+    steps.push(format!(
+        "unpack {bits_allocated}-bit pixels with {bits_stored} stored bits"
+    ));
     let mut values = unpack_pixels(
-        pixel_data,
+        &decoded.bytes,
         bits_allocated,
         bits_stored,
         signed,
@@ -135,8 +245,11 @@ pub(crate) fn present_dataset_pixels(dataset: &DicomDataSet) -> Result<Presented
         height: rows,
         transfer_syntax_uid: dataset.transfer_syntax_uid.clone(),
         photometric_interpretation: photometric,
-        source_pixel_hash: sha256_hex(pixel_data),
+        source_pixel_hash: decoded.source_pixel_hash,
         presented_pixel_hash: sha256_hex(&pixels),
+        decoder_backend: decoded.backend,
+        decoder_version: decoded.backend_version,
+        compressed: decoded.compressed,
         min_value,
         max_value,
         steps,
@@ -147,6 +260,128 @@ pub(crate) fn present_dataset_pixels(dataset: &DicomDataSet) -> Result<Presented
         pixels,
         explanation,
     })
+}
+
+fn decode_rle_lossless(
+    pixel_data: &[u8],
+    expected_bytes: usize,
+    bits_allocated: u16,
+    samples_per_pixel: u16,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    if pixel_data.len() < 64 {
+        return Err(DicomError::parse(
+            path,
+            "RLE Lossless PixelData is shorter than the 64-byte RLE header",
+        ));
+    }
+    let segments =
+        u32::from_le_bytes([pixel_data[0], pixel_data[1], pixel_data[2], pixel_data[3]]) as usize;
+    if segments == 0 || segments > 15 {
+        return Err(DicomError::parse(
+            path,
+            format!("invalid RLE segment count {segments}"),
+        ));
+    }
+    let bytes_per_sample = (bits_allocated as usize).div_ceil(8);
+    let expected_segments = bytes_per_sample
+        .checked_mul(samples_per_pixel as usize)
+        .ok_or_else(|| DicomError::parse(path, "RLE segment count overflow"))?;
+    if segments != expected_segments {
+        return Err(DicomError::unsupported(
+            path,
+            format!(
+                "RLE Lossless expected {expected_segments} segment(s) for {bits_allocated}-bit {}-sample pixels, got {segments}",
+                samples_per_pixel
+            ),
+        ));
+    }
+    let pixels = expected_bytes
+        .checked_div(bytes_per_sample.max(1))
+        .ok_or_else(|| DicomError::parse(path, "invalid RLE expected byte count"))?;
+    let mut offsets = Vec::with_capacity(segments);
+    for segment in 0..segments {
+        let header_offset = 4 + segment * 4;
+        let offset = u32::from_le_bytes([
+            pixel_data[header_offset],
+            pixel_data[header_offset + 1],
+            pixel_data[header_offset + 2],
+            pixel_data[header_offset + 3],
+        ]) as usize;
+        if offset < 64 || offset > pixel_data.len() {
+            return Err(DicomError::parse(
+                path,
+                format!("invalid RLE segment offset {offset}"),
+            ));
+        }
+        offsets.push(offset);
+    }
+    let mut planes = Vec::with_capacity(segments);
+    for (index, offset) in offsets.iter().copied().enumerate() {
+        let end = offsets.get(index + 1).copied().unwrap_or(pixel_data.len());
+        if end < offset {
+            return Err(DicomError::parse(
+                path,
+                "RLE segment offsets must be increasing",
+            ));
+        }
+        let plane = decode_packbits_segment(&pixel_data[offset..end], pixels, path)?;
+        if plane.len() != pixels {
+            return Err(DicomError::parse(
+                path,
+                format!(
+                    "RLE decoded segment length mismatch: expected {pixels} bytes, got {}",
+                    plane.len()
+                ),
+            ));
+        }
+        planes.push(plane);
+    }
+    let mut decoded = Vec::with_capacity(expected_bytes);
+    for pixel in 0..pixels {
+        for byte_index in (0..bytes_per_sample).rev() {
+            decoded.push(planes[byte_index][pixel]);
+        }
+    }
+    if decoded.len() != expected_bytes {
+        return Err(DicomError::parse(
+            path,
+            format!(
+                "RLE decoded length mismatch: expected {expected_bytes} bytes, got {}",
+                decoded.len()
+            ),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn decode_packbits_segment(segment: &[u8], expected_bytes: usize, path: &Path) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(expected_bytes);
+    let mut cursor = 0usize;
+    while cursor < segment.len() && out.len() < expected_bytes {
+        let control = segment[cursor] as i8;
+        cursor += 1;
+        match control {
+            0..=127 => {
+                let len = control as usize + 1;
+                if cursor + len > segment.len() {
+                    return Err(DicomError::parse(path, "truncated RLE literal run"));
+                }
+                out.extend_from_slice(&segment[cursor..cursor + len]);
+                cursor += len;
+            }
+            -127..=-1 => {
+                if cursor >= segment.len() {
+                    return Err(DicomError::parse(path, "truncated RLE replicate run"));
+                }
+                let len = 1usize + (-control as usize);
+                out.extend(std::iter::repeat(segment[cursor]).take(len));
+                cursor += 1;
+            }
+            -128 => {}
+        }
+    }
+    Ok(out)
 }
 
 fn required_u16(dataset: &DicomDataSet, tag: (u16, u16), name: &str) -> Result<u16> {
@@ -245,9 +480,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
 
-    use crate::{parser::DicomElement, types::EXPLICIT_VR_LITTLE_ENDIAN};
+    use crate::{
+        parser::DicomElement,
+        types::{EXPLICIT_VR_LITTLE_ENDIAN, RLE_LOSSLESS},
+    };
 
     use super::*;
 
@@ -336,6 +577,115 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("No such file"));
+        assert!(
+            present_dicom_pixels_with_backend(&missing, &NativeDecoderBackend)
+                .unwrap_err()
+                .to_string()
+                .contains("No such file")
+        );
+    }
+
+    #[test]
+    fn native_backend_decodes_rle_dataset_and_reports_metadata() {
+        let dataset = dataset_with_syntax(
+            RLE_LOSSLESS,
+            [
+                u16_element((0x0028, 0x0010), 1),
+                u16_element((0x0028, 0x0011), 4),
+                u16_element((0x0028, 0x0100), 8),
+                u16_element((0x0028, 0x0101), 8),
+                bytes_element((0x7FE0, 0x0010), rle_pixel_data(&[2, 4, 6, 8])),
+            ],
+        );
+
+        let image = present_dataset_pixels(&dataset).unwrap();
+        assert_eq!(image.pixels, vec![0, 85, 170, 255]);
+        assert!(image.explanation.compressed);
+        assert_eq!(image.explanation.decoder_backend, "medkit-native");
+
+        let malformed = dataset_with_syntax(
+            RLE_LOSSLESS,
+            [
+                u16_element((0x0028, 0x0010), 1),
+                u16_element((0x0028, 0x0011), 1),
+                u16_element((0x0028, 0x0100), 8),
+                u16_element((0x0028, 0x0101), 8),
+                bytes_element((0x7FE0, 0x0010), vec![0; 10]),
+            ],
+        );
+        assert!(present_dataset_pixels(&malformed)
+            .unwrap_err()
+            .to_string()
+            .contains("shorter than the 64-byte RLE header"));
+    }
+
+    #[test]
+    fn rle_decoder_reports_malformed_segment_shapes() {
+        let path = Path::new("bad-rle.dcm");
+        assert!(decode_rle_lossless(&[0; 10], 1, 8, 1, path)
+            .unwrap_err()
+            .to_string()
+            .contains("shorter than the 64-byte RLE header"));
+
+        let mut invalid_count = vec![0; 64];
+        invalid_count[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(decode_rle_lossless(&invalid_count, 1, 8, 1, path)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid RLE segment count 0"));
+
+        let mut mismatch = rle_header(&[64]);
+        mismatch.push(0);
+        assert!(decode_rle_lossless(&mismatch, 2, 16, 1, path)
+            .unwrap_err()
+            .to_string()
+            .contains("expected 2 segment"));
+
+        let mut bad_offset = rle_header(&[63]);
+        bad_offset.push(0);
+        assert!(decode_rle_lossless(&bad_offset, 1, 8, 1, path)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid RLE segment offset 63"));
+
+        let mut decreasing = rle_header(&[66, 65]);
+        decreasing.extend_from_slice(&[0, 0]);
+        assert!(decode_rle_lossless(&decreasing, 2, 16, 1, path)
+            .unwrap_err()
+            .to_string()
+            .contains("offsets must be increasing"));
+
+        let mut short_segment = rle_header(&[64]);
+        short_segment.push(0x80);
+        assert!(decode_rle_lossless(&short_segment, 1, 8, 1, path)
+            .unwrap_err()
+            .to_string()
+            .contains("decoded segment length mismatch"));
+
+        let mut truncated_literal = rle_header(&[64]);
+        truncated_literal.extend_from_slice(&[2, 1]);
+        assert!(decode_rle_lossless(&truncated_literal, 3, 8, 1, path)
+            .unwrap_err()
+            .to_string()
+            .contains("truncated RLE literal run"));
+
+        let mut truncated_replicate = rle_header(&[64]);
+        truncated_replicate.push(0xFF);
+        assert!(decode_rle_lossless(&truncated_replicate, 2, 8, 1, path)
+            .unwrap_err()
+            .to_string()
+            .contains("truncated RLE replicate run"));
+        assert_eq!(
+            decode_packbits_segment(&[0xFF, 7], 2, path).unwrap(),
+            vec![7, 7]
+        );
+
+        let mut odd_expected = rle_header(&[64, 66]);
+        odd_expected.extend_from_slice(&[0, 1, 0, 2]);
+        assert!(decode_rle_lossless(&odd_expected, 3, 16, 1, path)
+            .unwrap_err()
+            .to_string()
+            .contains("decoded length mismatch"));
     }
 
     #[test]
@@ -373,13 +723,24 @@ mod tests {
         assert_eq!(sign_or_mask(u32::MAX, 32, false), -1);
         assert_eq!(sign_or_mask(0b1111, 4, true), -1);
         assert_eq!(window_pixels(&[0.0, 2.0], 1.0, 1.0), vec![0, 255]);
+        assert_eq!(
+            decode_packbits_segment(&[0x80], 0, Path::new("noop.dcm")).unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     fn dataset_with(elements: impl IntoIterator<Item = DicomElement>) -> DicomDataSet {
+        dataset_with_syntax(EXPLICIT_VR_LITTLE_ENDIAN, elements)
+    }
+
+    fn dataset_with_syntax(
+        transfer_syntax_uid: &str,
+        elements: impl IntoIterator<Item = DicomElement>,
+    ) -> DicomDataSet {
         DicomDataSet {
             path: PathBuf::from("pixels.dcm"),
             sha256: "hash".to_string(),
-            transfer_syntax_uid: EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+            transfer_syntax_uid: transfer_syntax_uid.to_string(),
             elements: elements
                 .into_iter()
                 .map(|element| (element.tag, element))
@@ -397,5 +758,22 @@ mod tests {
             vr: None,
             value,
         }
+    }
+
+    fn rle_pixel_data(values: &[u8]) -> Vec<u8> {
+        let mut data = rle_header(&[64]);
+        data.push(values.len() as u8 - 1);
+        data.extend_from_slice(values);
+        data
+    }
+
+    fn rle_header(offsets: &[usize]) -> Vec<u8> {
+        let mut data = vec![0; 64];
+        data[..4].copy_from_slice(&(offsets.len() as u32).to_le_bytes());
+        for (index, offset) in offsets.iter().copied().enumerate() {
+            let start = 4 + index * 4;
+            data[start..start + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+        }
+        data
     }
 }

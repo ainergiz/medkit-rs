@@ -475,3 +475,69 @@ impl StratifyField {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stratify_field_aliases_values_and_zero_ratio_edges_are_covered() {
+        assert_eq!(ratio_target(0.0, 10.0), 0.0);
+        assert_eq!(ratio_target(f64::NAN, 10.0), 0.0);
+
+        let record = record();
+        for (name, canonical, value) in [
+            ("labelsource", "label_source", "labels"),
+            ("laterality", "laterality", "left"),
+            ("modality", "modality", "CR"),
+            (
+                "photometricinterpretation",
+                "photometric_interpretation",
+                "MONOCHROME2",
+            ),
+            ("sourceformat", "source_format", "png"),
+            ("viewpositioncode", "view_position", "PA"),
+        ] {
+            let field = StratifyField::from_name(name).unwrap();
+            assert_eq!(field.canonical_name(), canonical);
+            assert_eq!(field.value(&record), Some(value));
+        }
+        assert!(StratifyField::from_name("unknown").is_none());
+        assert!(StratifyField::supported_names().contains(&"view_position"));
+
+        let group = StratifiedPatientGroup {
+            patient_id: "patient".to_string(),
+            indices: vec![0],
+            strata_counts: BTreeMap::from([("rare".to_string(), 1), ("common".to_string(), 2)]),
+            bucket: 0,
+        };
+        let global = BTreeMap::from([("rare".to_string(), 3), ("common".to_string(), 8)]);
+        assert_eq!(group_min_stratum_count(&group, &global), 3);
+    }
+
+    fn record() -> CxrRecord {
+        CxrRecord {
+            sample_id: "sample".to_string(),
+            patient_id: "patient".to_string(),
+            study_id: "study".to_string(),
+            image_id: "image".to_string(),
+            image_path: "image.png".to_string(),
+            source_format: "png".to_string(),
+            modality: Some("CR".to_string()),
+            view_position: Some("PA".to_string()),
+            laterality: Some("left".to_string()),
+            width: Some(4),
+            height: Some(4),
+            photometric_interpretation: Some("MONOCHROME2".to_string()),
+            series_instance_uid: None,
+            sop_instance_uid: None,
+            transfer_syntax_uid: None,
+            pixel_hash: None,
+            labels: BTreeMap::new(),
+            label_source: Some("labels".to_string()),
+            report_path: None,
+            split: None,
+            sha256: None,
+        }
+    }
+}

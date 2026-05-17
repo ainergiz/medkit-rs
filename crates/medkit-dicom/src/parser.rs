@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     types::{
         DicomInspectReport, DicomInventoryRecord, DicomWarning, EXPLICIT_VR_BIG_ENDIAN,
-        EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN,
+        EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN, RLE_LOSSLESS,
     },
     DicomError, Result,
 };
@@ -215,6 +215,8 @@ impl DicomDataSet {
             pixel_hash: self
                 .element((0x7FE0, 0x0010))
                 .map(|value| sha256_hex(value)),
+            decoder_backend: None,
+            decoder_version: None,
             warnings,
         }
     }
@@ -285,7 +287,10 @@ impl DicomDataSet {
     pub fn is_supported_transfer_syntax(&self) -> bool {
         matches!(
             self.transfer_syntax_uid.as_str(),
-            EXPLICIT_VR_LITTLE_ENDIAN | IMPLICIT_VR_LITTLE_ENDIAN | EXPLICIT_VR_BIG_ENDIAN
+            EXPLICIT_VR_LITTLE_ENDIAN
+                | IMPLICIT_VR_LITTLE_ENDIAN
+                | EXPLICIT_VR_BIG_ENDIAN
+                | RLE_LOSSLESS
         )
     }
 
@@ -369,6 +374,14 @@ fn parse_element(
         }
     };
 
+    if length == u32::MAX && (group, element) == (0x7FE0, 0x0010) {
+        let value = parse_undefined_length_pixel_data(bytes, cursor, path)?;
+        return Ok(DicomElement {
+            tag: (group, element),
+            vr,
+            value,
+        });
+    }
     if length == u32::MAX {
         return Err(DicomError::unsupported(
             path,
@@ -403,7 +416,62 @@ fn syntax_modes(uid: &str) -> (Option<Endian>, Option<VrMode>) {
         EXPLICIT_VR_LITTLE_ENDIAN => (Some(Endian::Little), Some(VrMode::Explicit)),
         IMPLICIT_VR_LITTLE_ENDIAN => (Some(Endian::Little), Some(VrMode::Implicit)),
         EXPLICIT_VR_BIG_ENDIAN => (Some(Endian::Big), Some(VrMode::Explicit)),
+        RLE_LOSSLESS => (Some(Endian::Little), Some(VrMode::Explicit)),
         _ => (None, None),
+    }
+}
+
+fn parse_undefined_length_pixel_data(
+    bytes: &[u8],
+    cursor: &mut usize,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    let mut fragments = Vec::new();
+    let mut item_index = 0usize;
+    loop {
+        if *cursor + 8 > bytes.len() {
+            return Err(DicomError::parse(
+                path,
+                "truncated undefined length PixelData item header",
+            ));
+        }
+        let group = read_u16(bytes, *cursor, Endian::Little);
+        let element = read_u16(bytes, *cursor + 2, Endian::Little);
+        let length = read_u32(bytes, *cursor + 4, Endian::Little) as usize;
+        *cursor += 8;
+        match (group, element) {
+            (0xFFFE, 0xE0DD) => {
+                if length != 0 {
+                    return Err(DicomError::parse(
+                        path,
+                        "PixelData sequence delimitation item must have zero length",
+                    ));
+                }
+                return Ok(fragments);
+            }
+            (0xFFFE, 0xE000) => {
+                if *cursor + length > bytes.len() {
+                    return Err(DicomError::parse(
+                        path,
+                        "PixelData fragment length exceeds remaining bytes",
+                    ));
+                }
+                if item_index > 0 {
+                    fragments.extend_from_slice(&bytes[*cursor..*cursor + length]);
+                }
+                *cursor += length;
+                item_index += 1;
+            }
+            _ => {
+                return Err(DicomError::parse(
+                    path,
+                    format!(
+                        "expected PixelData item or sequence delimitation, got {}",
+                        format_tag((group, element))
+                    ),
+                ));
+            }
+        }
     }
 }
 
@@ -561,6 +629,81 @@ mod tests {
         )
         .unwrap_err()
         .to_string()
+        .contains("truncated undefined length PixelData item header"));
+
+        let mut encapsulated = undefined.clone();
+        encapsulated.extend_from_slice(&le_item((0xFFFE, 0xE000), b""));
+        encapsulated.extend_from_slice(&le_item((0xFFFE, 0xE000), b"abc"));
+        encapsulated.extend_from_slice(&le_item((0xFFFE, 0xE0DD), b""));
+        cursor = 0;
+        let element = parse_element(
+            &encapsulated,
+            &mut cursor,
+            Endian::Little,
+            VrMode::Explicit,
+            path,
+        )
+        .unwrap();
+        assert_eq!(element.value, b"abc");
+
+        let mut bad_delimitation = undefined.clone();
+        bad_delimitation.extend_from_slice(&le_item((0xFFFE, 0xE0DD), b"x"));
+        cursor = 0;
+        assert!(parse_element(
+            &bad_delimitation,
+            &mut cursor,
+            Endian::Little,
+            VrMode::Explicit,
+            path
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("delimitation item must have zero length"));
+
+        let mut long_fragment = undefined.clone();
+        long_fragment.extend_from_slice(&le_tag((0xFFFE, 0xE000)));
+        long_fragment.extend_from_slice(&4u32.to_le_bytes());
+        long_fragment.extend_from_slice(b"ab");
+        cursor = 0;
+        assert!(parse_element(
+            &long_fragment,
+            &mut cursor,
+            Endian::Little,
+            VrMode::Explicit,
+            path
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("fragment length exceeds remaining bytes"));
+
+        let mut bad_item_tag = undefined.clone();
+        bad_item_tag.extend_from_slice(&le_item((0x0010, 0x0010), b""));
+        cursor = 0;
+        assert!(parse_element(
+            &bad_item_tag,
+            &mut cursor,
+            Endian::Little,
+            VrMode::Explicit,
+            path
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("expected PixelData item"));
+
+        let mut undefined_non_pixel = le_tag((0x0008, 0x1111));
+        undefined_non_pixel.extend_from_slice(b"SQ");
+        undefined_non_pixel.extend_from_slice(&[0, 0]);
+        undefined_non_pixel.extend_from_slice(&u32::MAX.to_le_bytes());
+        cursor = 0;
+        assert!(parse_element(
+            &undefined_non_pixel,
+            &mut cursor,
+            Endian::Little,
+            VrMode::Explicit,
+            path
+        )
+        .unwrap_err()
+        .to_string()
         .contains("undefined length element"));
 
         let mut too_long = le_tag((0x0010, 0x0020));
@@ -708,6 +851,13 @@ mod tests {
         let mut out = Vec::new();
         out.extend_from_slice(&tag.0.to_le_bytes());
         out.extend_from_slice(&tag.1.to_le_bytes());
+        out
+    }
+
+    fn le_item(tag: (u16, u16), value: &[u8]) -> Vec<u8> {
+        let mut out = le_tag(tag);
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value);
         out
     }
 }

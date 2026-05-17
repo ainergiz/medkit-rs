@@ -471,6 +471,79 @@ fn cxr_cli_reports_parse_errors_without_running_products() {
         .stderr
         .contains("--image-shape must be formatted as n,c,h,w"));
 
+    let ingest_missing_root = run_medkit_fail(&["cxr", "ingest"]);
+    assert!(ingest_missing_root.stderr.contains("Usage:"));
+
+    let ingest_missing_recipe = run_medkit_fail(&[
+        "cxr",
+        "ingest",
+        "raw",
+        "--labels",
+        "labels.csv",
+        "--cache",
+        "cache",
+        "--workdir",
+        "work",
+        "--report",
+        "report.md",
+    ]);
+    assert!(ingest_missing_recipe.stderr.contains("missing --recipe"));
+
+    let ingest_bad_workers = run_medkit_fail(&[
+        "cxr",
+        "ingest",
+        "raw",
+        "--recipe",
+        "recipe.toml",
+        "--labels",
+        "labels.csv",
+        "--cache",
+        "cache",
+        "--workdir",
+        "work",
+        "--report",
+        "report.md",
+        "--workers",
+        "many",
+    ]);
+    assert!(ingest_bad_workers
+        .stderr
+        .contains("invalid integer for --workers: many"));
+
+    let ingest_unknown_arg = run_medkit_fail(&["cxr", "ingest", "raw", "--unknown"]);
+    assert!(ingest_unknown_arg
+        .stderr
+        .contains("unknown argument: --unknown"));
+
+    let root = unique_test_dir();
+    fs::write(
+        root.join("invalid-recipe.toml"),
+        "name = \"invalid\"\n[image]\nsize = [0, 4]\n[labels]\ntargets = [\"Pneumonia\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("labels.csv"),
+        "patient_id,study_instance_uid,Pneumonia\n",
+    )
+    .unwrap();
+    let invalid_recipe = run_medkit_fail(&[
+        "cxr",
+        "ingest",
+        root.join("raw").to_str().unwrap(),
+        "--recipe",
+        root.join("invalid-recipe.toml").to_str().unwrap(),
+        "--labels",
+        root.join("labels.csv").to_str().unwrap(),
+        "--cache",
+        root.join("cache").to_str().unwrap(),
+        "--workdir",
+        root.join("work").to_str().unwrap(),
+        "--report",
+        root.join("report.md").to_str().unwrap(),
+    ]);
+    assert!(invalid_recipe.stderr.contains("image.size"));
+    assert!(!root.join("cache/cache-metadata.json").exists());
+
     let unknown_cxr_command = run_medkit_fail(&["cxr", "unknown"]);
     assert!(unknown_cxr_command
         .stderr
@@ -481,7 +554,7 @@ fn cxr_cli_reports_parse_errors_without_running_products() {
 fn cxr_benchmark_bridge_covers_flags_defaults_and_errors() {
     let root = unique_test_dir();
     let script = root.join("capture_benchmark.sh");
-    fs::write(&script, "printf '%s\\n' \"$*\" > \"$1.args\"\nexit 0\n").unwrap();
+    fs::write(&script, "printf '%s\\n' \"$*\" > \"$0.args\"\nexit 0\n").unwrap();
 
     let report = root.join("nested").join("benchmark.json");
     let output = run_medkit_output(&[

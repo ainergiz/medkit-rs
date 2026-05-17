@@ -446,6 +446,7 @@ dependencies = [
  "criterion",
  "medkit-bench",
  "medkit-cache",
+ "medkit-cxr",
  "medkit-dataset",
  "medkit-sampler",
  "medkit-transform",

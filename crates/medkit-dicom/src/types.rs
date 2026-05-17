@@ -5,12 +5,22 @@ use serde::{Deserialize, Serialize};
 pub const EXPLICIT_VR_LITTLE_ENDIAN: &str = "1.2.840.10008.1.2.1";
 pub const IMPLICIT_VR_LITTLE_ENDIAN: &str = "1.2.840.10008.1.2";
 pub const EXPLICIT_VR_BIG_ENDIAN: &str = "1.2.840.10008.1.2.2";
+pub const RLE_LOSSLESS: &str = "1.2.840.10008.1.2.5";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DicomScanConfig {
     pub root: PathBuf,
     pub out_path: PathBuf,
     pub report_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DicomBrowseConfig {
+    pub root: PathBuf,
+    pub group: Vec<String>,
+    pub out_path: PathBuf,
+    pub report_path: PathBuf,
+    pub workers: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +62,10 @@ pub struct DicomInventoryRecord {
     pub window_center: Option<f32>,
     pub window_width: Option<f32>,
     pub pixel_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_version: Option<String>,
     pub warnings: Vec<DicomWarning>,
 }
 
@@ -92,4 +106,55 @@ pub struct DicomScanSummary {
 pub struct DicomInspectReport {
     pub record: DicomInventoryRecord,
     pub elements: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DicomGraphSummary {
+    pub root: String,
+    pub patients: usize,
+    pub studies: usize,
+    pub series: usize,
+    pub instances: usize,
+    pub duplicate_sop_instance_uids: usize,
+    pub duplicate_pixel_hashes: usize,
+    pub warnings: Vec<DicomGraphWarning>,
+    pub patients_detail: Vec<DicomPatientNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DicomGraphWarning {
+    pub code: String,
+    pub message: String,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DicomPatientNode {
+    pub patient_id: String,
+    pub studies: Vec<DicomStudyNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DicomStudyNode {
+    pub study_instance_uid: String,
+    pub series: Vec<DicomSeriesNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DicomSeriesNode {
+    pub series_instance_uid: String,
+    pub modality: Option<String>,
+    pub rows: Option<u16>,
+    pub columns: Option<u16>,
+    pub instances: Vec<DicomInstanceNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DicomInstanceNode {
+    pub sop_instance_uid: Option<String>,
+    pub path: String,
+    pub modality: Option<String>,
+    pub rows: Option<u16>,
+    pub columns: Option<u16>,
+    pub pixel_hash: Option<String>,
 }

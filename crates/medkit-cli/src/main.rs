@@ -12,10 +12,11 @@ use std::{
 use medkit_bench::{bench_cache, bench_patch_plan, BenchConfig, BenchReport, PlanBenchConfig};
 use medkit_cache::{prepare_cache, CacheManifest, PrepareConfig};
 use medkit_cxr::{
-    cache_cxr, index_cxr, split_cxr, validate_cache_cxr, validate_cxr,
+    cache_cxr, index_cxr, ingest_cxr_dicom, split_cxr, validate_cache_cxr, validate_cxr,
     CacheConfig as CxrCacheConfig, CacheSummary as CxrCacheSummary,
     CacheValidationSummary as CxrCacheValidationSummary, IndexConfig as CxrIndexConfig,
-    IndexSummary as CxrIndexSummary, SplitConfig as CxrSplitConfig,
+    IndexSummary as CxrIndexSummary, IngestConfig as CxrIngestConfig,
+    IngestSummary as CxrIngestSummary, SplitConfig as CxrSplitConfig,
     SplitSummary as CxrSplitSummary, ValidateCacheConfig as CxrValidateCacheConfig,
     ValidateConfig as CxrValidateConfig, ValidationSummary as CxrValidationSummary,
 };
@@ -23,8 +24,9 @@ use medkit_dataset::{
     validate_dataset, write_manifest_json, write_report, DatasetManifest, ValidationConfig,
 };
 use medkit_dicom::{
-    explain_pixels, inspect_dicom_file, render_unicode, scan_dicom, write_scan_outputs,
-    DicomFileConfig, DicomScanConfig, DicomScanSummary, DicomViewConfig, RenderOptions,
+    browse_dicom, explain_pixels, inspect_dicom_file, render_unicode, scan_dicom,
+    scan_dicom_with_workers, write_scan_outputs, DicomBrowseConfig, DicomFileConfig,
+    DicomGraphSummary, DicomScanConfig, DicomScanSummary, DicomViewConfig, RenderOptions,
 };
 use medkit_sampler::{sample_cache, SampleConfig, SampleSummary, SamplingStrategy};
 
@@ -225,20 +227,65 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::CxrIngest {
+            raw_root,
+            recipe_path,
+            labels_path,
+            cache_dir,
+            workdir,
+            report_path,
+            dry_run,
+            workers,
+        } => {
+            let summary = ingest_cxr_dicom(&CxrIngestConfig {
+                raw_root,
+                recipe_path,
+                labels_path,
+                cache_dir,
+                workdir,
+                report_path,
+                dry_run,
+                workers,
+            })?;
+            print_cxr_ingest_summary(&summary);
+            ensure_cxr_ingest_cache_validation_ok(&summary.cache_validation_status)
+        }
         Command::CxrBenchmark(config) => run_cxr_benchmark_bridge(config),
         Command::DicomScan {
             root,
             out_path,
             report_path,
+            workers,
         } => {
             let config = DicomScanConfig {
                 root,
                 out_path: out_path.clone(),
                 report_path: report_path.clone(),
             };
-            let (summary, records) = scan_dicom(&config)?;
+            let (summary, records) = if workers > 1 {
+                scan_dicom_with_workers(&config, workers)?
+            } else {
+                scan_dicom(&config)?
+            };
             write_scan_outputs(&summary, &records, &out_path, &report_path)?;
             print_dicom_scan_summary(&summary);
+            Ok(())
+        }
+        Command::DicomBrowse {
+            root,
+            group,
+            out_path,
+            report_path,
+            workers,
+        } => {
+            let summary = browse_dicom(&DicomBrowseConfig {
+                root,
+                group,
+                out_path,
+                report_path,
+                workers,
+            })?;
+            print_dicom_graph_summary(&summary);
             Ok(())
         }
         Command::DicomInspect { path } => {
@@ -343,11 +390,29 @@ enum Command {
         report_path: Option<PathBuf>,
         json_path: Option<PathBuf>,
     },
+    CxrIngest {
+        raw_root: PathBuf,
+        recipe_path: PathBuf,
+        labels_path: PathBuf,
+        cache_dir: PathBuf,
+        workdir: PathBuf,
+        report_path: PathBuf,
+        dry_run: bool,
+        workers: usize,
+    },
     CxrBenchmark(CxrBenchmarkBridgeConfig),
     DicomScan {
         root: PathBuf,
         out_path: PathBuf,
         report_path: PathBuf,
+        workers: usize,
+    },
+    DicomBrowse {
+        root: PathBuf,
+        group: Vec<String>,
+        out_path: PathBuf,
+        report_path: PathBuf,
+        workers: usize,
     },
     DicomInspect {
         path: PathBuf,
@@ -427,6 +492,7 @@ fn parse_dicom_command(mut args: impl Iterator<Item = OsString>) -> Result<Comma
     };
     match action.to_string_lossy().as_ref() {
         "scan" => parse_dicom_scan_command(args),
+        "browse" => parse_dicom_browse_command(args),
         "inspect" => parse_dicom_inspect_command(args),
         "pixels" => parse_dicom_pixels_command(args),
         "view" => parse_dicom_view_command(args),
@@ -445,11 +511,15 @@ fn parse_dicom_scan_command(mut args: impl Iterator<Item = OsString>) -> Result<
     let root = PathBuf::from(root);
     let mut out_path = None;
     let mut report_path = None;
+    let mut workers = 1usize;
     let mut rest = args.peekable();
     while let Some(flag) = rest.next() {
         match flag.to_string_lossy().as_ref() {
             "--out" => out_path = Some(next_path(&mut rest, "--out")?),
             "--report" => report_path = Some(next_path(&mut rest, "--report")?),
+            "--workers" => {
+                workers = parse_usize(&next_string(&mut rest, "--workers")?, "--workers")?
+            }
             "--help" | "-h" => return Err(CliError::usage()),
             other => {
                 return Err(CliError::Message(format!(
@@ -465,6 +535,51 @@ fn parse_dicom_scan_command(mut args: impl Iterator<Item = OsString>) -> Result<
             .ok_or_else(|| CliError::Message(format!("missing --out\n\n{}", usage())))?,
         report_path: report_path
             .ok_or_else(|| CliError::Message(format!("missing --report\n\n{}", usage())))?,
+        workers,
+    })
+}
+
+fn parse_dicom_browse_command(
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<Command, CliError> {
+    let Some(root) = args.next() else {
+        return Err(CliError::usage());
+    };
+    let root = PathBuf::from(root);
+    let mut group = vec![
+        "patient".to_string(),
+        "study".to_string(),
+        "series".to_string(),
+    ];
+    let mut out_path = None;
+    let mut report_path = None;
+    let mut workers = 1usize;
+    let mut rest = args.peekable();
+    while let Some(flag) = rest.next() {
+        match flag.to_string_lossy().as_ref() {
+            "--group" => group = parse_csv_list(&next_string(&mut rest, "--group")?),
+            "--out" => out_path = Some(next_path(&mut rest, "--out")?),
+            "--report" => report_path = Some(next_path(&mut rest, "--report")?),
+            "--workers" => {
+                workers = parse_usize(&next_string(&mut rest, "--workers")?, "--workers")?
+            }
+            "--help" | "-h" => return Err(CliError::usage()),
+            other => {
+                return Err(CliError::Message(format!(
+                    "unknown argument: {other}\n\n{}",
+                    usage()
+                )))
+            }
+        }
+    }
+    Ok(Command::DicomBrowse {
+        root,
+        group,
+        out_path: out_path
+            .ok_or_else(|| CliError::Message(format!("missing --out\n\n{}", usage())))?,
+        report_path: report_path
+            .ok_or_else(|| CliError::Message(format!("missing --report\n\n{}", usage())))?,
+        workers,
     })
 }
 
@@ -534,6 +649,7 @@ fn parse_cxr_command(mut args: impl Iterator<Item = OsString>) -> Result<Command
         "split" => parse_cxr_split_command(args),
         "cache" => parse_cxr_cache_command(args),
         "validate-cache" | "inspect-cache" => parse_cxr_validate_cache_command(args),
+        "ingest" => parse_cxr_ingest_command(args),
         "benchmark" => parse_cxr_benchmark_command(args),
         "--help" | "-h" => Err(CliError::usage()),
         other => Err(CliError::Message(format!(
@@ -710,20 +826,18 @@ fn parse_cxr_index_command(args: impl Iterator<Item = OsString>) -> Result<Comma
             usage()
         )));
     }
-    let images_root = match (&images_root, &dicom_index_path) {
-        (Some(root), None) => root.clone(),
-        (None, Some(path)) => path
-            .parent()
+    let images_root = if let Some(root) = &images_root {
+        root.clone()
+    } else if let Some(path) = &dicom_index_path {
+        path.parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-        (None, None) => {
-            return Err(CliError::Message(format!(
-                "missing --images or --dicom-index\n\n{}",
-                usage()
-            )))
-        }
-        (Some(_), Some(_)) => unreachable!("checked above"),
+            .to_path_buf()
+    } else {
+        return Err(CliError::Message(format!(
+            "missing --images or --dicom-index\n\n{}",
+            usage()
+        )));
     };
     Ok(Command::CxrIndex {
         images_root,
@@ -896,6 +1010,56 @@ fn parse_cxr_validate_cache_command(
         plan_path,
         report_path,
         json_path,
+    })
+}
+
+fn parse_cxr_ingest_command(mut args: impl Iterator<Item = OsString>) -> Result<Command, CliError> {
+    let Some(raw_root) = args.next() else {
+        return Err(CliError::usage());
+    };
+    let raw_root = PathBuf::from(raw_root);
+    let mut recipe_path = None;
+    let mut labels_path = None;
+    let mut cache_dir = None;
+    let mut workdir = None;
+    let mut report_path = None;
+    let mut dry_run = false;
+    let mut workers = 1usize;
+    let mut rest = args.peekable();
+    while let Some(flag) = rest.next() {
+        match flag.to_string_lossy().as_ref() {
+            "--recipe" => recipe_path = Some(next_path(&mut rest, "--recipe")?),
+            "--labels" => labels_path = Some(next_path(&mut rest, "--labels")?),
+            "--cache" => cache_dir = Some(next_path(&mut rest, "--cache")?),
+            "--workdir" => workdir = Some(next_path(&mut rest, "--workdir")?),
+            "--report" => report_path = Some(next_path(&mut rest, "--report")?),
+            "--workers" => {
+                workers = parse_usize(&next_string(&mut rest, "--workers")?, "--workers")?
+            }
+            "--dry-run" => dry_run = true,
+            "--help" | "-h" => return Err(CliError::usage()),
+            other => {
+                return Err(CliError::Message(format!(
+                    "unknown argument: {other}\n\n{}",
+                    usage()
+                )))
+            }
+        }
+    }
+    Ok(Command::CxrIngest {
+        raw_root,
+        recipe_path: recipe_path
+            .ok_or_else(|| CliError::Message(format!("missing --recipe\n\n{}", usage())))?,
+        labels_path: labels_path
+            .ok_or_else(|| CliError::Message(format!("missing --labels\n\n{}", usage())))?,
+        cache_dir: cache_dir
+            .ok_or_else(|| CliError::Message(format!("missing --cache\n\n{}", usage())))?,
+        workdir: workdir
+            .ok_or_else(|| CliError::Message(format!("missing --workdir\n\n{}", usage())))?,
+        report_path: report_path
+            .ok_or_else(|| CliError::Message(format!("missing --report\n\n{}", usage())))?,
+        dry_run,
+        workers,
     })
 }
 
@@ -1330,6 +1494,29 @@ fn print_cxr_cache_validation_summary(summary: &CxrCacheValidationSummary) {
     }
 }
 
+fn print_cxr_ingest_summary(summary: &CxrIngestSummary) {
+    println!("CXR ingest status: {}", summary.status);
+    println!("Dry run: {}", summary.dry_run);
+    println!("Recipe: {}", summary.recipe_name);
+    println!("Recipe hash: {}", summary.recipe_hash);
+    println!(
+        "DICOM records scanned: {}",
+        summary.counts.dicom_records_scanned
+    );
+    println!("Manifest records: {}", summary.counts.manifest_records);
+    println!(
+        "Unsupported/skipped images: {}",
+        summary.counts.unsupported_or_skipped_images
+    );
+    println!(
+        "Cache transform fingerprint: {}",
+        summary.cache_transform_fingerprint
+    );
+    println!("Cache validation: {}", summary.cache_validation_status);
+    println!("Wrote report: {}", summary.paths.ingest_report);
+    println!("Wrote summary: {}", summary.paths.ingest_summary_json);
+}
+
 fn print_dicom_scan_summary(summary: &DicomScanSummary) {
     println!("DICOM root: {}", summary.root);
     println!("Records: {}", summary.records);
@@ -1342,6 +1529,20 @@ fn print_dicom_scan_summary(summary: &DicomScanSummary) {
     println!("Duplicate pixel hashes: {}", summary.duplicate_pixel_hashes);
     println!("Wrote inventory: {}", summary.out_path);
     println!("Wrote report: {}", summary.report_path);
+}
+
+fn print_dicom_graph_summary(summary: &DicomGraphSummary) {
+    println!("DICOM graph root: {}", summary.root);
+    println!("Patients: {}", summary.patients);
+    println!("Studies: {}", summary.studies);
+    println!("Series: {}", summary.series);
+    println!("Instances: {}", summary.instances);
+    println!(
+        "Duplicate SOP Instance UIDs: {}",
+        summary.duplicate_sop_instance_uids
+    );
+    println!("Duplicate pixel hashes: {}", summary.duplicate_pixel_hashes);
+    println!("Warnings: {}", summary.warnings.len());
 }
 
 fn run_cxr_benchmark_bridge(config: CxrBenchmarkBridgeConfig) -> Result<(), CliError> {
@@ -1415,6 +1616,16 @@ fn run_cxr_benchmark_bridge(config: CxrBenchmarkBridgeConfig) -> Result<(), CliE
     println!("CXR benchmark command: {rendered_command}");
     println!("Elapsed: {:.2} ms", elapsed_ms);
     Ok(())
+}
+
+fn ensure_cxr_ingest_cache_validation_ok(status: &str) -> Result<(), CliError> {
+    if status == "failed" {
+        Err(CliError::Message(
+            "CXR ingest completed with failed cache validation".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn cxr_benchmark_harness_command(runner: &str, script_path: &Path) -> ProcessCommand {
@@ -1548,7 +1759,7 @@ impl From<serde_json::Error> for CliError {
 }
 
 fn usage() -> String {
-    "Usage:\n  medkit dataset validate <root> [--images imagesTr] [--labels labelsTr] [--out manifest.json] [--report report.txt]\n  medkit prepare <root> --manifest manifest.json --plan ct-segmentation.toml --cache .medkit/cache [--chunk 96,96,96]\n  medkit sample <cache> --patch 96,96,96 --strategy foreground-balanced --count 10000 --out patches.jsonl\n  medkit bench <cache> --patch 96,96,96 --workers 8 [--samples 10000]\n  medkit bench-plan <cache> --patches patches.jsonl --workers 8 [--samples 10000]\n  medkit cxr manifest --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr manifest --dicom-index dicom-index.jsonl [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr index --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr validate <manifest.jsonl> [--require-frontal] [--check-patient-leakage] [--check-duplicates] --report validation.md\n  medkit cxr split <manifest.jsonl> --by patient_id --train 0.8 --val 0.1 --test 0.1 [--stratify Pneumonia,view_position] [--seed 0] --out splits.json\n  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache\n  medkit cxr validate-cache <cache> [--split train] [--targets Pneumonia] [--image-shape n,c,h,w] [--plan cxr-512.toml] [--report cache-validation.md] [--json cache-validation.json]\n  medkit cxr benchmark [--manifest manifest.jsonl] [--splits splits.json] [--plan cxr-512.toml] [--targets Pneumonia] [--baselines pytorch_raw,monai_raw,medkit_cached_mmap] [--batch-sizes 64,128] [--workers 8,16] [--device cuda:0] [--out benchmark.json]\n  medkit dicom scan <root> --out inventory.jsonl --report dicom-report.md\n  medkit dicom inspect <file.dcm>\n  medkit dicom pixels --explain <file.dcm>\n  medkit dicom view <file.dcm> [--width 80]".to_string()
+    "Usage:\n  medkit dataset validate <root> [--images imagesTr] [--labels labelsTr] [--out manifest.json] [--report report.txt]\n  medkit prepare <root> --manifest manifest.json --plan ct-segmentation.toml --cache .medkit/cache [--chunk 96,96,96]\n  medkit sample <cache> --patch 96,96,96 --strategy foreground-balanced --count 10000 --out patches.jsonl\n  medkit bench <cache> --patch 96,96,96 --workers 8 [--samples 10000]\n  medkit bench-plan <cache> --patches patches.jsonl --workers 8 [--samples 10000]\n  medkit cxr manifest --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr manifest --dicom-index dicom-index.jsonl [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr index --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl\n  medkit cxr validate <manifest.jsonl> [--require-frontal] [--check-patient-leakage] [--check-duplicates] --report validation.md\n  medkit cxr split <manifest.jsonl> --by patient_id --train 0.8 --val 0.1 --test 0.1 [--stratify Pneumonia,view_position] [--seed 0] --out splits.json\n  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache\n  medkit cxr validate-cache <cache> [--split train] [--targets Pneumonia] [--image-shape n,c,h,w] [--plan cxr-512.toml] [--report cache-validation.md] [--json cache-validation.json]\n  medkit cxr ingest <raw-dicom> --recipe cxr-dicom-512.toml --labels labels.csv --cache .medkit/cxr-cache --workdir .medkit/cxr-ingest --report ingestion-report.md [--dry-run] [--workers 4]\n  medkit cxr benchmark [--manifest manifest.jsonl] [--splits splits.json] [--plan cxr-512.toml] [--targets Pneumonia] [--baselines pytorch_raw,monai_raw,medkit_cached_mmap] [--batch-sizes 64,128] [--workers 8,16] [--device cuda:0] [--out benchmark.json]\n  medkit dicom scan <root> --out inventory.jsonl --report dicom-report.md [--workers 4]\n  medkit dicom browse <root> --group patient,study,series --out graph.json --report graph-report.md [--workers 4]\n  medkit dicom inspect <file.dcm>\n  medkit dicom pixels --explain <file.dcm>\n  medkit dicom view <file.dcm> [--width 80]".to_string()
 }
 
 #[cfg(test)]
@@ -1570,5 +1781,141 @@ mod tests {
 
         let explicit = cxr_benchmark_harness_command("/bin/sh", Path::new("bench.sh"));
         assert_eq!(format_command(&explicit), "/bin/sh bench.sh");
+    }
+
+    #[test]
+    fn dicom_cli_parser_covers_help_unknown_workers_and_trailing_errors() {
+        assert!(parse(&["medkit", "dicom", "--help"])
+            .unwrap_err()
+            .to_string()
+            .contains("Usage:"));
+        assert!(parse(&["medkit", "dicom", "bogus"])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown dicom command"));
+        assert!(parse(&["medkit", "dicom", "scan"])
+            .unwrap_err()
+            .to_string()
+            .contains("Usage:"));
+        assert!(parse(&["medkit", "dicom", "scan", "root", "--help"])
+            .unwrap_err()
+            .to_string()
+            .contains("Usage:"));
+        assert!(parse(&["medkit", "dicom", "scan", "root", "--unknown"])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown argument"));
+        assert!(matches!(
+            parse(&[
+                "medkit",
+                "dicom",
+                "scan",
+                "root",
+                "--out",
+                "index.jsonl",
+                "--report",
+                "report.md",
+                "--workers",
+                "2",
+            ])
+            .unwrap(),
+            Command::DicomScan { workers: 2, .. }
+        ));
+
+        assert!(parse(&["medkit", "dicom", "browse", "root", "--help"])
+            .unwrap_err()
+            .to_string()
+            .contains("Usage:"));
+        assert!(parse(&["medkit", "dicom", "browse", "root", "--unknown"])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown argument"));
+        assert!(matches!(
+            parse(&[
+                "medkit",
+                "dicom",
+                "browse",
+                "root",
+                "--group",
+                "patient,study",
+                "--out",
+                "graph.json",
+                "--report",
+                "graph.md",
+                "--workers",
+                "3",
+            ])
+            .unwrap(),
+            Command::DicomBrowse { workers: 3, .. }
+        ));
+
+        assert!(parse(&["medkit", "dicom", "inspect"])
+            .unwrap_err()
+            .to_string()
+            .contains("Usage:"));
+        assert!(parse(&["medkit", "dicom", "inspect", "file.dcm", "extra"])
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected argument"));
+        assert!(parse(&["medkit", "dicom", "pixels"])
+            .unwrap_err()
+            .to_string()
+            .contains("Usage:"));
+        assert!(parse(&["medkit", "dicom", "pixels", "show"])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown dicom pixels command"));
+        assert!(parse(&["medkit", "dicom", "pixels", "--explain"])
+            .unwrap_err()
+            .to_string()
+            .contains("Usage:"));
+        assert!(parse(&["medkit", "dicom", "view"])
+            .unwrap_err()
+            .to_string()
+            .contains("Usage:"));
+        assert!(parse(&["medkit", "dicom", "view", "file.dcm", "--help"])
+            .unwrap_err()
+            .to_string()
+            .contains("Usage:"));
+        assert!(parse(&["medkit", "dicom", "view", "file.dcm", "--unknown"])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown argument"));
+    }
+
+    #[test]
+    fn cli_error_json_display_and_dicom_worker_run_error_are_covered() {
+        let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let cli_error = CliError::from(json_error);
+        assert!(cli_error.to_string().contains("EOF"));
+
+        let missing = std::env::temp_dir().join(format!(
+            "medkit-cli-missing-dicom-root-{}",
+            std::process::id()
+        ));
+        let error = run([
+            OsString::from("medkit"),
+            OsString::from("dicom"),
+            OsString::from("scan"),
+            missing.into_os_string(),
+            OsString::from("--out"),
+            OsString::from("index.jsonl"),
+            OsString::from("--report"),
+            OsString::from("report.md"),
+            OsString::from("--workers"),
+            OsString::from("2"),
+        ])
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+
+        assert!(ensure_cxr_ingest_cache_validation_ok("failed")
+            .unwrap_err()
+            .to_string()
+            .contains("failed cache validation"));
+        ensure_cxr_ingest_cache_validation_ok("ok").unwrap();
+    }
+
+    fn parse(args: &[&str]) -> Result<Command, CliError> {
+        parse_args(args.iter().map(OsString::from))
     }
 }

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    thread,
 };
 
 use crate::{
@@ -15,9 +16,20 @@ use crate::{
 pub fn scan_dicom(
     config: &DicomScanConfig,
 ) -> Result<(DicomScanSummary, Vec<DicomInventoryRecord>)> {
+    scan_dicom_with_workers(config, 1)
+}
+
+pub fn scan_dicom_with_workers(
+    config: &DicomScanConfig,
+    workers: usize,
+) -> Result<(DicomScanSummary, Vec<DicomInventoryRecord>)> {
     let mut paths = Vec::new();
     collect_candidate_paths(&config.root, &mut paths)?;
     paths.sort();
+
+    if workers > 1 && paths.len() > 1 {
+        return scan_dicom_paths_parallel(config, paths, workers);
+    }
 
     let mut records = Vec::new();
     let mut errors = Vec::new();
@@ -33,6 +45,50 @@ pub fn scan_dicom(
     add_duplicate_warnings(&mut records);
     let summary = scan_summary(config, &records, errors);
     Ok((summary, records))
+}
+
+fn scan_dicom_paths_parallel(
+    config: &DicomScanConfig,
+    paths: Vec<PathBuf>,
+    workers: usize,
+) -> Result<(DicomScanSummary, Vec<DicomInventoryRecord>)> {
+    let worker_count = workers.max(1).min(paths.len());
+    let chunk_size = paths.len().div_ceil(worker_count);
+    let chunks = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in paths.chunks(chunk_size) {
+            handles.push(scope.spawn(move || scan_path_chunk(chunk)));
+        }
+
+        let mut records = Vec::new();
+        let mut errors = Vec::new();
+        for handle in handles {
+            let (mut chunk_records, mut chunk_errors) =
+                handle.join().expect("DICOM scan worker panicked");
+            records.append(&mut chunk_records);
+            errors.append(&mut chunk_errors);
+        }
+        (records, errors)
+    });
+    let (mut records, errors) = chunks;
+    add_duplicate_warnings(&mut records);
+    let summary = scan_summary(config, &records, errors);
+    Ok((summary, records))
+}
+
+fn scan_path_chunk(paths: &[PathBuf]) -> (Vec<DicomInventoryRecord>, Vec<DicomScanError>) {
+    let mut records = Vec::new();
+    let mut errors = Vec::new();
+    for path in paths {
+        match DicomDataSet::from_file(path) {
+            Ok(dataset) => records.push(dataset.inventory_record()),
+            Err(error) => errors.push(DicomScanError {
+                path: path.display().to_string(),
+                message: error.to_string(),
+            }),
+        }
+    }
+    (records, errors)
 }
 
 pub fn write_scan_outputs(
@@ -419,6 +475,8 @@ mod tests {
             window_center: None,
             window_width: None,
             pixel_hash: None,
+            decoder_backend: None,
+            decoder_version: None,
             warnings: Vec::new(),
         }
     }
