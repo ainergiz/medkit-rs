@@ -75,6 +75,7 @@ def test_cxr_dataloader_contract_against_cli_cache_fixture() -> None:
         prefetch_depth=3,
         read_workers=1,
         read_mode="mmap",
+        include_metadata=True,
     )
     loader = cxr.DataLoader(
         dataset,
@@ -96,6 +97,7 @@ def test_cxr_dataloader_contract_against_cli_cache_fixture() -> None:
     assert report["prefetch_depth"] == 0
     assert report["read_workers"] == 0
     assert report["read_mode"] == "mmap"
+    assert report["include_metadata"] is True
     assert report["worker_mode"] == "single_process"
     assert report["num_workers"] == 0
     assert report["num_samples"] == length

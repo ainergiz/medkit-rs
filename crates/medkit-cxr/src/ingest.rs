@@ -128,6 +128,7 @@ pub fn ingest_cxr_dicom(config: &IngestConfig) -> Result<IngestSummary, CxrError
             recipe_hash: fingerprint.sha256.clone(),
             recipe_path: config.recipe_path.display().to_string(),
             label_policy: recipe.label_policy(),
+            cache_dtype: Default::default(),
             image_size_policy: recipe.image_size_policy(),
             dicom_presentation_policy: recipe.presentation_policy(),
             transfer_syntax_policy: recipe.transfer_syntax_policy(),

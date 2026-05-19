@@ -175,38 +175,39 @@ The streaming path is useful for memory-constrained pinned CXR training: it cut
 loader PSS by about 753 MB and GPU-loop PSS by about 1.73 GB while leaving
 pinned train throughput essentially flat. It should not become the universal
 default yet, because unpinned native prefetch lost substantial throughput.
-`smaps_pss_file_mb` reported 0.0 in all four rows, so current decision-making
-should rely on total PSS/USS and train throughput until the file-backed mapping
-classification is improved further.
+`smaps_pss_file_mb` reported 0.0 in all four rows, so those historical rows
+should rely on total PSS/USS and train throughput. The next rerun should use the
+new smaps parser that classifies mappings by address headers and known cache
+paths, then verify that mmap rows report nonzero cache-file PSS after the image
+cache has been touched.
 
 Next implementation priorities:
 
-1. Treat CXR reader memory policy as implemented but keep it explicit:
-   `read_mode = "mmap" | "stream"`. The streaming mode should use positioned
-   reads directly into the batch tensor rather than mapping the whole split
-   image cache. This should reduce RSS on memory-constrained machines, with a
-   measured speed tradeoff.
-2. Add CXR cache dtype policy:
-   `cache_dtype = "float32" | "float16" | "uint8"`. `float32` remains the
-   fastest and simplest path. `float16` cuts image cache size by about half.
-   `uint8` keeps resized grayscale pixels compact and applies scale/normalize
-   during batch fill.
-3. Keep user-facing defaults on a balanced policy:
+1. Keep CXR reader memory policy explicit: `read_mode = "mmap" | "stream"`.
+   `mmap` remains the speed default. `stream` is a memory-pressure lever and
+   should use persistent file handles plus positioned reads rather than mapping
+   the whole split image cache.
+2. Keep CXR cache dtype policy explicit:
+   `cache_dtype = "float32" | "float16" | "uint8"`. Apply dtype compaction to
+   the image cache first; labels and masks stay float32 until there is evidence
+   that compact label storage matters.
+3. Keep metadata opt-in for training batches: `include_metadata = false`.
+   Training loops normally need only `image`, `labels`, and `mask`; metadata
+   strings remain available for audit/debug sidecars.
+4. Keep user-facing defaults on a balanced policy:
    `prefetch_depth = 1`, `read_workers = 1`, and `pin_memory = false` unless a
    benchmark shows the GPU is data-starved. Keep pinned/deeper prefetch as
    explicit speed knobs.
-4. Add `include_metadata = false` for CXR training batches. Most training loops
-   need only `image`, `labels`, and `mask`; metadata strings should be opt-in
-   when users need audit/debug sidecars.
-5. Improve memory telemetry in the benchmark harness. Report RSS, PSS,
-   USS/private dirty memory, file-backed mappings, cache file size, and an
-   estimated pinned-memory footprint so mmap accounting is not confused with
-   private heap growth.
-6. Add a CXR scale-up matrix on at least one larger GPU target, such as L40S or
-   A100/H100 depending on Modal availability. Keep the L4/224px/batch64 matrix
-   for comparable memory regressions, but add 512px and larger-batch or
-   higher-throughput runs so the project does not optimize only for constrained
-   hosts.
+5. Improve memory telemetry in every report. Summaries should include RSS, PSS,
+   USS/private dirty memory, cache-file PSS buckets, other file-backed mappings,
+   cache file size, and estimated pinned batch footprint.
+6. Run two benchmark tracks, not one:
+   - Memory-pressure track: L4/224px/batch64 remains the comparable regression
+     target for host-memory and throughput tradeoffs.
+   - Scale-up track: run 512px and higher-throughput configurations on a larger
+     GPU target such as L40S, A100, or H100 depending on Modal availability. The
+     project should prove that medkit remains useful when training moves to
+     larger GPUs, not only when optimizing around constrained hosts.
 
 Success criteria:
 

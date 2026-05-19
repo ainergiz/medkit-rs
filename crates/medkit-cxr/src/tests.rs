@@ -1400,7 +1400,7 @@ fn parallel_indexed_reads_scatter_non_contiguous_runs() {
 
     assert_eq!(metrics.samples, 3);
     assert_eq!(metrics.runs, 2);
-    assert_eq!(metrics.workers, 2);
+    assert_eq!(metrics.workers, 1);
     assert_eq!(metrics.read_bytes, (image_len + label_len + label_len) * 4);
     assert_eq!(metrics.scatter_bytes, metrics.read_bytes);
     assert_eq!(parallel_images, streaming_images);
@@ -1409,6 +1409,32 @@ fn parallel_indexed_reads_scatter_non_contiguous_runs() {
     assert_eq!(parallel_images[0..4], [16.0, 17.0, 18.0, 19.0]);
     assert_eq!(parallel_labels[0..2], [8.0, 9.0]);
     assert_eq!(parallel_masks[0..2], [108.0, 109.0]);
+
+    let stream_reader =
+        CxrCacheReader::open_with_read_mode(&cache_dir, "train", CxrCacheReadMode::Stream).unwrap();
+    let mut stream_parallel_images = vec![0.0; image_len];
+    let mut stream_parallel_labels = vec![0.0; label_len];
+    let mut stream_parallel_masks = vec![0.0; label_len];
+    let stream_metrics = stream_reader
+        .fill_indices_parallel(
+            &indices,
+            &mut stream_parallel_images,
+            &mut stream_parallel_labels,
+            &mut stream_parallel_masks,
+            2,
+        )
+        .unwrap();
+    assert_eq!(stream_metrics.samples, 3);
+    assert_eq!(stream_metrics.runs, 2);
+    assert_eq!(stream_metrics.workers, 2);
+    assert_eq!(
+        stream_metrics.read_bytes,
+        (image_len + label_len + label_len) * 4
+    );
+    assert_eq!(stream_metrics.scatter_bytes, stream_metrics.read_bytes);
+    assert_eq!(stream_parallel_images, streaming_images);
+    assert_eq!(stream_parallel_labels, streaming_labels);
+    assert_eq!(stream_parallel_masks, streaming_masks);
 
     let mut single_worker_images = vec![0.0; image_len];
     let mut single_worker_labels = vec![0.0; label_len];
@@ -1484,6 +1510,55 @@ fn cxr_cache_reader_stream_mode_matches_mmap_reads() {
     assert_eq!(stream_images, mmap_images);
     assert_eq!(stream_labels, mmap_labels);
     assert_eq!(stream_masks, mmap_masks);
+}
+
+#[test]
+fn cxr_cache_reader_decodes_compact_image_dtypes() {
+    for dtype in [CxrCacheDType::Float16, CxrCacheDType::Uint8] {
+        let root = unique_test_dir();
+        let cache_dir = root.join(format!("cache-{}", dtype.as_str()));
+        let mut summary = write_synthetic_cache(&cache_dir, 2, 2, &["A"]);
+        let old_images = cache_dir.join("train-images.float32.dat");
+        fs::remove_file(&old_images).unwrap();
+        let images_name = format!("train-images.{}.dat", dtype.as_str());
+        let images_path = cache_dir.join(&images_name);
+        let expected = match dtype {
+            CxrCacheDType::Float16 => {
+                let values = [0.0f32, 0.5, 1.0, -2.0, 4.0, 8.0, 16.0, 32.0];
+                let mut bytes = Vec::new();
+                for value in values {
+                    bytes.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
+                }
+                fs::write(&images_path, bytes).unwrap();
+                values.to_vec()
+            }
+            CxrCacheDType::Uint8 => {
+                let values = [0_u8, 64, 128, 255, 10, 20, 30, 40];
+                fs::write(&images_path, values).unwrap();
+                values.iter().map(|value| *value as f32 / 255.0).collect()
+            }
+            CxrCacheDType::Float32 => unreachable!(),
+        };
+        summary.dtype = dtype.as_str().to_string();
+        summary.image_size_policy.dtype = dtype.as_str().to_string();
+        let split = summary.splits.get_mut("train").unwrap();
+        split.images_path = images_name;
+        split.images_sha256 = hash_file(&images_path).unwrap();
+        summary.cache_size_bytes = directory_size(&cache_dir).unwrap();
+        write_json(&cache_dir.join("cache-metadata.json"), &summary).unwrap();
+
+        let mmap_reader = CxrCacheReader::open(&cache_dir, "train").unwrap();
+        let stream_reader =
+            CxrCacheReader::open_with_read_mode(&cache_dir, "train", CxrCacheReadMode::Stream)
+                .unwrap();
+        for reader in [mmap_reader, stream_reader] {
+            let batch = reader.read_batch(0, 2).unwrap();
+            assert_eq!(batch.images.len(), expected.len());
+            for (actual, expected) in batch.images.iter().zip(&expected) {
+                assert!((actual - expected).abs() <= 0.001);
+            }
+        }
+    }
 }
 
 #[test]

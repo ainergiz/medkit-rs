@@ -31,6 +31,8 @@ CURRENT_TOOLS_ROOT = LOCAL_REPO_ROOT / "target" / "reports" / "cxr-current-tools
 class Row:
     name: str
     baseline: str
+    cache_dtype: str
+    read_mode: str
     purpose: str
 
 
@@ -54,6 +56,7 @@ def main() -> int:
         help="Comma-separated baselines to launch as separate rows.",
     )
     parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--cache-dtype", choices=("float32", "float16", "uint8"), default="float32")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-samples", type=int, default=6000)
@@ -68,7 +71,18 @@ def main() -> int:
     parser.add_argument("--prefetch-depth", type=int, default=1)
     parser.add_argument("--prefetch-read-workers", type=int, default=1)
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
+    parser.add_argument(
+        "--read-modes",
+        default="",
+        help="Optional comma-separated read modes; overrides --read-mode for matrix rows.",
+    )
+    parser.add_argument("--include-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument(
+        "--cache-dtypes",
+        default="",
+        help="Optional comma-separated cache dtypes; overrides --cache-dtype for matrix rows.",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--force-cache", action="store_true")
     parser.add_argument("--force-rematerialize", action="store_true")
@@ -83,10 +97,24 @@ def main() -> int:
     batch_dir = CURRENT_TOOLS_ROOT / batch_id
     batch_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = [
-        Row(name=baseline_to_name(baseline), baseline=baseline, purpose=row_purpose(baseline))
-        for baseline in [item.strip() for item in args.baselines.split(",") if item.strip()]
-    ]
+    baselines = parse_csv(args.baselines)
+    cache_dtypes = parse_csv(args.cache_dtypes) or [args.cache_dtype]
+    read_modes = parse_csv(args.read_modes) or [args.read_mode]
+    validate_choices("cache dtype", cache_dtypes, {"float32", "float16", "uint8"})
+    validate_choices("read mode", read_modes, {"mmap", "stream"})
+    rows = []
+    for baseline in baselines:
+        settings = matrix_settings_for_baseline(baseline, cache_dtypes, read_modes)
+        for cache_dtype, read_mode in settings:
+            rows.append(
+                Row(
+                    name=row_name(baseline, cache_dtype, read_mode),
+                    baseline=baseline,
+                    cache_dtype=cache_dtype,
+                    read_mode=read_mode,
+                    purpose=row_purpose(baseline, cache_dtype, read_mode),
+                )
+            )
     if not rows:
         raise ValueError("No baselines provided")
 
@@ -108,7 +136,7 @@ def main() -> int:
     if args.dry_run:
         for row in rows:
             run_id = run_id_for(batch_id, row)
-            command = build_command(args, run_id=run_id, baseline=row.baseline)
+            command = build_command(args, run_id=run_id, row=row)
             print(" ".join(command))
         return 0
 
@@ -119,7 +147,7 @@ def main() -> int:
             row_dir = batch_dir / run_id
             row_dir.mkdir(parents=True, exist_ok=True)
             output_path = row_dir / "modal-output.log"
-            command = build_command(args, run_id=run_id, baseline=row.baseline)
+            command = build_command(args, run_id=run_id, row=row)
             (row_dir / "launcher-command.txt").write_text(" ".join(command) + "\n")
             pain_diary_path = row_dir / "pain-diary.md"
             pain_diary_path.write_text(initial_pain_diary(row, run_id, command))
@@ -165,7 +193,7 @@ def main() -> int:
     return 1 if failures else 0
 
 
-def build_command(args: argparse.Namespace, *, run_id: str, baseline: str) -> list[str]:
+def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[str]:
     command = [
         "modal",
         "run",
@@ -182,6 +210,8 @@ def build_command(args: argparse.Namespace, *, run_id: str, baseline: str) -> li
         str(args.max_test),
         "--image-size",
         str(args.image_size),
+        "--cache-dtype",
+        row.cache_dtype,
         "--batch-size",
         str(args.batch_size),
         "--workers",
@@ -197,9 +227,10 @@ def build_command(args: argparse.Namespace, *, run_id: str, baseline: str) -> li
         "--prefetch-read-workers",
         str(args.prefetch_read_workers),
         "--read-mode",
-        args.read_mode,
+        row.read_mode,
+        "--include-metadata" if args.include_metadata else "--no-include-metadata",
         "--baselines",
-        baseline,
+        row.baseline,
     ]
     if args.max_train_batches:
         command.extend(["--max-train-batches", str(args.max_train_batches)])
@@ -231,6 +262,8 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
     result = {
         "run_id": active.run_id,
         "baseline": active.row.baseline,
+        "cache_dtype": active.row.cache_dtype,
+        "read_mode": active.row.read_mode,
         "purpose": active.row.purpose,
         "returncode": returncode,
         "status": status,
@@ -275,6 +308,8 @@ def write_batch_summary(
             {
                 "run_id": active.run_id,
                 "baseline": active.row.baseline,
+                "cache_dtype": active.row.cache_dtype,
+                "read_mode": active.row.read_mode,
                 "elapsed_seconds": time.perf_counter() - active.started_at,
             }
             for active in running
@@ -342,18 +377,45 @@ def append_pain_diary(path: Path, result: dict[str, Any]) -> None:
         handle.write("\n".join(lines) + "\n")
 
 
+def parse_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def validate_choices(label: str, values: list[str], allowed: set[str]) -> None:
+    invalid = [value for value in values if value not in allowed]
+    if invalid:
+        raise ValueError(f"Unsupported {label} values {invalid}; expected one of {sorted(allowed)}")
+
+
 def baseline_to_name(baseline: str) -> str:
     return baseline.replace("_", "-")
 
 
-def row_purpose(baseline: str) -> str:
+def row_name(baseline: str, cache_dtype: str, read_mode: str) -> str:
+    return f"{baseline_to_name(baseline)}-{cache_dtype}-{read_mode}"
+
+
+def row_purpose(baseline: str, cache_dtype: str, read_mode: str) -> str:
     purposes = {
         "pytorch_raw": "Hand-rolled PyTorch control path.",
         "monai_raw": "MONAI medical-imaging framework path.",
         "torchxrayvision": "CXR-specific toolkit path.",
         "medkit_native_prefetch_pinned": "Reference medkit native-prefetch path.",
     }
-    return purposes.get(baseline, "Current-tool benchmark row.")
+    return (
+        purposes.get(baseline, "Current-tool benchmark row.")
+        + f" Matrix settings: cache_dtype={cache_dtype}, read_mode={read_mode}."
+    )
+
+
+def matrix_settings_for_baseline(
+    baseline: str,
+    cache_dtypes: list[str],
+    read_modes: list[str],
+) -> list[tuple[str, str]]:
+    if not baseline.startswith("medkit"):
+        return [(cache_dtypes[0], read_modes[0])]
+    return [(cache_dtype, read_mode) for cache_dtype in cache_dtypes for read_mode in read_modes]
 
 
 def run_id_for(batch_id: str, row: Row) -> str:

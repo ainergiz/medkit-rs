@@ -933,6 +933,7 @@ version = "0.1.0"
 dependencies = [
  "csv",
  "flate2",
+ "half",
  "image",
  "medkit-dicom",
  "memmap2",

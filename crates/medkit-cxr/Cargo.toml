@@ -20,6 +20,7 @@ dicom-rs-codecs = ["medkit-dicom/dicom-rs-codecs"]
 [dependencies]
 csv.workspace = true
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+half.workspace = true
 image.workspace = true
 medkit-dicom = { path = "../medkit-dicom" }
 memmap2.workspace = true

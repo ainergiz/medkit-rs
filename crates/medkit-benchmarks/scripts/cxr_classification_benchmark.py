@@ -24,6 +24,7 @@ import math
 import os
 import platform
 import random
+import re
 import resource
 import shutil
 import subprocess
@@ -64,6 +65,7 @@ ALL_NIH_LABELS = (
     "Pneumothorax",
     "No Finding",
 )
+SMAPS_HEADER_RE = re.compile(r"^[0-9a-fA-F]+-[0-9a-fA-F]+\s")
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,7 @@ def main() -> int:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--cache-image-size", type=int, default=0)
+    parser.add_argument("--cache-dtype", choices=("float32", "float16", "uint8"), default="float32")
     parser.add_argument("--targets", default=",".join(DEFAULT_TARGETS))
     parser.add_argument("--max-samples", type=int, default=6000)
     parser.add_argument("--max-train", type=int, default=4096)
@@ -111,6 +114,7 @@ def main() -> int:
     parser.add_argument("--prefetch-depth", type=int, default=1)
     parser.add_argument("--prefetch-read-workers", type=int, default=1)
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
+    parser.add_argument("--include-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--baselines",
         default="pytorch_raw,monai_raw,medkit_cached_mmap,medkit_pinned_prefetch",
@@ -156,7 +160,7 @@ def main() -> int:
     data_dir = args.work_dir / "materialized"
     manifest_path = args.work_dir / "manifest.jsonl"
     split_path = args.work_dir / "splits.json"
-    cache_dir = args.work_dir / f"cache-{cache_size}"
+    cache_dir = args.work_dir / f"cache-{cache_size}-{args.cache_dtype}"
     webdataset_dir = args.work_dir / f"webdataset-{cache_size}"
 
     run_metadata = {
@@ -177,11 +181,13 @@ def main() -> int:
         "missing_policy": "mask_missing",
         "image_size": args.image_size,
         "cache_image_size": cache_size,
+        "cache_dtype": args.cache_dtype,
         "batch_size": args.batch_size,
         "workers": args.workers,
         "prefetch_depth": args.prefetch_depth,
         "prefetch_read_workers": args.prefetch_read_workers,
         "read_mode": args.read_mode,
+        "include_metadata": args.include_metadata,
         "epochs": args.epochs,
         "baselines": baselines,
         "seed": args.seed,
@@ -239,6 +245,7 @@ def main() -> int:
             records=records,
             targets=targets,
             image_size=cache_size,
+            cache_dtype=args.cache_dtype,
         )
     if rebuild_cache:
         cache_report = build_cache(
@@ -246,6 +253,7 @@ def main() -> int:
             targets=targets,
             cache_dir=cache_dir,
             image_size=cache_size,
+            cache_dtype=args.cache_dtype,
             seed=args.seed,
         )
     else:
@@ -679,6 +687,7 @@ def build_cache(
     targets: Sequence[str],
     cache_dir: Path,
     image_size: int,
+    cache_dtype: str,
     seed: int,
 ) -> dict[str, Any]:
     numpy = import_numpy()
@@ -689,13 +698,13 @@ def build_cache(
         "name": f"cxr-{image_size}",
         "channels": 1,
         "size": [image_size, image_size],
-        "dtype": "float32",
+        "dtype": cache_dtype,
         "operations": [
             "decode_png_or_jpeg",
             "convert_grayscale",
             "resize_square_area",
-            "scale_0_1",
-            "normalize_train_mean_std",
+            "store_uint8_pixels" if cache_dtype == "uint8" else "scale_0_1",
+            "defer_normalize_to_reader" if cache_dtype == "uint8" else "normalize_train_mean_std",
         ],
     }
     transform_hash = stable_hash(transform)
@@ -707,23 +716,28 @@ def build_cache(
     failed: list[str] = []
     for split in ("train", "val", "test"):
         split_records = [record for record in records if record.split == split]
-        images_path = cache_dir / f"{split}-images.float32.dat"
+        images_path = cache_dir / f"{split}-images.{cache_dtype}.dat"
         labels_path = cache_dir / f"{split}-labels.float32.dat"
         masks_path = cache_dir / f"{split}-masks.float32.dat"
         metadata_path = cache_dir / f"{split}-metadata.jsonl"
         shape = (len(split_records), 1, image_size, image_size)
-        images = numpy.memmap(images_path, dtype="float32", mode="w+", shape=shape)
+        images = numpy.memmap(images_path, dtype=cache_dtype, mode="w+", shape=shape)
         labels = numpy.zeros((len(split_records), len(targets)), dtype="float32")
         masks = numpy.zeros((len(split_records), len(targets)), dtype="float32")
         with metadata_path.open("w", encoding="utf-8") as handle:
             for index, record in enumerate(split_records):
                 try:
-                    images[index, 0, :, :] = preprocess_image_to_numpy(
-                        record.image_path,
-                        image_size=image_size,
-                        mean=mean,
-                        std=std,
-                    )
+                    if cache_dtype == "uint8":
+                        images[index, 0, :, :] = load_resized_grayscale(
+                            record.image_path, image_size
+                        )
+                    else:
+                        images[index, 0, :, :] = preprocess_image_to_numpy(
+                            record.image_path,
+                            image_size=image_size,
+                            mean=mean,
+                            std=std,
+                        ).astype(cache_dtype)
                 except Exception as error:
                     failed.append(f"{record.sample_id}: {error}")
                     continue
@@ -757,10 +771,10 @@ def build_cache(
         "cache_schema_version": 1,
         "report_schema_version": 1,
         "cache_dir": str(cache_dir),
-        "cache_kind": "medkit_rust_compatible_mmap_float32",
+        "cache_kind": f"medkit_rust_compatible_mmap_{cache_dtype}",
         "cache_reused": False,
         "channels": 1,
-        "dtype": "float32",
+        "dtype": cache_dtype,
         "image_size": image_size,
         "targets": list(targets),
         "label_policy": {
@@ -779,7 +793,7 @@ def build_cache(
             "channels": 1,
             "height": image_size,
             "width": image_size,
-            "dtype": "float32",
+            "dtype": cache_dtype,
             "transform": "decode grayscale, resize square, normalize dataset mean/std",
         },
         "normalization": {"mean": mean, "std": std},
@@ -805,10 +819,13 @@ def cache_matches_run(
     records: Sequence[SampleRecord],
     targets: Sequence[str],
     image_size: int,
+    cache_dtype: str,
 ) -> bool:
     if int(cache_report.get("cache_schema_version", 0)) != 1:
         return False
-    if cache_report.get("cache_kind") != "medkit_rust_compatible_mmap_float32":
+    if cache_report.get("cache_kind") != f"medkit_rust_compatible_mmap_{cache_dtype}":
+        return False
+    if str(cache_report.get("dtype", "float32")) != cache_dtype:
         return False
     if int(cache_report.get("image_size", 0)) != image_size:
         return False
@@ -1007,6 +1024,7 @@ def run_all_baselines(
                 prefetch_depth=args.prefetch_depth,
                 prefetch_read_workers=args.prefetch_read_workers,
                 read_mode=args.read_mode,
+                include_metadata=args.include_metadata,
                 seed=args.seed,
             )
         except Exception as error:
@@ -1072,6 +1090,7 @@ def make_loader_factory(
     prefetch_depth: int,
     prefetch_read_workers: int,
     read_mode: str,
+    include_metadata: bool,
     seed: int,
 ) -> Any:
     torch = import_torch()
@@ -1163,14 +1182,32 @@ def make_loader_factory(
             )
             for split in ("train", "val", "test")
         }
-        return lambda split, shuffle=False: torch.utils.data.DataLoader(
-            dataset_by_split[split],
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=0 if resident else workers,
-            pin_memory=pin_memory,
-            persistent_workers=(not resident and workers > 0),
-        )
+
+        def make_cached_loader(split: str, shuffle: bool = False) -> Any:
+            loader = torch.utils.data.DataLoader(
+                dataset_by_split[split],
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=0 if resident else workers,
+                pin_memory=pin_memory,
+                persistent_workers=(not resident and workers > 0),
+            )
+            return with_report_metadata(
+                loader,
+                {
+                    "baseline": baseline,
+                    "cache_dir": str(cache_dir),
+                    "cache_dtype": cache_dtype_from_metadata(cache_dir),
+                    "batch_size": batch_size,
+                    "worker_mode": "resident" if resident else "pytorch_workers",
+                    "num_workers": 0 if resident else workers,
+                    "pin_memory": pin_memory,
+                    "shuffle": shuffle,
+                    "native_prefetch": False,
+                },
+            )
+
+        return make_cached_loader
     if baseline in {"medkit_dropin_cxr", "medkit_dropin_cxr_pinned"}:
         medkit_rs = import_medkit_rs()
         pin_memory = baseline == "medkit_dropin_cxr_pinned"
@@ -1180,6 +1217,7 @@ def make_loader_factory(
                 cache_dir=cache_dir,
                 split=split,
                 read_mode=read_mode,
+                include_metadata=include_metadata,
             )
             loader = medkit_rs.cxr.DataLoader(
                 dataset,
@@ -1191,11 +1229,14 @@ def make_loader_factory(
                 prefetch_depth=prefetch_depth,
                 read_workers=prefetch_read_workers,
                 read_mode=read_mode,
+                include_metadata=include_metadata,
             )
             return with_report_metadata(
                 loader,
                 {
                     "baseline": baseline,
+                    "cache_dir": str(cache_dir),
+                    "cache_dtype": cache_dtype_from_metadata(cache_dir),
                     "dataset_api": "medkit_rs.cxr.Dataset",
                     "loader_api": "medkit_rs.cxr.DataLoader",
                     "batch_size": batch_size,
@@ -1205,6 +1246,7 @@ def make_loader_factory(
                     "prefetch_depth": prefetch_depth,
                     "prefetch_read_workers": prefetch_read_workers,
                     "read_mode": read_mode,
+                    "include_metadata": include_metadata,
                     "shuffle": shuffle,
                     "native_prefetch": True,
                     "dropin_api": True,
@@ -1225,6 +1267,7 @@ def make_loader_factory(
                 shuffle=shuffle,
                 seed=seed,
                 read_mode=read_mode,
+                include_metadata=include_metadata,
             )
             loader = torch.utils.data.DataLoader(
                 dataset,
@@ -1237,11 +1280,14 @@ def make_loader_factory(
                 loader,
                 {
                     "baseline": baseline,
+                    "cache_dir": str(cache_dir),
+                    "cache_dtype": cache_dtype_from_metadata(cache_dir),
                     "batch_size": batch_size,
                     "worker_mode": "single_process",
                     "num_workers": 0,
                     "pin_memory": pin_memory,
                     "read_mode": read_mode,
+                    "include_metadata": include_metadata,
                     "shuffle": shuffle,
                     "native_prefetch": False,
                 },
@@ -1263,6 +1309,7 @@ def make_loader_factory(
                 prefetch_depth=prefetch_depth,
                 read_workers=prefetch_read_workers,
                 read_mode=read_mode,
+                include_metadata=include_metadata,
             )
             loader = torch.utils.data.DataLoader(
                 dataset,
@@ -1275,6 +1322,8 @@ def make_loader_factory(
                 loader,
                 {
                     "baseline": baseline,
+                    "cache_dir": str(cache_dir),
+                    "cache_dtype": cache_dtype_from_metadata(cache_dir),
                     "batch_size": batch_size,
                     "worker_mode": "rust_thread_prefetch",
                     "num_workers": 0,
@@ -1282,6 +1331,7 @@ def make_loader_factory(
                     "prefetch_depth": prefetch_depth,
                     "prefetch_read_workers": prefetch_read_workers,
                     "read_mode": read_mode,
+                    "include_metadata": include_metadata,
                     "shuffle": shuffle,
                     "native_prefetch": True,
                     "native_prefetch_threads": 1,
@@ -1477,9 +1527,13 @@ class CachedCxrDataset:
         split_info = metadata["splits"][split]
         self.targets = list(targets)
         self.shape = tuple(split_info["shape"])
+        self.image_dtype = str(metadata.get("dtype", "float32"))
+        normalization = metadata.get("normalization", {})
+        self.mean = float(normalization.get("mean", 0.5))
+        self.std = float(normalization.get("std", 0.25))
         images = numpy.memmap(
             split_info["images_path"],
-            dtype="float32",
+            dtype=self.image_dtype,
             mode="r",
             shape=tuple(self.shape),
         )
@@ -1504,8 +1558,13 @@ class CachedCxrDataset:
     def __getitem__(self, index: int) -> dict[str, Any]:
         torch = import_torch()
         record = self.records[index]
+        image = self.images[index]
+        if self.image_dtype == "uint8":
+            image = (image.astype("float32") / 255.0 - self.mean) / self.std
+        else:
+            image = image.astype("float32", copy=False)
         return {
-            "image": torch.from_numpy(self.images[index].copy()),
+            "image": torch.from_numpy(image.copy()),
             "labels": torch.from_numpy(self.labels[index].copy()),
             "mask": torch.from_numpy(self.masks[index].copy()),
             "patient_id": record.get("patient_id", ""),
@@ -2278,6 +2337,17 @@ def cache_normalization(cache_dir: Path) -> tuple[float, float]:
     return float(norm.get("mean", 0.5)), float(norm.get("std", 0.25))
 
 
+def cache_dtype_from_metadata(cache_dir: Path) -> str:
+    try:
+        metadata = load_json(cache_dir / "cache-metadata.json")
+    except (OSError, json.JSONDecodeError):
+        return "unknown"
+    image_size_policy = metadata.get("image_size_policy", {})
+    if not isinstance(image_size_policy, dict):
+        image_size_policy = {}
+    return str(metadata.get("dtype") or image_size_policy.get("dtype") or "unknown")
+
+
 def write_manifest(path: Path, records: Sequence[SampleRecord]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -2365,7 +2435,7 @@ def memory_snapshot(
     if full_info:
         snapshot["sources"].append("psutil.Process.memory_full_info")
         snapshot.update(full_info)
-    smaps, smaps_source = smaps_memory()
+    smaps, smaps_source = smaps_memory(smaps_cache_path_categories(pipeline))
     if smaps:
         snapshot["sources"].append(smaps_source)
         snapshot.update(smaps)
@@ -2382,8 +2452,15 @@ def memory_summary(reports: dict[str, dict[str, dict[str, Any]]]) -> dict[str, A
         "psutil_swap_mb",
         "smaps_pss_mb",
         "smaps_pss_file_mb",
+        "smaps_pss_cache_images_mb",
+        "smaps_pss_cache_labels_mb",
+        "smaps_pss_cache_masks_mb",
+        "smaps_pss_metadata_mb",
+        "smaps_pss_other_file_mb",
         "smaps_uss_mb",
         "smaps_private_dirty_mb",
+        "smaps_private_clean_mb",
+        "smaps_locked_mb",
         "max_batch_tensor_mb",
         "estimated_pinned_memory_mb",
     )
@@ -2447,11 +2524,25 @@ def psutil_memory_full_info() -> dict[str, float]:
     return report
 
 
-def smaps_memory() -> tuple[dict[str, float], str]:
+def smaps_memory(cache_file_categories: dict[str, str] | None = None) -> tuple[dict[str, float], str]:
     rollup = smaps_rollup_memory()
+    smaps = smaps_full_memory(cache_file_categories)
+    if rollup and smaps:
+        combined = dict(rollup)
+        for key, value in smaps.items():
+            if key.startswith("smaps_pss_cache_") or key in {
+                "smaps_pss_file_mb",
+                "smaps_pss_anon_mb",
+                "smaps_pss_heap_mb",
+                "smaps_pss_stack_mb",
+                "smaps_pss_dev_mb",
+                "smaps_pss_metadata_mb",
+                "smaps_pss_other_file_mb",
+            }:
+                combined[key] = value
+        return combined, "/proc/self/smaps_rollup+/proc/self/smaps"
     if rollup:
         return rollup, "/proc/self/smaps_rollup"
-    smaps = smaps_full_memory()
     if smaps:
         return smaps, "/proc/self/smaps"
     return {}, ""
@@ -2502,7 +2593,7 @@ def smaps_rollup_memory() -> dict[str, float]:
     return report
 
 
-def smaps_full_memory() -> dict[str, float]:
+def smaps_full_memory(cache_file_categories: dict[str, str] | None = None) -> dict[str, float]:
     path = Path("/proc/self/smaps")
     if not path.exists():
         return {}
@@ -2510,15 +2601,23 @@ def smaps_full_memory() -> dict[str, float]:
         raw = path.read_text()
     except OSError:
         return {}
+    return parse_smaps_full_memory(raw, cache_file_categories)
+
+
+def parse_smaps_full_memory(
+    raw: str,
+    cache_file_categories: dict[str, str] | None = None,
+) -> dict[str, float]:
     totals: dict[str, int] = {}
-    file_pss_kb = 0
-    anon_pss_kb = 0
-    current_is_file_backed = False
+    pss_buckets_kb: dict[str, int] = {}
+    current_bucket = "anon"
     for line in raw.splitlines():
         if not line:
             continue
+        if SMAPS_HEADER_RE.match(line):
+            current_bucket = smaps_mapping_bucket(line, cache_file_categories or {})
+            continue
         if ":" not in line:
-            current_is_file_backed = smaps_header_is_file_backed(line)
             continue
         key, rest = line.split(":", 1)
         parts = rest.strip().split()
@@ -2530,10 +2629,7 @@ def smaps_full_memory() -> dict[str, float]:
             continue
         totals[key] = totals.get(key, 0) + value_kb
         if key == "Pss":
-            if current_is_file_backed:
-                file_pss_kb += value_kb
-            else:
-                anon_pss_kb += value_kb
+            pss_buckets_kb[current_bucket] = pss_buckets_kb.get(current_bucket, 0) + value_kb
 
     private_clean = totals.get("Private_Clean", 0)
     private_dirty = totals.get("Private_Dirty", 0)
@@ -2552,18 +2648,117 @@ def smaps_full_memory() -> dict[str, float]:
         for output_name, field in fields.items()
         if field in totals
     }
-    report["smaps_pss_file_mb"] = kib_to_mb(file_pss_kb)
-    report["smaps_pss_anon_mb"] = kib_to_mb(anon_pss_kb)
+    file_buckets = (
+        "cache_images",
+        "cache_labels",
+        "cache_masks",
+        "metadata",
+        "other_file",
+        "dev",
+    )
+    anon_buckets = ("anon", "heap", "stack")
+    report["smaps_pss_file_mb"] = kib_to_mb(
+        sum(pss_buckets_kb.get(bucket, 0) for bucket in file_buckets)
+    )
+    report["smaps_pss_anon_mb"] = kib_to_mb(
+        sum(pss_buckets_kb.get(bucket, 0) for bucket in anon_buckets)
+    )
+    for bucket, field in {
+        "cache_images": "smaps_pss_cache_images_mb",
+        "cache_labels": "smaps_pss_cache_labels_mb",
+        "cache_masks": "smaps_pss_cache_masks_mb",
+        "metadata": "smaps_pss_metadata_mb",
+        "other_file": "smaps_pss_other_file_mb",
+        "heap": "smaps_pss_heap_mb",
+        "stack": "smaps_pss_stack_mb",
+        "dev": "smaps_pss_dev_mb",
+    }.items():
+        report[field] = kib_to_mb(pss_buckets_kb.get(bucket, 0))
     report["smaps_uss_mb"] = kib_to_mb(private_clean + private_dirty)
     return report
 
 
 def smaps_header_is_file_backed(line: str) -> bool:
+    return smaps_mapping_bucket(line, {}) in {
+        "other_file",
+        "cache_images",
+        "cache_labels",
+        "cache_masks",
+        "metadata",
+        "dev",
+    }
+
+
+def smaps_mapping_bucket(line: str, cache_file_categories: dict[str, str]) -> str:
+    pathname = smaps_header_pathname(line)
+    if not pathname:
+        return "anon"
+    if pathname == "[heap]":
+        return "heap"
+    if pathname.startswith("[stack"):
+        return "stack"
+    if pathname.startswith("[dev:"):
+        return "dev"
+    if pathname.startswith("["):
+        return "anon"
+    normalized = normalize_smaps_pathname(pathname)
+    category = cache_file_categories.get(normalized)
+    if category:
+        return category
+    if normalized.startswith("/dev/"):
+        return "dev"
+    return "other_file"
+
+
+def smaps_header_pathname(line: str) -> str:
     parts = line.split(maxsplit=5)
     if len(parts) < 6:
-        return False
-    pathname = parts[5]
-    return bool(pathname) and not pathname.startswith("[")
+        return ""
+    return parts[5]
+
+
+def normalize_smaps_pathname(pathname: str) -> str:
+    if pathname.endswith(" (deleted)"):
+        pathname = pathname[: -len(" (deleted)")]
+    try:
+        return str(Path(pathname).resolve(strict=False))
+    except OSError:
+        return pathname
+
+
+def smaps_cache_path_categories(pipeline: dict[str, Any] | None) -> dict[str, str]:
+    if not pipeline:
+        return {}
+    cache_dir_value = pipeline.get("cache_dir")
+    if not cache_dir_value:
+        return {}
+    cache_dir = Path(str(cache_dir_value))
+    metadata_path = cache_dir / "cache-metadata.json"
+    try:
+        metadata = load_json(metadata_path)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    splits = metadata.get("splits")
+    if not isinstance(splits, dict):
+        return {}
+    categories: dict[str, str] = {}
+    for split_info in splits.values():
+        if not isinstance(split_info, dict):
+            continue
+        for key, category in {
+            "images_path": "cache_images",
+            "labels_path": "cache_labels",
+            "masks_path": "cache_masks",
+            "metadata_path": "metadata",
+        }.items():
+            value = split_info.get(key)
+            if not value:
+                continue
+            path = Path(str(value))
+            if not path.is_absolute():
+                path = cache_dir / path
+            categories[normalize_smaps_pathname(str(path))] = category
+    return categories
 
 
 def estimate_pinned_memory_mb(

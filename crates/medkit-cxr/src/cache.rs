@@ -1,7 +1,11 @@
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File},
-    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::Arc,
     thread,
@@ -17,7 +21,7 @@ use crate::{
     manifest::{is_dicom_record, read_manifest},
     types::{
         CacheConfig, CacheSplitSummary, CacheSummary, CacheValidationSummary, CxrCacheBatch,
-        CxrCacheReadMode, CxrCacheReader, CxrIndexedReadMetrics, CxrRecord,
+        CxrCacheDType, CxrCacheReadMode, CxrCacheReader, CxrIndexedReadMetrics, CxrRecord,
         DicomPresentationPolicy, ImageSizePolicy, LabelPolicy, Normalization, SplitFile,
         SplitPolicyMetadata, TransferSyntaxPolicy, ValidateCacheConfig, CXR_CACHE_SCHEMA_VERSION,
         CXR_REPORT_SCHEMA_VERSION,
@@ -38,10 +42,11 @@ struct CxrIndexedRunRead {
     masks: Vec<f32>,
 }
 
-struct CacheSplitPaths<'a> {
-    images: &'a Path,
-    labels: &'a Path,
-    masks: &'a Path,
+#[derive(Clone, Copy)]
+struct CacheSplitFiles<'a> {
+    images: &'a File,
+    labels: &'a File,
+    masks: &'a File,
 }
 
 struct CacheSplitBuffers<'a> {
@@ -56,6 +61,7 @@ pub struct CxrCacheOptions {
     pub recipe_hash: String,
     pub recipe_path: String,
     pub label_policy: LabelPolicy,
+    pub cache_dtype: CxrCacheDType,
     pub image_size_policy: ImageSizePolicy,
     pub dicom_presentation_policy: DicomPresentationPolicy,
     pub transfer_syntax_policy: TransferSyntaxPolicy,
@@ -117,6 +123,7 @@ fn cache_cxr_in_staging(
     } else {
         "decode grayscale, resize longest side, pad square, normalize dataset mean/std"
     };
+    let cache_dtype = options.cache_dtype;
     let train_records = records_for_split(records, &split_file.train)?;
     let normalization = estimate_normalization(&train_records, image_size, options)?;
     let mut splits = BTreeMap::new();
@@ -145,7 +152,7 @@ fn cache_cxr_in_staging(
         cache_dir: config.cache_dir.display().to_string(),
         image_size,
         channels: 1,
-        dtype: "float32".to_string(),
+        dtype: cache_dtype.as_str().to_string(),
         targets,
         label_policy: options.label_policy.clone(),
         normalization,
@@ -156,13 +163,15 @@ fn cache_cxr_in_staging(
         source_manifest_checksum: hash_file(&config.manifest_path)?,
         split_names,
         image_size_policy: if options.image_size_policy.height > 0 {
-            options.image_size_policy.clone()
+            let mut policy = options.image_size_policy.clone();
+            policy.dtype = cache_dtype.as_str().to_string();
+            policy
         } else {
             ImageSizePolicy {
                 channels: 1,
                 height: image_size,
                 width: image_size,
-                dtype: "float32".to_string(),
+                dtype: cache_dtype.as_str().to_string(),
                 transform: transform_description.to_string(),
             }
         },
@@ -344,6 +353,11 @@ pub fn validate_cache_cxr(
         }
         None => summary.splits.keys().cloned().collect::<Vec<_>>(),
     };
+    let image_dtype = if summary.dtype.is_empty() {
+        CxrCacheDType::Float32
+    } else {
+        summary.dtype.parse().map_err(CxrError::Message)?
+    };
 
     for split in &checked_splits {
         let split_summary = summary
@@ -354,6 +368,7 @@ pub fn validate_cache_cxr(
             &config.cache_dir,
             split,
             split_summary,
+            image_dtype,
             summary.targets.len(),
             config.expected_image_shape,
             &mut errors,
@@ -435,11 +450,17 @@ impl CxrCacheReader {
                 split_summary.shape
             )));
         }
+        let image_dtype = if summary.dtype.is_empty() {
+            CxrCacheDType::Float32
+        } else {
+            summary.dtype.parse().map_err(CxrError::Message)?
+        };
         let mut file_errors = Vec::new();
         validate_cache_split_files(
             &cache_dir,
             &split,
             &split_summary,
+            image_dtype,
             summary.targets.len(),
             None,
             &mut file_errors,
@@ -457,18 +478,29 @@ impl CxrCacheReader {
         let images_path = resolve_cache_path(&cache_dir, &split_summary.images_path);
         let labels_path = resolve_cache_path(&cache_dir, &split_summary.labels_path);
         let masks_path = resolve_cache_path(&cache_dir, &split_summary.masks_path);
-        let (images_mmap, labels_mmap, masks_mmap) = match read_mode {
-            CxrCacheReadMode::Mmap => (
-                Some(Arc::new(mmap_file(&images_path)?)),
-                Some(Arc::new(mmap_file(&labels_path)?)),
-                Some(Arc::new(mmap_file(&masks_path)?)),
-            ),
-            CxrCacheReadMode::Stream => (None, None, None),
-        };
+        let (images_mmap, labels_mmap, masks_mmap, images_file, labels_file, masks_file) =
+            match read_mode {
+                CxrCacheReadMode::Mmap => (
+                    Some(Arc::new(mmap_file(&images_path)?)),
+                    Some(Arc::new(mmap_file(&labels_path)?)),
+                    Some(Arc::new(mmap_file(&masks_path)?)),
+                    None,
+                    None,
+                    None,
+                ),
+                CxrCacheReadMode::Stream => (
+                    None,
+                    None,
+                    None,
+                    Some(Arc::new(File::open(&images_path)?)),
+                    Some(Arc::new(File::open(&labels_path)?)),
+                    Some(Arc::new(File::open(&masks_path)?)),
+                ),
+            };
         Ok(Self {
-            cache_dir,
             split,
             read_mode,
+            image_dtype,
             summary,
             split_summary,
             records,
@@ -480,6 +512,9 @@ impl CxrCacheReader {
             images_mmap,
             labels_mmap,
             masks_mmap,
+            images_file,
+            labels_file,
+            masks_file,
         })
     }
 
@@ -625,8 +660,9 @@ impl CxrCacheReader {
         let label_offset = start_index
             .checked_mul(self.target_count)
             .ok_or_else(|| CxrError::Message("label offset overflow".to_string()))?;
-        self.read_f32_range(
+        self.read_image_range(
             self.images_mmap.as_deref(),
+            self.images_file.as_deref(),
             &self.images_path,
             image_offset,
             &mut image_out[..image_values],
@@ -634,6 +670,7 @@ impl CxrCacheReader {
         )?;
         self.read_f32_range(
             self.labels_mmap.as_deref(),
+            self.labels_file.as_deref(),
             &self.labels_path,
             label_offset,
             &mut labels_out[..label_values],
@@ -641,6 +678,7 @@ impl CxrCacheReader {
         )?;
         self.read_f32_range(
             self.masks_mmap.as_deref(),
+            self.masks_file.as_deref(),
             &self.masks_path,
             label_offset,
             &mut masks_out[..label_values],
@@ -701,11 +739,7 @@ impl CxrCacheReader {
             return self
                 .fill_indexed_runs_streaming(
                     &self.indexed_runs(indices)?,
-                    CacheSplitPaths {
-                        images: &self.images_path,
-                        labels: &self.labels_path,
-                        masks: &self.masks_path,
-                    },
+                    self.stream_files()?,
                     CacheSplitBuffers {
                         images: image_out,
                         labels: labels_out,
@@ -732,8 +766,9 @@ impl CxrCacheReader {
             let mut image_scratch = vec![0.0f32; run_samples * self.image_values_per_sample];
             let mut label_scratch = vec![0.0f32; run_samples * self.target_count];
             let mut mask_scratch = vec![0.0f32; run_samples * self.target_count];
-            self.read_f32_range(
+            self.read_image_range(
                 self.images_mmap.as_deref(),
+                self.images_file.as_deref(),
                 &self.images_path,
                 image_offset,
                 &mut image_scratch,
@@ -741,6 +776,7 @@ impl CxrCacheReader {
             )?;
             self.read_f32_range(
                 self.labels_mmap.as_deref(),
+                self.labels_file.as_deref(),
                 &self.labels_path,
                 label_offset,
                 &mut label_scratch,
@@ -748,6 +784,7 @@ impl CxrCacheReader {
             )?;
             self.read_f32_range(
                 self.masks_mmap.as_deref(),
+                self.masks_file.as_deref(),
                 &self.masks_path,
                 label_offset,
                 &mut mask_scratch,
@@ -811,18 +848,26 @@ impl CxrCacheReader {
         }
 
         let runs = self.indexed_runs(indices)?;
+        let bytes = (image_values + label_values + label_values) * std::mem::size_of::<f32>();
+        if self.read_mode == CxrCacheReadMode::Mmap {
+            let read_start = Instant::now();
+            let samples = self.fill_indices(indices, image_out, labels_out, masks_out)?;
+            return Ok(CxrIndexedReadMetrics {
+                samples,
+                runs: runs.len(),
+                workers: 1,
+                read_bytes: bytes,
+                scatter_bytes: bytes,
+                read_micros: read_start.elapsed().as_micros(),
+                scatter_micros: 0,
+            });
+        }
         let worker_count = workers.max(1).min(runs.len().max(1));
-        let image_path = resolve_cache_path(&self.cache_dir, &self.split_summary.images_path);
-        let labels_path = resolve_cache_path(&self.cache_dir, &self.split_summary.labels_path);
-        let masks_path = resolve_cache_path(&self.cache_dir, &self.split_summary.masks_path);
+        let files = self.stream_files()?;
         if worker_count == 1 {
             return self.fill_indexed_runs_streaming(
                 &runs,
-                CacheSplitPaths {
-                    images: &image_path,
-                    labels: &labels_path,
-                    masks: &masks_path,
-                },
+                files,
                 CacheSplitBuffers {
                     images: image_out,
                     labels: labels_out,
@@ -836,15 +881,12 @@ impl CxrCacheReader {
         let run_reads = thread::scope(|scope| {
             let mut handles = Vec::new();
             for chunk in runs.chunks(chunk_size) {
-                let image_path = &image_path;
-                let labels_path = &labels_path;
-                let masks_path = &masks_path;
                 handles.push(scope.spawn(move || {
                     read_indexed_runs(
                         chunk,
-                        image_path,
-                        labels_path,
-                        masks_path,
+                        files,
+                        self.image_dtype,
+                        &self.summary.normalization,
                         self.image_values_per_sample,
                         self.target_count,
                     )
@@ -881,7 +923,6 @@ impl CxrCacheReader {
             }
         }
         let scatter_micros = scatter_start.elapsed().as_micros();
-        let bytes = (image_values + label_values + label_values) * std::mem::size_of::<f32>();
         Ok(CxrIndexedReadMetrics {
             samples,
             runs: runs.len(),
@@ -896,12 +937,9 @@ impl CxrCacheReader {
     fn fill_indexed_runs_streaming(
         &self,
         runs: &[CxrIndexedRun],
-        paths: CacheSplitPaths<'_>,
+        files: CacheSplitFiles<'_>,
         outputs: CacheSplitBuffers<'_>,
     ) -> Result<CxrIndexedReadMetrics, CxrError> {
-        let mut images = File::open(paths.images)?;
-        let mut labels = File::open(paths.labels)?;
-        let mut masks = File::open(paths.masks)?;
         let mut samples = 0usize;
         let mut read_micros = 0u128;
         let mut scatter_micros = 0u128;
@@ -920,9 +958,15 @@ impl CxrCacheReader {
             let mut label_scratch = vec![0.0f32; run.out_indices.len() * self.target_count];
             let mut mask_scratch = vec![0.0f32; run.out_indices.len() * self.target_count];
             let read_start = Instant::now();
-            read_f32_range_from(&mut images, image_offset, &mut image_scratch)?;
-            read_f32_range_from(&mut labels, label_offset, &mut label_scratch)?;
-            read_f32_range_from(&mut masks, label_offset, &mut mask_scratch)?;
+            read_image_range_from_file(
+                files.images,
+                self.image_dtype,
+                &self.summary.normalization,
+                image_offset,
+                &mut image_scratch,
+            )?;
+            read_f32_range_from_file(files.labels, label_offset, &mut label_scratch)?;
+            read_f32_range_from_file(files.masks, label_offset, &mut mask_scratch)?;
             read_micros += read_start.elapsed().as_micros();
 
             let scatter_start = Instant::now();
@@ -964,6 +1008,7 @@ impl CxrCacheReader {
     fn read_f32_range(
         &self,
         mmap: Option<&Mmap>,
+        file: Option<&File>,
         path: &Path,
         start_value: usize,
         out: &mut [f32],
@@ -979,10 +1024,77 @@ impl CxrCacheReader {
                 read_f32_range_from_mmap(mmap, start_value, out)
             }
             CxrCacheReadMode::Stream => {
-                let mut file = File::open(path)?;
-                read_f32_range_from(&mut file, start_value, out)
+                let file = file.ok_or_else(|| {
+                    CxrError::Message(format!(
+                        "CXR cache {kind} file is unavailable for stream read mode: {}",
+                        path.display()
+                    ))
+                })?;
+                read_f32_range_from_file(file, start_value, out)
             }
         }
+    }
+
+    fn read_image_range(
+        &self,
+        mmap: Option<&Mmap>,
+        file: Option<&File>,
+        path: &Path,
+        start_value: usize,
+        out: &mut [f32],
+        kind: &str,
+    ) -> Result<(), CxrError> {
+        match self.read_mode {
+            CxrCacheReadMode::Mmap => {
+                let mmap = mmap.ok_or_else(|| {
+                    CxrError::Message(format!(
+                        "CXR cache {kind} mmap is unavailable for mmap read mode"
+                    ))
+                })?;
+                read_image_range_from_mmap(
+                    mmap,
+                    self.image_dtype,
+                    &self.summary.normalization,
+                    start_value,
+                    out,
+                )
+            }
+            CxrCacheReadMode::Stream => {
+                let file = file.ok_or_else(|| {
+                    CxrError::Message(format!(
+                        "CXR cache {kind} file is unavailable for stream read mode: {}",
+                        path.display()
+                    ))
+                })?;
+                read_image_range_from_file(
+                    file,
+                    self.image_dtype,
+                    &self.summary.normalization,
+                    start_value,
+                    out,
+                )
+            }
+        }
+    }
+
+    fn stream_files(&self) -> Result<CacheSplitFiles<'_>, CxrError> {
+        let images = self
+            .images_file
+            .as_deref()
+            .ok_or_else(|| CxrError::Message("CXR image stream file is unavailable".to_string()))?;
+        let labels = self
+            .labels_file
+            .as_deref()
+            .ok_or_else(|| CxrError::Message("CXR label stream file is unavailable".to_string()))?;
+        let masks = self
+            .masks_file
+            .as_deref()
+            .ok_or_else(|| CxrError::Message("CXR mask stream file is unavailable".to_string()))?;
+        Ok(CacheSplitFiles {
+            images,
+            labels,
+            masks,
+        })
     }
 
     fn actual_batch_size(&self, start_index: usize, batch_size: usize) -> usize {
@@ -1038,7 +1150,8 @@ fn write_cache_split(
     normalization: &Normalization,
     options: &CxrCacheOptions,
 ) -> Result<CacheSplitSummary, CxrError> {
-    let images_name = format!("{split}-images.float32.dat");
+    let image_dtype = options.cache_dtype;
+    let images_name = format!("{split}-images.{}.dat", image_dtype.as_str());
     let labels_name = format!("{split}-labels.float32.dat");
     let masks_name = format!("{split}-masks.float32.dat");
     let metadata_name = format!("{split}-metadata.jsonl");
@@ -1052,16 +1165,14 @@ fn write_cache_split(
     let mut metadata = BufWriter::new(File::create(&metadata_path)?);
 
     for record in records {
-        let values =
-            preprocess_image(record, image_size, normalization, options).map_err(|error| {
+        write_image_cache_record(&mut images, record, image_size, normalization, options).map_err(
+            |error| {
                 CxrError::Message(format!(
                     "failed to preprocess sample {}: {error}",
                     record.sample_id
                 ))
-            })?;
-        for value in values {
-            images.write_all(&value.to_le_bytes())?;
-        }
+            },
+        )?;
         for target in targets {
             let value = record.labels.get(target).copied().flatten();
             let (label, mask) =
@@ -1163,20 +1274,41 @@ fn estimate_normalization(
     })
 }
 
-fn preprocess_image(
+fn write_image_cache_record(
+    writer: &mut impl Write,
     record: &CxrRecord,
     image_size: usize,
     normalization: &Normalization,
     options: &CxrCacheOptions,
-) -> Result<Vec<f32>, CxrError> {
+) -> Result<(), CxrError> {
     let gray = load_resized_luma(record, image_size, options)?;
-    Ok(gray
-        .into_iter()
-        .map(|value| {
-            let scaled = value as f32 / 255.0;
-            (scaled - normalization.mean) / normalization.std
-        })
-        .collect())
+    match options.cache_dtype {
+        CxrCacheDType::Float32 => {
+            for value in normalized_luma_values(gray, normalization) {
+                writer.write_all(&value.to_le_bytes())?;
+            }
+        }
+        CxrCacheDType::Float16 => {
+            for value in normalized_luma_values(gray, normalization) {
+                let half = half::f16::from_f32(value);
+                writer.write_all(&half.to_le_bytes())?;
+            }
+        }
+        CxrCacheDType::Uint8 => {
+            writer.write_all(&gray)?;
+        }
+    }
+    Ok(())
+}
+
+fn normalized_luma_values(
+    gray: Vec<u8>,
+    normalization: &Normalization,
+) -> impl Iterator<Item = f32> + '_ {
+    gray.into_iter().map(|value| {
+        let scaled = value as f32 / 255.0;
+        (scaled - normalization.mean) / normalization.std
+    })
 }
 
 fn load_resized_luma(
@@ -1315,6 +1447,7 @@ fn cache_transform_fingerprint(
         transform_plan_hash,
         &options.targets,
         &options.label_policy,
+        options.cache_dtype.as_str(),
         &options.image_size_policy,
         &options.dicom_presentation_policy,
         &options.transfer_syntax_policy,
@@ -1504,6 +1637,7 @@ fn validate_cache_split_files(
     cache_dir: &Path,
     split: &str,
     split_summary: &CacheSplitSummary,
+    image_dtype: CxrCacheDType,
     target_count: usize,
     expected_image_shape: Option<[usize; 4]>,
     errors: &mut Vec<String>,
@@ -1534,7 +1668,7 @@ fn validate_cache_split_files(
     let images_path = resolve_cache_path(cache_dir, &split_summary.images_path);
     check_file_size(
         &images_path,
-        image_values * std::mem::size_of::<f32>(),
+        image_values * image_dtype.bytes_per_value(),
         split,
         "images",
         errors,
@@ -1687,17 +1821,58 @@ fn read_f32_range_from_mmap(
     Ok(())
 }
 
+fn read_image_range_from_mmap(
+    mmap: &Mmap,
+    dtype: CxrCacheDType,
+    normalization: &Normalization,
+    start_value: usize,
+    out: &mut [f32],
+) -> Result<(), CxrError> {
+    match dtype {
+        CxrCacheDType::Float32 => read_f32_range_from_mmap(mmap, start_value, out),
+        CxrCacheDType::Float16 => {
+            let bytes = mmap_value_bytes(mmap, start_value, out.len(), dtype.bytes_per_value())?;
+            for (slot, chunk) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                *slot = half::f16::from_bits(bits).to_f32();
+            }
+            Ok(())
+        }
+        CxrCacheDType::Uint8 => {
+            let bytes = mmap_value_bytes(mmap, start_value, out.len(), dtype.bytes_per_value())?;
+            decode_uint8_image_values(bytes.iter().copied(), normalization, out);
+            Ok(())
+        }
+    }
+}
+
+fn mmap_value_bytes(
+    mmap: &Mmap,
+    start_value: usize,
+    values: usize,
+    bytes_per_value: usize,
+) -> Result<&[u8], CxrError> {
+    let byte_offset = byte_offset_for(start_value, bytes_per_value)?;
+    let byte_offset = usize::try_from(byte_offset)
+        .map_err(|_| CxrError::Message("cache byte offset overflow".to_string()))?;
+    let byte_len = values
+        .checked_mul(bytes_per_value)
+        .ok_or_else(|| CxrError::Message("cache byte length overflow".to_string()))?;
+    let byte_end = byte_offset
+        .checked_add(byte_len)
+        .ok_or_else(|| CxrError::Message("cache byte range overflow".to_string()))?;
+    mmap.get(byte_offset..byte_end)
+        .ok_or_else(|| CxrError::Message("cache mmap range is out of bounds".to_string()))
+}
+
 fn read_indexed_runs(
     runs: &[CxrIndexedRun],
-    image_path: &Path,
-    labels_path: &Path,
-    masks_path: &Path,
+    files: CacheSplitFiles<'_>,
+    image_dtype: CxrCacheDType,
+    normalization: &Normalization,
     image_values_per_sample: usize,
     target_count: usize,
 ) -> Result<Vec<CxrIndexedRunRead>, CxrError> {
-    let mut images = File::open(image_path)?;
-    let mut labels = File::open(labels_path)?;
-    let mut masks = File::open(masks_path)?;
     let mut reads = Vec::with_capacity(runs.len());
     for run in runs {
         let run_len = run.out_indices.len();
@@ -1712,9 +1887,15 @@ fn read_indexed_runs(
         let mut image_scratch = vec![0.0f32; run_len * image_values_per_sample];
         let mut label_scratch = vec![0.0f32; run_len * target_count];
         let mut mask_scratch = vec![0.0f32; run_len * target_count];
-        read_f32_range_from(&mut images, image_offset, &mut image_scratch)?;
-        read_f32_range_from(&mut labels, label_offset, &mut label_scratch)?;
-        read_f32_range_from(&mut masks, label_offset, &mut mask_scratch)?;
+        read_image_range_from_file(
+            files.images,
+            image_dtype,
+            normalization,
+            image_offset,
+            &mut image_scratch,
+        )?;
+        read_f32_range_from_file(files.labels, label_offset, &mut label_scratch)?;
+        read_f32_range_from_file(files.masks, label_offset, &mut mask_scratch)?;
         reads.push(CxrIndexedRunRead {
             out_indices: run.out_indices.clone(),
             images: image_scratch,
@@ -1725,11 +1906,23 @@ fn read_indexed_runs(
     Ok(reads)
 }
 
-fn read_f32_range_from(
-    file: &mut File,
+fn read_f32_range_from_file(
+    file: &File,
     start_value: usize,
     out: &mut [f32],
 ) -> Result<(), CxrError> {
+    if cfg!(target_endian = "little") {
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                out.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(out),
+            )
+        };
+        read_exact_at(file, bytes, byte_offset(start_value)?)?;
+        return Ok(());
+    }
+
+    let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(byte_offset(start_value)?))?;
     let mut bytes = vec![0u8; std::mem::size_of_val(out)];
     file.read_exact(&mut bytes)?;
@@ -1739,9 +1932,97 @@ fn read_f32_range_from(
     Ok(())
 }
 
+fn read_image_range_from_file(
+    file: &File,
+    dtype: CxrCacheDType,
+    normalization: &Normalization,
+    start_value: usize,
+    out: &mut [f32],
+) -> Result<(), CxrError> {
+    match dtype {
+        CxrCacheDType::Float32 => read_f32_range_from_file(file, start_value, out),
+        CxrCacheDType::Float16 => {
+            let mut bytes = vec![0u8; out.len() * dtype.bytes_per_value()];
+            read_exact_at(
+                file,
+                &mut bytes,
+                byte_offset_for(start_value, dtype.bytes_per_value())?,
+            )?;
+            for (slot, chunk) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                *slot = half::f16::from_bits(bits).to_f32();
+            }
+            Ok(())
+        }
+        CxrCacheDType::Uint8 => {
+            let mut bytes = vec![0u8; out.len()];
+            read_exact_at(
+                file,
+                &mut bytes,
+                byte_offset_for(start_value, dtype.bytes_per_value())?,
+            )?;
+            decode_uint8_image_values(bytes, normalization, out);
+            Ok(())
+        }
+    }
+}
+
+fn decode_uint8_image_values(
+    values: impl IntoIterator<Item = u8>,
+    normalization: &Normalization,
+    out: &mut [f32],
+) {
+    for (slot, value) in out.iter_mut().zip(values) {
+        let scaled = value as f32 / 255.0;
+        *slot = (scaled - normalization.mean) / normalization.std;
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> Result<(), CxrError> {
+    while !buffer.is_empty() {
+        let read = file.read_at(buffer, offset)?;
+        if read == 0 {
+            return Err(CxrError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short positioned read from CXR cache",
+            )));
+        }
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| CxrError::Message("positioned read offset overflow".to_string()))?;
+        let (_, rest) = buffer.split_at_mut(read);
+        buffer = rest;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> Result<(), CxrError> {
+    while !buffer.is_empty() {
+        let read = file.seek_read(buffer, offset)?;
+        if read == 0 {
+            return Err(CxrError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short positioned read from CXR cache",
+            )));
+        }
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| CxrError::Message("positioned read offset overflow".to_string()))?;
+        let (_, rest) = buffer.split_at_mut(read);
+        buffer = rest;
+    }
+    Ok(())
+}
+
 fn byte_offset(value_index: usize) -> Result<u64, CxrError> {
+    byte_offset_for(value_index, std::mem::size_of::<f32>())
+}
+
+fn byte_offset_for(value_index: usize, bytes_per_value: usize) -> Result<u64, CxrError> {
     value_index
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(bytes_per_value)
         .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| CxrError::Message("cache byte offset overflow".to_string()))
 }

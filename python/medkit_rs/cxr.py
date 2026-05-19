@@ -40,6 +40,7 @@ class Dataset(_IterableDatasetBase):
         prefetch_depth: int = 1,
         read_workers: int = 1,
         read_mode: str = "mmap",
+        include_metadata: bool = False,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
@@ -60,6 +61,7 @@ class Dataset(_IterableDatasetBase):
         self.prefetch_depth = prefetch_depth
         self.read_workers = read_workers
         self.read_mode = read_mode
+        self.include_metadata = include_metadata
         self._inner: Any | None = None
 
     def __iter__(self):
@@ -96,6 +98,7 @@ class Dataset(_IterableDatasetBase):
             "prefetch_depth": self.prefetch_depth if self.prefetch else 0,
             "read_workers": self.read_workers if self.prefetch else 0,
             "read_mode": self.read_mode,
+            "include_metadata": self.include_metadata,
             "worker_mode": "rust_thread_prefetch" if self.prefetch else "single_process",
             "num_workers": 0,
             "num_samples": self.num_samples,
@@ -134,6 +137,7 @@ class Dataset(_IterableDatasetBase):
             "prefetch_depth": self.prefetch_depth,
             "read_workers": self.read_workers,
             "read_mode": self.read_mode,
+            "include_metadata": self.include_metadata,
         }
         options.update(
             {key: value for key, value in overrides.items() if value is not None}
@@ -155,6 +159,7 @@ class Dataset(_IterableDatasetBase):
             "shuffle": self.shuffle,
             "seed": self.seed,
             "read_mode": self.read_mode,
+            "include_metadata": self.include_metadata,
         }
         if self.prefetch:
             return MedkitCxrNativePrefetchDataset(
@@ -186,6 +191,7 @@ def DataLoader(
     prefetch_depth: int | None = None,
     read_workers: int | None = None,
     read_mode: str | None = None,
+    include_metadata: bool | None = None,
     drop_last: bool = False,
     persistent_workers: bool = False,
     **kwargs: Any,
@@ -220,6 +226,7 @@ def DataLoader(
         "prefetch_depth": prefetch_depth,
         "read_workers": read_workers,
         "read_mode": read_mode,
+        "include_metadata": include_metadata,
     }
     overrides = {
         key: value
@@ -251,6 +258,7 @@ def datasets(
     prefetch_depth: int = 1,
     read_workers: int = 1,
     read_mode: str = "mmap",
+    include_metadata: bool = False,
     seed: int = 0,
 ) -> dict[str, Dataset]:
     """Construct matching CXR datasets for common train/val/test splits."""
@@ -267,6 +275,7 @@ def datasets(
             prefetch_depth=prefetch_depth,
             read_workers=read_workers,
             read_mode=read_mode,
+            include_metadata=include_metadata,
         )
         for split in splits
     }

@@ -79,7 +79,7 @@ enum CxrPrefetchMessage {
     Ready {
         slot_index: usize,
         samples: usize,
-        records: Vec<CxrRecord>,
+        records: Option<Vec<CxrRecord>>,
         metrics: Option<CxrIndexedReadMetrics>,
     },
     Done,
@@ -303,12 +303,14 @@ impl CxrCacheHandle {
         allocate_cxr_batch_for_reader(py, &self.inner, batch_size, pin_memory)
     }
 
+    #[pyo3(signature = (buffer, start_index, batch_size, include_metadata = false))]
     fn fill_cxr_batch_buffer(
         &self,
         py: Python<'_>,
         buffer: &CxrBatchBuffer,
         start_index: usize,
         batch_size: usize,
+        include_metadata: bool,
     ) -> PyResult<Py<PyAny>> {
         if batch_size == 0 {
             return Err(PyValueError::new_err(
@@ -344,18 +346,25 @@ impl CxrCacheHandle {
             })
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
 
-        let records = self
-            .inner
-            .records_for_range(start_index, written)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        cxr_batch_to_dict(py, buffer, written, &records)
+        let records = if include_metadata {
+            Some(
+                self.inner
+                    .records_for_range(start_index, written)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        cxr_batch_to_dict(py, buffer, written, records.as_deref())
     }
 
+    #[pyo3(signature = (buffer, indices, include_metadata = false))]
     fn fill_cxr_indices_buffer(
         &self,
         py: Python<'_>,
         buffer: &CxrBatchBuffer,
         indices: Vec<usize>,
+        include_metadata: bool,
     ) -> PyResult<Py<PyAny>> {
         let batch_size = indices.len();
         if batch_size == 0 {
@@ -392,14 +401,20 @@ impl CxrCacheHandle {
             })
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
 
-        let records = self
-            .inner
-            .records_for_indices(&indices)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        cxr_batch_to_dict(py, buffer, written, &records)
+        let records = if include_metadata {
+            Some(
+                self.inner
+                    .records_for_indices(&indices)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        cxr_batch_to_dict(py, buffer, written, records.as_deref())
     }
 
-    #[pyo3(signature = (batch_size, batches, pin_memory = false, prefetch_depth = 3, read_workers = 1))]
+    #[pyo3(signature = (batch_size, batches, pin_memory = false, prefetch_depth = 3, read_workers = 1, include_metadata = false))]
+    #[allow(clippy::too_many_arguments)]
     fn create_cxr_prefetcher(
         &self,
         py: Python<'_>,
@@ -408,6 +423,7 @@ impl CxrCacheHandle {
         pin_memory: bool,
         prefetch_depth: usize,
         read_workers: usize,
+        include_metadata: bool,
     ) -> PyResult<CxrPrefetcher> {
         CxrPrefetcher::new(
             py,
@@ -417,6 +433,7 @@ impl CxrCacheHandle {
             pin_memory,
             prefetch_depth,
             read_workers,
+            include_metadata,
         )
     }
 
@@ -460,7 +477,8 @@ impl CxrPrefetcher {
                 }
                 self.slot_leased[slot_index] = true;
                 self.record_ready_metrics(metrics);
-                let batch = cxr_batch_to_dict(py, &self.buffers[slot_index], samples, &records)?;
+                let batch =
+                    cxr_batch_to_dict(py, &self.buffers[slot_index], samples, records.as_deref())?;
                 Ok(Some((slot_index, batch)))
             }
             Ok(CxrPrefetchMessage::Done) => {
@@ -526,6 +544,7 @@ impl CxrPrefetcher {
 }
 
 impl CxrPrefetcher {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         reader: CxrCacheReader,
@@ -534,6 +553,7 @@ impl CxrPrefetcher {
         pin_memory: bool,
         prefetch_depth: usize,
         read_workers: usize,
+        include_metadata: bool,
     ) -> PyResult<Self> {
         if batch_size == 0 {
             return Err(PyValueError::new_err(
@@ -588,6 +608,7 @@ impl CxrPrefetcher {
                 worker_slots,
                 batches,
                 read_workers.max(1),
+                include_metadata,
                 free_rx,
                 ready_tx,
                 worker_stop,
@@ -722,7 +743,7 @@ fn cxr_batch_to_dict(
     py: Python<'_>,
     buffer: &CxrBatchBuffer,
     written: usize,
-    records: &[CxrRecord],
+    records: Option<&[CxrRecord]>,
 ) -> PyResult<Py<PyAny>> {
     if written == 0 {
         return Err(PyRuntimeError::new_err(
@@ -735,11 +756,13 @@ fn cxr_batch_to_dict(
             buffer.batch_size
         )));
     }
-    if records.len() != written {
-        return Err(PyRuntimeError::new_err(format!(
-            "native CXR metadata sidecar has {} records for {written} samples",
-            records.len()
-        )));
+    if let Some(records) = records {
+        if records.len() != written {
+            return Err(PyRuntimeError::new_err(format!(
+                "native CXR metadata sidecar has {} records for {written} samples",
+                records.len()
+            )));
+        }
     }
     let out = PyDict::new_bound(py);
     if written == buffer.batch_size {
@@ -753,7 +776,9 @@ fn cxr_batch_to_dict(
         out.set_item("labels", labels)?;
         out.set_item("mask", buffer.mask.bind(py).get_item(first_dim)?)?;
     }
-    add_cxr_metadata(py, &out, records)?;
+    if let Some(records) = records {
+        add_cxr_metadata(py, &out, records)?;
+    }
     Ok(out.into())
 }
 
@@ -797,11 +822,13 @@ fn add_cxr_metadata(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cxr_prefetch_worker(
     reader: CxrCacheReader,
     slots: Vec<CxrWorkerSlot>,
     batches: Vec<Vec<usize>>,
     read_workers: usize,
+    include_metadata: bool,
     free_rx: Receiver<usize>,
     ready_tx: Sender<CxrPrefetchMessage>,
     stop: Arc<AtomicBool>,
@@ -828,9 +855,14 @@ fn run_cxr_prefetch_worker(
         };
         match fill_cxr_prefetch_slot(&reader, slot, &indices, read_workers) {
             Ok((samples, metrics)) => {
-                let records = reader
-                    .records_for_indices(&indices[..samples])
-                    .expect("CXR prefetch fill returned only valid requested sample indices");
+                let records =
+                    if include_metadata {
+                        Some(reader.records_for_indices(&indices[..samples]).expect(
+                            "CXR prefetch fill returned only valid requested sample indices",
+                        ))
+                    } else {
+                        None
+                    };
                 if ready_tx
                     .send(CxrPrefetchMessage::Ready {
                         slot_index,
@@ -1814,7 +1846,9 @@ def empty_like(tensor):
             );
 
             let buffer = cache.allocate_cxr_batch(py, 2, true).unwrap();
-            let batch = cache.fill_cxr_batch_buffer(py, &buffer, 0, 2).unwrap();
+            let batch = cache
+                .fill_cxr_batch_buffer(py, &buffer, 0, 2, true)
+                .unwrap();
             let batch = batch.bind(py).downcast::<PyDict>().unwrap();
             assert_eq!(
                 batch
@@ -1849,7 +1883,7 @@ def empty_like(tensor):
             );
 
             let indexed = cache
-                .fill_cxr_indices_buffer(py, &buffer, vec![2, 0])
+                .fill_cxr_indices_buffer(py, &buffer, vec![2, 0], true)
                 .unwrap();
             let indexed = indexed.bind(py).downcast::<PyDict>().unwrap();
             assert_eq!(
@@ -1873,7 +1907,9 @@ def empty_like(tensor):
                 vec![100.0, 200.0, 300.0, 400.0, 1.0, 2.0, 3.0, 4.0]
             );
 
-            let partial = cache.fill_cxr_batch_buffer(py, &buffer, 1, 1).unwrap();
+            let partial = cache
+                .fill_cxr_batch_buffer(py, &buffer, 1, 1, false)
+                .unwrap();
             let partial = partial.bind(py).downcast::<PyDict>().unwrap();
             assert_eq!(
                 partial
@@ -1917,16 +1953,20 @@ def empty_like(tensor):
             assert_value_error(py, error, "batch_size must be greater than zero");
 
             let buffer = cache.allocate_cxr_batch(py, 1, false).unwrap();
-            let error = cache.fill_cxr_batch_buffer(py, &buffer, 0, 0).unwrap_err();
+            let error = cache
+                .fill_cxr_batch_buffer(py, &buffer, 0, 0, false)
+                .unwrap_err();
             assert_value_error(py, error, "batch_size must be greater than zero");
-            let error = cache.fill_cxr_batch_buffer(py, &buffer, 0, 2).unwrap_err();
+            let error = cache
+                .fill_cxr_batch_buffer(py, &buffer, 0, 2, false)
+                .unwrap_err();
             assert_value_error(py, error, "exceeds buffer capacity");
             let error = cache
-                .fill_cxr_indices_buffer(py, &buffer, Vec::new())
+                .fill_cxr_indices_buffer(py, &buffer, Vec::new(), false)
                 .unwrap_err();
             assert_value_error(py, error, "indices must contain at least one sample");
             let error = cache
-                .fill_cxr_indices_buffer(py, &buffer, vec![0, 1])
+                .fill_cxr_indices_buffer(py, &buffer, vec![0, 1], false)
                 .unwrap_err();
             assert_value_error(py, error, "exceeds buffer capacity");
         });
@@ -1937,15 +1977,15 @@ def empty_like(tensor):
         with_python(|py| {
             let buffer = dummy_cxr_buffer(py, 2);
 
-            let error = cxr_batch_to_dict(py, &buffer, 0, &[]).unwrap_err();
+            let error = cxr_batch_to_dict(py, &buffer, 0, Some(&[])).unwrap_err();
             assert_runtime_error(py, error, "empty batch");
 
             let records = vec![sample_record("a"), sample_record("b"), sample_record("c")];
-            let error = cxr_batch_to_dict(py, &buffer, 3, &records).unwrap_err();
+            let error = cxr_batch_to_dict(py, &buffer, 3, Some(&records)).unwrap_err();
             assert_runtime_error(py, error, "wrote 3 samples into capacity 2");
 
             let records = vec![sample_record("a")];
-            let error = cxr_batch_to_dict(py, &buffer, 2, &records).unwrap_err();
+            let error = cxr_batch_to_dict(py, &buffer, 2, Some(&records)).unwrap_err();
             assert_runtime_error(py, error, "metadata sidecar has 1 records for 2 samples");
         });
     }
@@ -1956,7 +1996,7 @@ def empty_like(tensor):
             let buffer = dummy_cxr_buffer(py, 2);
             let records = vec![sample_record("a"), sample_record("b")];
 
-            let batch = cxr_batch_to_dict(py, &buffer, 2, &records).unwrap();
+            let batch = cxr_batch_to_dict(py, &buffer, 2, Some(&records)).unwrap();
             let batch = batch.bind(py).downcast::<PyDict>().unwrap();
 
             assert_eq!(
@@ -1981,12 +2021,28 @@ def empty_like(tensor):
     }
 
     #[test]
+    fn cxr_batch_to_dict_omits_metadata_when_not_requested() {
+        with_python(|py| {
+            let buffer = dummy_cxr_buffer(py, 2);
+
+            let batch = cxr_batch_to_dict(py, &buffer, 2, None).unwrap();
+            let batch = batch.bind(py).downcast::<PyDict>().unwrap();
+
+            assert!(batch.get_item("image").unwrap().is_some());
+            assert!(batch.get_item("labels").unwrap().is_some());
+            assert!(batch.get_item("mask").unwrap().is_some());
+            assert!(batch.get_item("metadata").unwrap().is_none());
+            assert!(batch.get_item("sample_id").unwrap().is_none());
+        });
+    }
+
+    #[test]
     fn cxr_batch_to_dict_slices_partial_batches_without_torch() {
         with_python(|py| {
             let buffer = dummy_cxr_buffer(py, 3);
             let records = vec![sample_record("a"), sample_record("b")];
 
-            let batch = cxr_batch_to_dict(py, &buffer, 2, &records).unwrap();
+            let batch = cxr_batch_to_dict(py, &buffer, 2, Some(&records)).unwrap();
             let batch = batch.bind(py).downcast::<PyDict>().unwrap();
 
             assert_eq!(
@@ -2057,17 +2113,19 @@ def empty_like(tensor):
         with_fake_torch(|py| {
             let reader = CxrCacheReader::open(&fixture.cache_dir, "train").unwrap();
 
-            let error = CxrPrefetcher::new(py, reader.clone(), 0, vec![vec![0]], false, 1, 1)
-                .err()
-                .expect("prefetcher should reject zero batch size");
+            let error =
+                CxrPrefetcher::new(py, reader.clone(), 0, vec![vec![0]], false, 1, 1, false)
+                    .err()
+                    .expect("prefetcher should reject zero batch size");
             assert_value_error(py, error, "batch_size must be greater than zero");
 
-            let error = CxrPrefetcher::new(py, reader.clone(), 1, vec![vec![0, 1]], false, 1, 1)
-                .err()
-                .expect("prefetcher should reject oversized batches");
+            let error =
+                CxrPrefetcher::new(py, reader.clone(), 1, vec![vec![0, 1]], false, 1, 1, false)
+                    .err()
+                    .expect("prefetcher should reject oversized batches");
             assert_value_error(py, error, "exceeding batch_size 1");
 
-            let error = CxrPrefetcher::new(py, reader, 1, vec![vec![3]], false, 1, 1)
+            let error = CxrPrefetcher::new(py, reader, 1, vec![vec![3]], false, 1, 1, false)
                 .err()
                 .expect("prefetcher should reject out of bounds sample");
             assert_value_error(py, error, "out of bounds for 3 samples");
@@ -2080,7 +2138,15 @@ def empty_like(tensor):
         with_fake_torch(|py| {
             let cache = CxrCacheHandle::new(fixture.cache_dir.clone(), "train", "mmap").unwrap();
             let mut prefetcher = cache
-                .create_cxr_prefetcher(py, 2, vec![vec![], vec![0, 1], vec![2, 0]], false, 0, 2)
+                .create_cxr_prefetcher(
+                    py,
+                    2,
+                    vec![vec![], vec![0, 1], vec![2, 0]],
+                    false,
+                    0,
+                    2,
+                    true,
+                )
                 .unwrap();
             assert_eq!(
                 prefetcher.__repr__(),
@@ -2145,6 +2211,7 @@ def empty_like(tensor):
             vec![slot],
             vec![vec![0]],
             1,
+            false,
             free_rx,
             ready_tx,
             stop,
@@ -2255,7 +2322,7 @@ def empty_like(tensor):
                 .send(CxrPrefetchMessage::Ready {
                     slot_index: 0,
                     samples: 1,
-                    records: vec![sample_record("a")],
+                    records: Some(vec![sample_record("a")]),
                     metrics: None,
                 })
                 .unwrap();
@@ -2275,7 +2342,7 @@ def empty_like(tensor):
                 .send(CxrPrefetchMessage::Ready {
                     slot_index: 0,
                     samples: 1,
-                    records: vec![sample_record("a")],
+                    records: Some(vec![sample_record("a")]),
                     metrics: Some(CxrIndexedReadMetrics {
                         samples: 1,
                         runs: 2,
@@ -2321,7 +2388,7 @@ def empty_like(tensor):
                     .send(CxrPrefetchMessage::Ready {
                         slot_index: 0,
                         samples: 1,
-                        records: vec![sample_record(suffix)],
+                        records: Some(vec![sample_record(suffix)]),
                         metrics: None,
                     })
                     .unwrap();
@@ -2389,6 +2456,7 @@ def empty_like(tensor):
             vec![slot.clone()],
             vec![vec![0]],
             1,
+            false,
             free_rx,
             ready_tx,
             stop,
@@ -2403,6 +2471,7 @@ def empty_like(tensor):
             vec![slot.clone()],
             vec![vec![0]],
             1,
+            false,
             free_rx,
             ready_tx,
             Arc::new(AtomicBool::new(false)),
@@ -2417,6 +2486,7 @@ def empty_like(tensor):
             vec![slot],
             vec![vec![0]],
             1,
+            false,
             free_rx,
             ready_tx,
             Arc::new(AtomicBool::new(true)),
@@ -2444,6 +2514,7 @@ def empty_like(tensor):
                 vec![slot],
                 vec![vec![0]],
                 1,
+                false,
                 free_rx,
                 ready_tx,
                 worker_stop,
@@ -2479,6 +2550,7 @@ def empty_like(tensor):
             vec![slot.clone()],
             vec![vec![0, 3]],
             1,
+            false,
             free_rx,
             ready_tx,
             Arc::new(AtomicBool::new(false)),
@@ -2495,6 +2567,7 @@ def empty_like(tensor):
             vec![slot],
             vec![vec![2, 0]],
             1,
+            false,
             free_rx,
             ready_tx,
             Arc::new(AtomicBool::new(false)),

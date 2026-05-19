@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::BTreeMap, fmt, fs::File, path::PathBuf, str::FromStr, sync::Arc};
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,48 @@ impl FromStr for CxrCacheReadMode {
             "stream" => Ok(Self::Stream),
             other => Err(format!(
                 "unsupported CXR cache read mode {other:?}; expected 'mmap' or 'stream'"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CxrCacheDType {
+    #[default]
+    Float32,
+    Float16,
+    Uint8,
+}
+
+impl CxrCacheDType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Float32 => "float32",
+            Self::Float16 => "float16",
+            Self::Uint8 => "uint8",
+        }
+    }
+
+    pub fn bytes_per_value(self) -> usize {
+        match self {
+            Self::Float32 => 4,
+            Self::Float16 => 2,
+            Self::Uint8 => 1,
+        }
+    }
+}
+
+impl FromStr for CxrCacheDType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "float32" | "f32" => Ok(Self::Float32),
+            "float16" | "f16" => Ok(Self::Float16),
+            "uint8" | "u8" => Ok(Self::Uint8),
+            other => Err(format!(
+                "unsupported CXR cache dtype {other:?}; expected 'float32', 'float16', or 'uint8'"
             )),
         }
     }
@@ -503,9 +545,9 @@ pub struct IngestSampleIssue {
 
 #[derive(Debug, Clone)]
 pub struct CxrCacheReader {
-    pub(crate) cache_dir: PathBuf,
     pub(crate) split: String,
     pub(crate) read_mode: CxrCacheReadMode,
+    pub(crate) image_dtype: CxrCacheDType,
     pub(crate) summary: CacheSummary,
     pub(crate) split_summary: CacheSplitSummary,
     pub(crate) records: Vec<CxrRecord>,
@@ -517,6 +559,9 @@ pub struct CxrCacheReader {
     pub(crate) images_mmap: Option<Arc<Mmap>>,
     pub(crate) labels_mmap: Option<Arc<Mmap>>,
     pub(crate) masks_mmap: Option<Arc<Mmap>>,
+    pub(crate) images_file: Option<Arc<File>>,
+    pub(crate) labels_file: Option<Arc<File>>,
+    pub(crate) masks_file: Option<Arc<File>>,
 }
 
 #[derive(Debug, Clone)]

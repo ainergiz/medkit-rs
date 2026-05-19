@@ -304,6 +304,7 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         shuffle: bool = False,
         seed: int = 0,
         read_mode: str = "mmap",
+        include_metadata: bool = False,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
@@ -316,6 +317,7 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         self.shuffle = shuffle
         self.seed = seed
         self.read_mode = read_mode
+        self.include_metadata = include_metadata
         self._handle = None
         self._records = 0
         self._targets: list[str] = []
@@ -340,13 +342,20 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
             random.Random(self.seed).shuffle(order)
             while index < length:
                 indices = order[index : min(index + self.batch_size, length)]
-                yield handle.fill_cxr_indices_buffer(buffer, indices)
+                yield handle.fill_cxr_indices_buffer(
+                    buffer, indices, include_metadata=self.include_metadata
+                )
                 index += step
             return
         while index < length:
             start_index = index % self._records
             current = min(self.batch_size, length - index, self._records - start_index)
-            yield handle.fill_cxr_batch_buffer(buffer, start_index, current)
+            yield handle.fill_cxr_batch_buffer(
+                buffer,
+                start_index,
+                current,
+                include_metadata=self.include_metadata,
+            )
             index += step
 
     def __len__(self) -> int:
@@ -403,6 +412,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         prefetch_depth: int = 1,
         read_workers: int = 1,
         read_mode: str = "mmap",
+        include_metadata: bool = False,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
@@ -421,6 +431,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         self.prefetch_depth = prefetch_depth
         self.read_workers = read_workers
         self.read_mode = read_mode
+        self.include_metadata = include_metadata
         self._handle = None
         self._records = 0
         self._targets: list[str] = []
@@ -443,6 +454,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
             pin_memory=self.pin_memory,
             prefetch_depth=self.prefetch_depth,
             read_workers=self.read_workers,
+            include_metadata=self.include_metadata,
         )
         leased_slot: int | None = None
         try:
