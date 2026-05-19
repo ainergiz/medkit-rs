@@ -17,9 +17,10 @@ use crate::{
     manifest::{is_dicom_record, read_manifest},
     types::{
         CacheConfig, CacheSplitSummary, CacheSummary, CacheValidationSummary, CxrCacheBatch,
-        CxrCacheReader, CxrIndexedReadMetrics, CxrRecord, DicomPresentationPolicy, ImageSizePolicy,
-        LabelPolicy, Normalization, SplitFile, SplitPolicyMetadata, TransferSyntaxPolicy,
-        ValidateCacheConfig, CXR_CACHE_SCHEMA_VERSION, CXR_REPORT_SCHEMA_VERSION,
+        CxrCacheReadMode, CxrCacheReader, CxrIndexedReadMetrics, CxrRecord,
+        DicomPresentationPolicy, ImageSizePolicy, LabelPolicy, Normalization, SplitFile,
+        SplitPolicyMetadata, TransferSyntaxPolicy, ValidateCacheConfig, CXR_CACHE_SCHEMA_VERSION,
+        CXR_REPORT_SCHEMA_VERSION,
     },
     util::{collect_targets, directory_size, hash_file, resolve_cache_path, write_json},
 };
@@ -406,6 +407,14 @@ pub fn validate_cache_cxr(
 
 impl CxrCacheReader {
     pub fn open(cache_dir: impl AsRef<Path>, split: impl Into<String>) -> Result<Self, CxrError> {
+        Self::open_with_read_mode(cache_dir, split, CxrCacheReadMode::Mmap)
+    }
+
+    pub fn open_with_read_mode(
+        cache_dir: impl AsRef<Path>,
+        split: impl Into<String>,
+        read_mode: CxrCacheReadMode,
+    ) -> Result<Self, CxrError> {
         let cache_dir = cache_dir.as_ref().to_path_buf();
         let split = split.into();
         let summary = read_cache_summary(&cache_dir)?;
@@ -448,22 +457,38 @@ impl CxrCacheReader {
         let images_path = resolve_cache_path(&cache_dir, &split_summary.images_path);
         let labels_path = resolve_cache_path(&cache_dir, &split_summary.labels_path);
         let masks_path = resolve_cache_path(&cache_dir, &split_summary.masks_path);
+        let (images_mmap, labels_mmap, masks_mmap) = match read_mode {
+            CxrCacheReadMode::Mmap => (
+                Some(Arc::new(mmap_file(&images_path)?)),
+                Some(Arc::new(mmap_file(&labels_path)?)),
+                Some(Arc::new(mmap_file(&masks_path)?)),
+            ),
+            CxrCacheReadMode::Stream => (None, None, None),
+        };
         Ok(Self {
             cache_dir,
             split,
+            read_mode,
             summary,
             split_summary,
             records,
             image_values_per_sample,
             target_count,
-            images_mmap: Arc::new(mmap_file(&images_path)?),
-            labels_mmap: Arc::new(mmap_file(&labels_path)?),
-            masks_mmap: Arc::new(mmap_file(&masks_path)?),
+            images_path,
+            labels_path,
+            masks_path,
+            images_mmap,
+            labels_mmap,
+            masks_mmap,
         })
     }
 
     pub fn split(&self) -> &str {
         &self.split
+    }
+
+    pub fn read_mode(&self) -> CxrCacheReadMode {
+        self.read_mode
     }
 
     pub fn samples(&self) -> usize {
@@ -600,20 +625,26 @@ impl CxrCacheReader {
         let label_offset = start_index
             .checked_mul(self.target_count)
             .ok_or_else(|| CxrError::Message("label offset overflow".to_string()))?;
-        read_f32_range_from_mmap(
-            &self.images_mmap,
+        self.read_f32_range(
+            self.images_mmap.as_deref(),
+            &self.images_path,
             image_offset,
             &mut image_out[..image_values],
+            "images",
         )?;
-        read_f32_range_from_mmap(
-            &self.labels_mmap,
+        self.read_f32_range(
+            self.labels_mmap.as_deref(),
+            &self.labels_path,
             label_offset,
             &mut labels_out[..label_values],
+            "labels",
         )?;
-        read_f32_range_from_mmap(
-            &self.masks_mmap,
+        self.read_f32_range(
+            self.masks_mmap.as_deref(),
+            &self.masks_path,
             label_offset,
             &mut masks_out[..label_values],
+            "masks",
         )?;
         Ok(samples)
     }
@@ -666,6 +697,24 @@ impl CxrCacheReader {
         }
         order.sort_unstable_by_key(|(sample_index, _)| *sample_index);
 
+        if self.read_mode == CxrCacheReadMode::Stream {
+            return self
+                .fill_indexed_runs_streaming(
+                    &self.indexed_runs(indices)?,
+                    CacheSplitPaths {
+                        images: &self.images_path,
+                        labels: &self.labels_path,
+                        masks: &self.masks_path,
+                    },
+                    CacheSplitBuffers {
+                        images: image_out,
+                        labels: labels_out,
+                        masks: masks_out,
+                    },
+                )
+                .map(|metrics| metrics.samples);
+        }
+
         let mut cursor = 0usize;
         while cursor < order.len() {
             let start_sample = order[cursor].0;
@@ -683,9 +732,27 @@ impl CxrCacheReader {
             let mut image_scratch = vec![0.0f32; run_samples * self.image_values_per_sample];
             let mut label_scratch = vec![0.0f32; run_samples * self.target_count];
             let mut mask_scratch = vec![0.0f32; run_samples * self.target_count];
-            read_f32_range_from_mmap(&self.images_mmap, image_offset, &mut image_scratch)?;
-            read_f32_range_from_mmap(&self.labels_mmap, label_offset, &mut label_scratch)?;
-            read_f32_range_from_mmap(&self.masks_mmap, label_offset, &mut mask_scratch)?;
+            self.read_f32_range(
+                self.images_mmap.as_deref(),
+                &self.images_path,
+                image_offset,
+                &mut image_scratch,
+                "images",
+            )?;
+            self.read_f32_range(
+                self.labels_mmap.as_deref(),
+                &self.labels_path,
+                label_offset,
+                &mut label_scratch,
+                "labels",
+            )?;
+            self.read_f32_range(
+                self.masks_mmap.as_deref(),
+                &self.masks_path,
+                label_offset,
+                &mut mask_scratch,
+                "masks",
+            )?;
 
             for (run_index, (_sample_index, out_index)) in order[cursor..end].iter().enumerate() {
                 let src_image_start = run_index * self.image_values_per_sample;
@@ -892,6 +959,30 @@ impl CxrCacheReader {
             read_micros,
             scatter_micros,
         })
+    }
+
+    fn read_f32_range(
+        &self,
+        mmap: Option<&Mmap>,
+        path: &Path,
+        start_value: usize,
+        out: &mut [f32],
+        kind: &str,
+    ) -> Result<(), CxrError> {
+        match self.read_mode {
+            CxrCacheReadMode::Mmap => {
+                let mmap = mmap.ok_or_else(|| {
+                    CxrError::Message(format!(
+                        "CXR cache {kind} mmap is unavailable for mmap read mode"
+                    ))
+                })?;
+                read_f32_range_from_mmap(mmap, start_value, out)
+            }
+            CxrCacheReadMode::Stream => {
+                let mut file = File::open(path)?;
+                read_f32_range_from(&mut file, start_value, out)
+            }
+        }
     }
 
     fn actual_batch_size(&self, start_index: usize, batch_size: usize) -> usize {

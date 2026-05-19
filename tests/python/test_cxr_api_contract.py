@@ -18,6 +18,8 @@ def test_cxr_module_imports_and_validates_arguments() -> None:
 
     with pytest.raises(ValueError, match="batch_size must be greater than zero"):
         cxr.Dataset("unused-cache", batch_size=0)
+    with pytest.raises(ValueError, match="read_mode must be"):
+        cxr.Dataset("unused-cache", read_mode="resident")
 
     with pytest.raises(TypeError, match="expects a medkit_rs.cxr.Dataset"):
         cxr.DataLoader(object())
@@ -72,6 +74,7 @@ def test_cxr_dataloader_contract_against_cli_cache_fixture() -> None:
         prefetch=True,
         prefetch_depth=3,
         read_workers=1,
+        read_mode="mmap",
     )
     loader = cxr.DataLoader(
         dataset,
@@ -92,6 +95,7 @@ def test_cxr_dataloader_contract_against_cli_cache_fixture() -> None:
     assert report["prefetch"] is False
     assert report["prefetch_depth"] == 0
     assert report["read_workers"] == 0
+    assert report["read_mode"] == "mmap"
     assert report["worker_mode"] == "single_process"
     assert report["num_workers"] == 0
     assert report["num_samples"] == length

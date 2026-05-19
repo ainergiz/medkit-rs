@@ -13,7 +13,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use medkit_cxr::{CxrCacheReader, CxrIndexedReadMetrics, CxrRecord};
+use medkit_cxr::{CxrCacheReadMode, CxrCacheReader, CxrIndexedReadMetrics, CxrRecord};
 use medkit_python_ffi::{DatasetHandle as NativeDatasetHandle, StorageMode};
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
@@ -253,9 +253,9 @@ impl DatasetHandle {
 #[pymethods]
 impl CxrCacheHandle {
     #[new]
-    #[pyo3(signature = (cache_dir, split = "train"))]
-    fn new(cache_dir: PathBuf, split: &str) -> PyResult<Self> {
-        CxrCacheReader::open(cache_dir, split)
+    #[pyo3(signature = (cache_dir, split = "train", read_mode = "mmap"))]
+    fn new(cache_dir: PathBuf, split: &str, read_mode: &str) -> PyResult<Self> {
+        CxrCacheReader::open_with_read_mode(cache_dir, split, parse_cxr_read_mode(read_mode)?)
             .map(|inner| Self { inner })
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
@@ -286,6 +286,11 @@ impl CxrCacheHandle {
     fn image_shape(&self) -> (usize, usize, usize, usize) {
         let [batch, channels, height, width] = self.inner.image_shape();
         (batch, channels, height, width)
+    }
+
+    #[getter]
+    fn read_mode(&self) -> &'static str {
+        self.inner.read_mode().as_str()
     }
 
     #[pyo3(signature = (batch_size, pin_memory = false))]
@@ -651,9 +656,9 @@ fn open_dataset(
 }
 
 #[pyfunction]
-#[pyo3(signature = (cache_dir, split = "train"))]
-fn open_cxr_cache(cache_dir: PathBuf, split: &str) -> PyResult<CxrCacheHandle> {
-    CxrCacheHandle::new(cache_dir, split)
+#[pyo3(signature = (cache_dir, split = "train", read_mode = "mmap"))]
+fn open_cxr_cache(cache_dir: PathBuf, split: &str, read_mode: &str) -> PyResult<CxrCacheHandle> {
+    CxrCacheHandle::new(cache_dir, split, read_mode)
 }
 
 #[pymodule]
@@ -903,6 +908,10 @@ fn parse_storage(value: &str) -> PyResult<StorageMode> {
             "unsupported storage mode {other:?}; expected 'resident' or 'chunked'"
         ))),
     }
+}
+
+fn parse_cxr_read_mode(value: &str) -> PyResult<CxrCacheReadMode> {
+    value.parse().map_err(PyValueError::new_err)
 }
 
 #[cfg(test)]

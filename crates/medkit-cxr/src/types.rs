@@ -45,6 +45,41 @@ pub struct CacheConfig {
     pub cache_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CxrCacheReadMode {
+    Mmap,
+    Stream,
+}
+
+impl CxrCacheReadMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mmap => "mmap",
+            Self::Stream => "stream",
+        }
+    }
+}
+
+impl Default for CxrCacheReadMode {
+    fn default() -> Self {
+        Self::Mmap
+    }
+}
+
+impl FromStr for CxrCacheReadMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "mmap" => Ok(Self::Mmap),
+            "stream" => Ok(Self::Stream),
+            other => Err(format!(
+                "unsupported CXR cache read mode {other:?}; expected 'mmap' or 'stream'"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidateCacheConfig {
     pub cache_dir: PathBuf,
@@ -475,14 +510,18 @@ pub struct IngestSampleIssue {
 pub struct CxrCacheReader {
     pub(crate) cache_dir: PathBuf,
     pub(crate) split: String,
+    pub(crate) read_mode: CxrCacheReadMode,
     pub(crate) summary: CacheSummary,
     pub(crate) split_summary: CacheSplitSummary,
     pub(crate) records: Vec<CxrRecord>,
     pub(crate) image_values_per_sample: usize,
     pub(crate) target_count: usize,
-    pub(crate) images_mmap: Arc<Mmap>,
-    pub(crate) labels_mmap: Arc<Mmap>,
-    pub(crate) masks_mmap: Arc<Mmap>,
+    pub(crate) images_path: PathBuf,
+    pub(crate) labels_path: PathBuf,
+    pub(crate) masks_path: PathBuf,
+    pub(crate) images_mmap: Option<Arc<Mmap>>,
+    pub(crate) labels_mmap: Option<Arc<Mmap>>,
+    pub(crate) masks_mmap: Option<Arc<Mmap>>,
 }
 
 #[derive(Debug, Clone)]

@@ -108,8 +108,9 @@ def main() -> int:
     parser.add_argument("--max-eval-batches", type=int, default=0)
     parser.add_argument("--loader-batches", type=int, default=64)
     parser.add_argument("--warmup-batches", type=int, default=2)
-    parser.add_argument("--prefetch-depth", type=int, default=3)
+    parser.add_argument("--prefetch-depth", type=int, default=1)
     parser.add_argument("--prefetch-read-workers", type=int, default=1)
+    parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
     parser.add_argument(
         "--baselines",
         default="pytorch_raw,monai_raw,medkit_cached_mmap,medkit_pinned_prefetch",
@@ -131,6 +132,8 @@ def main() -> int:
         args.max_train_batches = args.max_train_batches or 8
         args.max_eval_batches = args.max_eval_batches or 4
         args.epochs = min(args.epochs, 1)
+    if args.force_rematerialize:
+        args.force_cache = True
 
     started = time.strftime("%Y%m%d-%H%M%S")
     run_id = args.run_id or (
@@ -178,6 +181,7 @@ def main() -> int:
         "workers": args.workers,
         "prefetch_depth": args.prefetch_depth,
         "prefetch_read_workers": args.prefetch_read_workers,
+        "read_mode": args.read_mode,
         "epochs": args.epochs,
         "baselines": baselines,
         "seed": args.seed,
@@ -288,6 +292,8 @@ def main() -> int:
     write_json(report_dir / "gpu-throughput.json", reports["gpu"])
     write_json(report_dir / "model-quality.json", reports["quality"])
     write_json(report_dir / "threshold-report.json", reports["thresholds"])
+    memory = memory_summary(reports)
+    write_json(report_dir / "memory-summary.json", memory)
     write_json(report_dir / "subgroup-report.json", subgroup_report(records, reports["quality"]))
 
     summary = {
@@ -312,6 +318,7 @@ def main() -> int:
             for name, report in reports["quality"].items()
             if report.get("status") == "ok"
         },
+        "memory": memory,
     }
     write_json(report_dir / "run-summary.json", summary)
     if args.out:
@@ -735,9 +742,13 @@ def build_cache(
         split_reports[split] = {
             "samples": len(split_records),
             "images_path": str(images_path),
+            "images_sha256": hash_file(images_path),
             "labels_path": str(labels_path),
+            "labels_sha256": hash_file(labels_path),
             "masks_path": str(masks_path),
+            "masks_sha256": hash_file(masks_path),
             "metadata_path": str(metadata_path),
+            "metadata_sha256": hash_file(metadata_path),
             "shape": list(shape),
             "image_bytes": images_path.stat().st_size if images_path.exists() else 0,
         }
@@ -762,9 +773,7 @@ def build_cache(
         "transform_plan": transform,
         "transform_plan_hash": transform_hash,
         "transform_fingerprint": transform_hash,
-        "source_manifest_checksum": stable_hash(
-            [record_to_json(record) for record in records]
-        ),
+        "source_manifest_checksum": manifest_checksum(records),
         "split_names": ["train", "val", "test"],
         "image_size_policy": {
             "channels": 1,
@@ -805,6 +814,8 @@ def cache_matches_run(
         return False
     if list(cache_report.get("targets", [])) != list(targets):
         return False
+    if cache_report.get("source_manifest_checksum") != manifest_checksum(records):
+        return False
     splits = cache_report.get("splits")
     if not isinstance(splits, dict):
         return False
@@ -824,6 +835,10 @@ def cache_matches_run(
         if list(split_info.get("shape", [])) != expected_shape:
             return False
     return True
+
+
+def manifest_checksum(records: Sequence[SampleRecord]) -> str:
+    return stable_hash([record_to_json(record) for record in records])
 
 
 def build_webdataset_shards(
@@ -991,6 +1006,7 @@ def run_all_baselines(
                 workers=args.workers,
                 prefetch_depth=args.prefetch_depth,
                 prefetch_read_workers=args.prefetch_read_workers,
+                read_mode=args.read_mode,
                 seed=args.seed,
             )
         except Exception as error:
@@ -1055,6 +1071,7 @@ def make_loader_factory(
     workers: int,
     prefetch_depth: int,
     prefetch_read_workers: int,
+    read_mode: str,
     seed: int,
 ) -> Any:
     torch = import_torch()
@@ -1162,6 +1179,7 @@ def make_loader_factory(
             dataset = medkit_rs.cxr.Dataset(
                 cache_dir=cache_dir,
                 split=split,
+                read_mode=read_mode,
             )
             loader = medkit_rs.cxr.DataLoader(
                 dataset,
@@ -1172,6 +1190,7 @@ def make_loader_factory(
                 prefetch=True,
                 prefetch_depth=prefetch_depth,
                 read_workers=prefetch_read_workers,
+                read_mode=read_mode,
             )
             return with_report_metadata(
                 loader,
@@ -1185,6 +1204,7 @@ def make_loader_factory(
                     "pin_memory": pin_memory,
                     "prefetch_depth": prefetch_depth,
                     "prefetch_read_workers": prefetch_read_workers,
+                    "read_mode": read_mode,
                     "shuffle": shuffle,
                     "native_prefetch": True,
                     "dropin_api": True,
@@ -1204,6 +1224,7 @@ def make_loader_factory(
                 pin_memory=pin_memory,
                 shuffle=shuffle,
                 seed=seed,
+                read_mode=read_mode,
             )
             loader = torch.utils.data.DataLoader(
                 dataset,
@@ -1220,6 +1241,7 @@ def make_loader_factory(
                     "worker_mode": "single_process",
                     "num_workers": 0,
                     "pin_memory": pin_memory,
+                    "read_mode": read_mode,
                     "shuffle": shuffle,
                     "native_prefetch": False,
                 },
@@ -1240,6 +1262,7 @@ def make_loader_factory(
                 seed=seed,
                 prefetch_depth=prefetch_depth,
                 read_workers=prefetch_read_workers,
+                read_mode=read_mode,
             )
             loader = torch.utils.data.DataLoader(
                 dataset,
@@ -1258,6 +1281,7 @@ def make_loader_factory(
                     "pin_memory": pin_memory,
                     "prefetch_depth": prefetch_depth,
                     "prefetch_read_workers": prefetch_read_workers,
+                    "read_mode": read_mode,
                     "shuffle": shuffle,
                     "native_prefetch": True,
                     "native_prefetch_threads": 1,
@@ -1806,12 +1830,14 @@ def benchmark_loader(loader: Any, *, max_batches: int, baseline: str) -> dict[st
     samples = 0
     checksum = 0.0
     batch_count = 0
+    max_batch_tensor_bytes = 0
     for batch in loader:
         now = time.perf_counter()
         if first_batch_seconds is None:
             first_batch_seconds = now - start
         samples += int(batch["image"].shape[0])
         checksum += float(batch["labels"].sum().item())
+        max_batch_tensor_bytes = max(max_batch_tensor_bytes, batch_tensor_bytes(batch))
         batch_count += 1
         if max_batches > 0 and batch_count >= max_batches:
             break
@@ -1829,6 +1855,10 @@ def benchmark_loader(loader: Any, *, max_batches: int, baseline: str) -> dict[st
     }
     if hasattr(loader, "report_metadata"):
         report["pipeline"] = loader.report_metadata()
+    report["memory"] = memory_snapshot(
+        pipeline=report.get("pipeline"),
+        max_batch_tensor_bytes=max_batch_tensor_bytes,
+    )
     return report
 
 
@@ -1869,6 +1899,7 @@ def train_and_evaluate(
     data_wait_seconds = 0.0
     step_seconds = 0.0
     h2d_bytes = 0
+    max_batch_tensor_bytes = 0
     samples = 0
     batches = 0
     train_start = time.perf_counter()
@@ -1883,6 +1914,7 @@ def train_and_evaluate(
                 break
             data_wait_seconds += time.perf_counter() - wait_start
             step_start = time.perf_counter()
+            max_batch_tensor_bytes = max(max_batch_tensor_bytes, batch_tensor_bytes(batch))
             image = batch["image"].to(device, non_blocking=True).float()
             labels = batch["labels"].to(device, non_blocking=True).float()
             mask = batch["mask"].to(device, non_blocking=True).float()
@@ -1951,6 +1983,10 @@ def train_and_evaluate(
     }
     if hasattr(train_loader, "report_metadata"):
         train_report["pipeline"] = train_loader.report_metadata()
+    train_report["memory"] = memory_snapshot(
+        pipeline=train_report.get("pipeline"),
+        max_batch_tensor_bytes=max_batch_tensor_bytes,
+    )
     return train_report, quality, thresholds
 
 
@@ -2191,6 +2227,7 @@ def environment_report(run_metadata: dict[str, Any]) -> dict[str, Any]:
         "medkit_rs",
         "datasets",
         "PIL",
+        "psutil",
         "numpy",
         "sklearn",
     ):
@@ -2309,11 +2346,260 @@ def directory_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
 
+def memory_snapshot(
+    *,
+    pipeline: dict[str, Any] | None = None,
+    max_batch_tensor_bytes: int = 0,
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "peak_rss_mb": peak_rss_mb(),
+        "current_rss_mb": current_rss_mb(),
+        "max_batch_tensor_mb": bytes_to_mb(max_batch_tensor_bytes),
+        "estimated_pinned_memory_mb": estimate_pinned_memory_mb(
+            pipeline=pipeline,
+            max_batch_tensor_bytes=max_batch_tensor_bytes,
+        ),
+        "sources": ["resource.getrusage"],
+    }
+    full_info = psutil_memory_full_info()
+    if full_info:
+        snapshot["sources"].append("psutil.Process.memory_full_info")
+        snapshot.update(full_info)
+    smaps, smaps_source = smaps_memory()
+    if smaps:
+        snapshot["sources"].append(smaps_source)
+        snapshot.update(smaps)
+    return snapshot
+
+
+def memory_summary(reports: dict[str, dict[str, dict[str, Any]]]) -> dict[str, Any]:
+    fields = (
+        "peak_rss_mb",
+        "current_rss_mb",
+        "psutil_rss_mb",
+        "psutil_pss_mb",
+        "psutil_uss_mb",
+        "psutil_swap_mb",
+        "smaps_pss_mb",
+        "smaps_pss_file_mb",
+        "smaps_uss_mb",
+        "smaps_private_dirty_mb",
+        "max_batch_tensor_mb",
+        "estimated_pinned_memory_mb",
+    )
+    summary: dict[str, Any] = {}
+    for section in ("loader", "gpu"):
+        section_reports = reports.get(section, {})
+        section_summary = {}
+        for name, report in section_reports.items():
+            memory = report.get("memory")
+            if not isinstance(memory, dict):
+                continue
+            section_summary[name] = {
+                field: memory[field] for field in fields if field in memory
+            }
+        if section_summary:
+            summary[section] = section_summary
+    return summary
+
+
 def peak_rss_mb() -> float:
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     if sys.platform == "darwin":
         return rss / (1024.0 * 1024.0)
     return rss / 1024.0
+
+
+def current_rss_mb() -> float | None:
+    statm = Path("/proc/self/statm")
+    if statm.exists():
+        try:
+            pages = int(statm.read_text().split()[1])
+            return bytes_to_mb(pages * os.sysconf("SC_PAGE_SIZE"))
+        except (IndexError, OSError, ValueError):
+            pass
+    try:
+        import psutil  # type: ignore
+
+        return bytes_to_mb(int(psutil.Process().memory_info().rss))
+    except Exception:
+        return None
+
+
+def psutil_memory_full_info() -> dict[str, float]:
+    try:
+        import psutil  # type: ignore
+
+        info = psutil.Process().memory_full_info()
+    except Exception:
+        return {}
+    fields = {
+        "psutil_rss_mb": "rss",
+        "psutil_pss_mb": "pss",
+        "psutil_uss_mb": "uss",
+        "psutil_swap_mb": "swap",
+    }
+    report = {}
+    for output_name, attr_name in fields.items():
+        value = getattr(info, attr_name, None)
+        if value is not None:
+            report[output_name] = bytes_to_mb(int(value))
+    return report
+
+
+def smaps_memory() -> tuple[dict[str, float], str]:
+    rollup = smaps_rollup_memory()
+    if rollup:
+        return rollup, "/proc/self/smaps_rollup"
+    smaps = smaps_full_memory()
+    if smaps:
+        return smaps, "/proc/self/smaps"
+    return {}, ""
+
+
+def smaps_rollup_memory() -> dict[str, float]:
+    path = Path("/proc/self/smaps_rollup")
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text()
+    except OSError:
+        return {}
+    values_kb: dict[str, int] = {}
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        key, rest = line.split(":", 1)
+        parts = rest.strip().split()
+        if not parts:
+            continue
+        try:
+            values_kb[key] = int(parts[0])
+        except ValueError:
+            continue
+
+    private_clean = values_kb.get("Private_Clean", 0)
+    private_dirty = values_kb.get("Private_Dirty", 0)
+    fields = {
+        "smaps_rss_mb": "Rss",
+        "smaps_pss_mb": "Pss",
+        "smaps_pss_anon_mb": "Pss_Anon",
+        "smaps_pss_file_mb": "Pss_File",
+        "smaps_pss_shmem_mb": "Pss_Shmem",
+        "smaps_private_clean_mb": "Private_Clean",
+        "smaps_private_dirty_mb": "Private_Dirty",
+        "smaps_shared_clean_mb": "Shared_Clean",
+        "smaps_shared_dirty_mb": "Shared_Dirty",
+        "smaps_locked_mb": "Locked",
+        "smaps_swap_mb": "Swap",
+    }
+    report = {
+        output_name: kib_to_mb(values_kb[field])
+        for output_name, field in fields.items()
+        if field in values_kb
+    }
+    report["smaps_uss_mb"] = kib_to_mb(private_clean + private_dirty)
+    return report
+
+
+def smaps_full_memory() -> dict[str, float]:
+    path = Path("/proc/self/smaps")
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text()
+    except OSError:
+        return {}
+    totals: dict[str, int] = {}
+    file_pss_kb = 0
+    anon_pss_kb = 0
+    current_is_file_backed = False
+    for line in raw.splitlines():
+        if not line:
+            continue
+        if ":" not in line:
+            current_is_file_backed = smaps_header_is_file_backed(line)
+            continue
+        key, rest = line.split(":", 1)
+        parts = rest.strip().split()
+        if not parts:
+            continue
+        try:
+            value_kb = int(parts[0])
+        except ValueError:
+            continue
+        totals[key] = totals.get(key, 0) + value_kb
+        if key == "Pss":
+            if current_is_file_backed:
+                file_pss_kb += value_kb
+            else:
+                anon_pss_kb += value_kb
+
+    private_clean = totals.get("Private_Clean", 0)
+    private_dirty = totals.get("Private_Dirty", 0)
+    fields = {
+        "smaps_rss_mb": "Rss",
+        "smaps_pss_mb": "Pss",
+        "smaps_private_clean_mb": "Private_Clean",
+        "smaps_private_dirty_mb": "Private_Dirty",
+        "smaps_shared_clean_mb": "Shared_Clean",
+        "smaps_shared_dirty_mb": "Shared_Dirty",
+        "smaps_locked_mb": "Locked",
+        "smaps_swap_mb": "Swap",
+    }
+    report = {
+        output_name: kib_to_mb(totals[field])
+        for output_name, field in fields.items()
+        if field in totals
+    }
+    report["smaps_pss_file_mb"] = kib_to_mb(file_pss_kb)
+    report["smaps_pss_anon_mb"] = kib_to_mb(anon_pss_kb)
+    report["smaps_uss_mb"] = kib_to_mb(private_clean + private_dirty)
+    return report
+
+
+def smaps_header_is_file_backed(line: str) -> bool:
+    parts = line.split(maxsplit=5)
+    if len(parts) < 6:
+        return False
+    pathname = parts[5]
+    return bool(pathname) and not pathname.startswith("[")
+
+
+def estimate_pinned_memory_mb(
+    *,
+    pipeline: dict[str, Any] | None,
+    max_batch_tensor_bytes: int,
+) -> float:
+    if not pipeline or not pipeline.get("pin_memory") or max_batch_tensor_bytes <= 0:
+        return 0.0
+    depth = int(pipeline.get("prefetch_depth") or 1)
+    if depth <= 0:
+        depth = 1
+    return bytes_to_mb(max_batch_tensor_bytes * depth)
+
+
+def batch_tensor_bytes(batch: Any) -> int:
+    if not isinstance(batch, dict):
+        return 0
+    total = 0
+    for key in ("image", "labels", "mask"):
+        value = batch.get(key)
+        if value is None:
+            continue
+        numel = getattr(value, "numel", None)
+        element_size = getattr(value, "element_size", None)
+        if callable(numel) and callable(element_size):
+            total += int(numel()) * int(element_size())
+    return total
+
+
+def bytes_to_mb(value: int | float) -> float:
+    return float(value) / (1024.0 * 1024.0)
+
+
+def kib_to_mb(value: int | float) -> float:
+    return float(value) / 1024.0
 
 
 def package_version(name: str) -> str | None:
@@ -2389,8 +2675,9 @@ def import_torch() -> Any:
 
 
 def import_medkit_rs() -> Any:
+    use_local_source = os.environ.get("MEDKIT_BENCHMARK_USE_LOCAL_SOURCE", "1") != "0"
     source_root = Path(__file__).resolve().parents[3] / "python"
-    if source_root.exists() and str(source_root) not in sys.path:
+    if use_local_source and source_root.exists() and str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
     try:
         import medkit_rs  # type: ignore

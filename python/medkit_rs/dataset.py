@@ -303,9 +303,11 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         pin_memory: bool = False,
         shuffle: bool = False,
         seed: int = 0,
+        read_mode: str = "mmap",
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+        read_mode = _validate_cxr_read_mode(read_mode)
         self.cache_dir = Path(cache_dir)
         self.split = split
         self.requested_length = length
@@ -313,6 +315,7 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         self.pin_memory = pin_memory
         self.shuffle = shuffle
         self.seed = seed
+        self.read_mode = read_mode
         self._handle = None
         self._records = 0
         self._targets: list[str] = []
@@ -369,7 +372,7 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         if self._handle is not None:
             return self._handle
         native = _native_module()
-        handle = native.CxrCacheHandle(self.cache_dir, self.split)
+        handle = native.CxrCacheHandle(self.cache_dir, self.split, self.read_mode)
         records = int(handle.records)
         if records <= 0:
             raise ValueError(f"CXR cache split contains no records: {self.split}")
@@ -397,8 +400,9 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         pin_memory: bool = False,
         shuffle: bool = False,
         seed: int = 0,
-        prefetch_depth: int = 3,
+        prefetch_depth: int = 1,
         read_workers: int = 1,
+        read_mode: str = "mmap",
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
@@ -406,6 +410,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
             raise ValueError("prefetch_depth must be greater than zero")
         if read_workers <= 0:
             raise ValueError("read_workers must be greater than zero")
+        read_mode = _validate_cxr_read_mode(read_mode)
         self.cache_dir = Path(cache_dir)
         self.split = split
         self.requested_length = length
@@ -415,6 +420,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         self.seed = seed
         self.prefetch_depth = prefetch_depth
         self.read_workers = read_workers
+        self.read_mode = read_mode
         self._handle = None
         self._records = 0
         self._targets: list[str] = []
@@ -487,7 +493,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         if self._handle is not None:
             return self._handle
         native = _native_module()
-        handle = native.CxrCacheHandle(self.cache_dir, self.split)
+        handle = native.CxrCacheHandle(self.cache_dir, self.split, self.read_mode)
         records = int(handle.records)
         if records <= 0:
             raise ValueError(f"CXR cache split contains no records: {self.split}")
@@ -739,6 +745,12 @@ def _native_module():
             "into python/medkit_rs"
         ) from error
     return _native
+
+
+def _validate_cxr_read_mode(value: str) -> str:
+    if value not in {"mmap", "stream"}:
+        raise ValueError("read_mode must be 'mmap' or 'stream'")
+    return value
 
 
 def _torch():

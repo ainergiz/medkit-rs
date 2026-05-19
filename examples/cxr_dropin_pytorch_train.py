@@ -20,7 +20,7 @@ def main() -> int:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
-    parser.add_argument("--prefetch-depth", type=int, default=3)
+    parser.add_argument("--prefetch-depth", type=int, default=1)
     parser.add_argument("--read-workers", type=int, default=1)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", type=Path, default=Path("cxr-dropin-report.json"))

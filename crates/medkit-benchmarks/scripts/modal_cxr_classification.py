@@ -17,6 +17,9 @@ APP_ROOT = Path("/opt/medkit-rs")
 VOLUME_ROOT = Path("/cache")
 WORK_DIR = VOLUME_ROOT / "cxr"
 REMOTE_REPORT_ROOT = VOLUME_ROOT / "results" / "cxr"
+MODAL_GPU = os.environ.get("MEDKIT_MODAL_GPU", "L4")
+MEDKIT_PACKAGE = os.environ.get("MEDKIT_MODAL_MEDKIT_PACKAGE", "medkit-rs==0.1.0")
+USE_PUBLISHED_MEDKIT = os.environ.get("MEDKIT_MODAL_USE_PYPI", "1") != "0"
 LOCAL_REPO_ROOT = next(
     (
         parent
@@ -48,10 +51,14 @@ def ignore_modal_source(path: Path) -> bool:
     return False
 
 
-image = (
+base_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("build-essential", "ca-certificates", "curl", "git")
-    .run_commands("curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal")
+    if USE_PUBLISHED_MEDKIT
+    else modal.Image.from_registry("rust:1.88-bookworm", add_python="3.11")
+)
+
+image = (
+    base_image.apt_install("ca-certificates", "git")
     .pip_install(
         "uv",
         "torch",
@@ -61,16 +68,20 @@ image = (
         "webdataset",
         "datasets",
         "pillow",
+        "psutil",
         "scikit-learn",
         "numpy",
+        *([MEDKIT_PACKAGE] if USE_PUBLISHED_MEDKIT else []),
     )
     .run_commands(
         "uv pip install --system --extra-index-url https://pypi.nvidia.com --upgrade nvidia-dali-cuda130"
     )
     .add_local_dir(LOCAL_REPO_ROOT, str(APP_ROOT), copy=True, ignore=ignore_modal_source)
     .workdir(str(APP_ROOT))
-    .run_commands("PATH=/root/.cargo/bin:$PATH uv pip install --system .")
 )
+
+if not USE_PUBLISHED_MEDKIT:
+    image = image.run_commands("rustc --version && cargo --version && uv pip install --system .")
 
 
 app = modal.App("medkit-rs-cxr-classification")
@@ -79,7 +90,7 @@ volume = modal.Volume.from_name("medkit-rs-cxr", create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu="L40S",
+    gpu=MODAL_GPU,
     cpu=16,
     memory=65536,
     ephemeral_disk=524288,
@@ -98,8 +109,9 @@ def run_cxr_benchmark(
     epochs: int = 1,
     loader_batches: int = 64,
     warmup_batches: int = 2,
-    prefetch_depth: int = 3,
+    prefetch_depth: int = 1,
     prefetch_read_workers: int = 1,
+    read_mode: str = "mmap",
     max_train_batches: int = 0,
     max_eval_batches: int = 0,
     baselines: str = "pytorch_raw,monai_raw,medkit_cached_mmap,medkit_pinned_prefetch",
@@ -144,6 +156,8 @@ def run_cxr_benchmark(
         str(prefetch_depth),
         "--prefetch-read-workers",
         str(prefetch_read_workers),
+        "--read-mode",
+        read_mode,
         "--baselines",
         baselines,
         "--device",
@@ -162,10 +176,13 @@ def run_cxr_benchmark(
     if force_cache:
         command.append("--force-cache")
 
+    env = os.environ.copy()
+    env["MEDKIT_BENCHMARK_USE_LOCAL_SOURCE"] = "0" if USE_PUBLISHED_MEDKIT else "1"
     start = time.perf_counter()
     completed = subprocess.run(
         command,
         cwd=APP_ROOT,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -207,8 +224,9 @@ def main(
     epochs: int = 1,
     loader_batches: int = 64,
     warmup_batches: int = 2,
-    prefetch_depth: int = 3,
+    prefetch_depth: int = 1,
     prefetch_read_workers: int = 1,
+    read_mode: str = "mmap",
     max_train_batches: int = 0,
     max_eval_batches: int = 0,
     baselines: str = "pytorch_raw,monai_raw,medkit_cached_mmap,medkit_pinned_prefetch",
@@ -218,7 +236,8 @@ def main(
     force_cache: bool = False,
 ) -> None:
     if not run_id:
-        mode = "smoke" if smoke else "l40s"
+        gpu_label = MODAL_GPU.lower().replace(" ", "-").replace(":", "-")
+        mode = "smoke" if smoke else gpu_label
         run_id = f"nih-cxr14-320-{mode}-size{image_size}-n{max_samples}-{time.strftime('%Y%m%d-%H%M%S')}"
     result = run_cxr_benchmark.remote(
         run_id=run_id,
@@ -234,6 +253,7 @@ def main(
         warmup_batches=warmup_batches,
         prefetch_depth=prefetch_depth,
         prefetch_read_workers=prefetch_read_workers,
+        read_mode=read_mode,
         max_train_batches=max_train_batches,
         max_eval_batches=max_eval_batches,
         baselines=baselines,

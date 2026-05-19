@@ -45,9 +45,7 @@ class RunningRow:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Launch CXR Modal benchmark rows concurrently."
-    )
+    parser = argparse.ArgumentParser(description="Launch CXR Modal benchmark rows.")
     parser.add_argument("--batch-id", default="")
     parser.add_argument("--splits", default="")
     parser.add_argument(
@@ -67,11 +65,13 @@ def main() -> int:
     parser.add_argument("--warmup-batches", type=int, default=2)
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-eval-batches", type=int, default=0)
-    parser.add_argument("--prefetch-depth", type=int, default=3)
+    parser.add_argument("--prefetch-depth", type=int, default=1)
     parser.add_argument("--prefetch-read-workers", type=int, default=1)
-    parser.add_argument("--concurrency", type=int, default=3)
+    parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
+    parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--force-cache", action="store_true")
+    parser.add_argument("--force-rematerialize", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -196,6 +196,8 @@ def build_command(args: argparse.Namespace, *, run_id: str, baseline: str) -> li
         str(args.prefetch_depth),
         "--prefetch-read-workers",
         str(args.prefetch_read_workers),
+        "--read-mode",
+        args.read_mode,
         "--baselines",
         baseline,
     ]
@@ -209,6 +211,8 @@ def build_command(args: argparse.Namespace, *, run_id: str, baseline: str) -> li
         command.append("--smoke")
     if args.force_cache:
         command.append("--force-cache")
+    if args.force_rematerialize:
+        command.append("--force-rematerialize")
     return command
 
 

@@ -335,10 +335,15 @@ class FakeNativeDatasetHandle:
 
 class FakeCxrCacheHandle:
     records = 4
+    last_prefetch_args: tuple[Any, ...] | None = None
+    last_prefetch_kwargs: dict[str, Any] | None = None
+    last_read_mode: str | None = None
 
-    def __init__(self, cache_dir: Path, split: str):
+    def __init__(self, cache_dir: Path, split: str, read_mode: str = "mmap"):
         self.cache_dir = cache_dir
         self.split = split
+        self.read_mode = read_mode
+        self.__class__.last_read_mode = read_mode
 
     def targets(self) -> list[str]:
         return ["No Finding", "Pneumonia"]
@@ -356,6 +361,8 @@ class FakeCxrCacheHandle:
         return {"mode": "indices", "indices": indices}
 
     def create_cxr_prefetcher(self, *args: Any, **kwargs: Any) -> "FakePrefetcher":
+        self.__class__.last_prefetch_args = args
+        self.__class__.last_prefetch_kwargs = kwargs
         return FakePrefetcher()
 
 
@@ -434,8 +441,14 @@ def test_cxr_native_batch_iterable_covers_range_shuffle_and_validation(
     FakeCxrCacheHandle.records = 4
 
     dataset = ds.MedkitCxrNativeBatchIterableDataset(
-        tmp_path, split="train", length=3, batch_size=2, pin_memory=True
+        tmp_path,
+        split="train",
+        length=3,
+        batch_size=2,
+        pin_memory=True,
+        read_mode="stream",
     )
+    assert FakeCxrCacheHandle.last_read_mode == "stream"
     assert dataset.targets == ["No Finding", "Pneumonia"]
     assert dataset.image_shape == (4, 1, 8, 8)
     assert list(dataset) == [
@@ -456,6 +469,8 @@ def test_cxr_native_batch_iterable_covers_range_shuffle_and_validation(
         ds.MedkitCxrNativeBatchIterableDataset(tmp_path, batch_size=0)
     with pytest.raises(ValueError, match="length cannot exceed"):
         ds.MedkitCxrNativeBatchIterableDataset(tmp_path, length=5)
+    with pytest.raises(ValueError, match="read_mode must be"):
+        ds.MedkitCxrNativeBatchIterableDataset(tmp_path, read_mode="resident")
 
     worker_ds = reload_dataset_module(
         monkeypatch, types.SimpleNamespace(id=1, num_workers=2)
@@ -482,8 +497,16 @@ def test_cxr_prefetch_iterable_batches_releases_and_worker_guard(
     FakeCxrCacheHandle.records = 4
 
     dataset = ds.MedkitCxrNativePrefetchDataset(
-        tmp_path, length=4, batch_size=2, shuffle=True, seed=2, prefetch_depth=2, read_workers=2
+        tmp_path,
+        length=4,
+        batch_size=2,
+        shuffle=True,
+        seed=2,
+        prefetch_depth=2,
+        read_workers=2,
+        read_mode="stream",
     )
+    assert FakeCxrCacheHandle.last_read_mode == "stream"
 
     assert len(dataset._batch_indices()) == 2
     assert len(
@@ -514,6 +537,8 @@ def test_cxr_prefetch_iterable_batches_releases_and_worker_guard(
         ds.MedkitCxrNativePrefetchDataset(tmp_path, read_workers=0)
     with pytest.raises(ValueError, match="length cannot exceed"):
         ds.MedkitCxrNativePrefetchDataset(tmp_path, length=5)
+    with pytest.raises(ValueError, match="read_mode must be"):
+        ds.MedkitCxrNativePrefetchDataset(tmp_path, read_mode="resident")
     FakeCxrCacheHandle.records = 0
     with pytest.raises(ValueError, match="contains no records"):
         ds.MedkitCxrNativePrefetchDataset(tmp_path)
@@ -740,6 +765,7 @@ def test_cxr_facade_routes_options_and_metadata(
         batch_size=2,
         prefetch=False,
         read_workers=1,
+        read_mode="stream",
     )
     assert dataset.num_samples == 4
     assert dataset.num_batches == 2
@@ -748,6 +774,7 @@ def test_cxr_facade_routes_options_and_metadata(
     report = dataset.report_metadata()
     assert report["cache_schema_version"] == 1
     assert report["transform_fingerprint"] == "abc"
+    assert report["read_mode"] == "stream"
     assert report["worker_mode"] == "single_process"
     assert len(dataset) == 2
     assert list(dataset) == [
@@ -755,16 +782,26 @@ def test_cxr_facade_routes_options_and_metadata(
         {"mode": "range", "start": 2, "count": 2},
     ]
 
-    loader = cxr.DataLoader(dataset, batch_size=1, shuffle=True, seed=9, pin_memory=True)
+    loader = cxr.DataLoader(
+        dataset, batch_size=1, shuffle=True, seed=9, pin_memory=True, read_mode="mmap"
+    )
     assert isinstance(loader, FakeLoader)
     assert loader.dataset.batch_size == 1
     assert loader.dataset.shuffle is True
+    assert loader.dataset.read_mode == "mmap"
     assert loader.report_metadata()["batch_size"] == 1
 
-    split_map = cxr.datasets(tmp_path, batch_size=1, splits=("train", "val"), prefetch=False)
+    split_map = cxr.datasets(
+        tmp_path,
+        batch_size=1,
+        splits=("train", "val"),
+        prefetch=False,
+        read_mode="stream",
+    )
     assert sorted(split_map) == ["train", "val"]
     assert split_map["train"].shuffle is True
     assert split_map["val"].shuffle is False
+    assert split_map["train"].read_mode == "stream"
 
     bad_metadata = tmp_path / "bad"
     bad_metadata.mkdir()
@@ -778,9 +815,15 @@ def test_cxr_facade_routes_options_and_metadata(
         cxr.Dataset(tmp_path, prefetch_depth=0)
     with pytest.raises(ValueError, match="read_workers must be greater than zero"):
         cxr.Dataset(tmp_path, read_workers=0)
+    with pytest.raises(ValueError, match="read_mode must be"):
+        cxr.Dataset(tmp_path, read_mode="resident")
 
     prefetch_dataset = cxr.Dataset(tmp_path, length=2, batch_size=1, prefetch=True)
+    assert prefetch_dataset.report_metadata()["prefetch_depth"] == 1
     assert list(prefetch_dataset) == [{"batch": 1}, {"batch": 2}]
+    assert FakeCxrCacheHandle.last_prefetch_kwargs is not None
+    assert FakeCxrCacheHandle.last_prefetch_kwargs["prefetch_depth"] == 1
+    assert FakeCxrCacheHandle.last_prefetch_kwargs["read_workers"] == 1
 
     loader_without_overrides = cxr.DataLoader(prefetch_dataset)
     assert loader_without_overrides.dataset is prefetch_dataset

@@ -1430,6 +1430,63 @@ fn parallel_indexed_reads_scatter_non_contiguous_runs() {
 }
 
 #[test]
+fn cxr_cache_reader_stream_mode_matches_mmap_reads() {
+    let root = unique_test_dir();
+    let cache_dir = root.join("cache");
+    write_synthetic_cache(&cache_dir, 5, 2, &["A", "B"]);
+    let mmap_reader = CxrCacheReader::open(&cache_dir, "train").unwrap();
+    let stream_reader =
+        CxrCacheReader::open_with_read_mode(&cache_dir, "train", CxrCacheReadMode::Stream).unwrap();
+    assert_eq!(stream_reader.read_mode(), CxrCacheReadMode::Stream);
+
+    let image_len = 3 * 4;
+    let label_len = 3 * 2;
+    let mut mmap_images = vec![0.0; image_len];
+    let mut mmap_labels = vec![0.0; label_len];
+    let mut mmap_masks = vec![0.0; label_len];
+    mmap_reader
+        .fill_batch(1, 3, &mut mmap_images, &mut mmap_labels, &mut mmap_masks)
+        .unwrap();
+
+    let mut stream_images = vec![0.0; image_len];
+    let mut stream_labels = vec![0.0; label_len];
+    let mut stream_masks = vec![0.0; label_len];
+    stream_reader
+        .fill_batch(
+            1,
+            3,
+            &mut stream_images,
+            &mut stream_labels,
+            &mut stream_masks,
+        )
+        .unwrap();
+    assert_eq!(stream_images, mmap_images);
+    assert_eq!(stream_labels, mmap_labels);
+    assert_eq!(stream_masks, mmap_masks);
+
+    let indices = [4, 1, 0];
+    mmap_reader
+        .fill_indices(
+            &indices,
+            &mut mmap_images,
+            &mut mmap_labels,
+            &mut mmap_masks,
+        )
+        .unwrap();
+    stream_reader
+        .fill_indices(
+            &indices,
+            &mut stream_images,
+            &mut stream_labels,
+            &mut stream_masks,
+        )
+        .unwrap();
+    assert_eq!(stream_images, mmap_images);
+    assert_eq!(stream_labels, mmap_labels);
+    assert_eq!(stream_masks, mmap_masks);
+}
+
+#[test]
 fn indexed_read_buffer_errors_cover_all_entry_points() {
     let root = unique_test_dir();
     let cache_dir = root.join("cache");

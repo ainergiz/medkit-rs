@@ -37,8 +37,9 @@ class Dataset(_IterableDatasetBase):
         seed: int = 0,
         pin_memory: bool = False,
         prefetch: bool = True,
-        prefetch_depth: int = 3,
+        prefetch_depth: int = 1,
         read_workers: int = 1,
+        read_mode: str = "mmap",
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
@@ -46,6 +47,8 @@ class Dataset(_IterableDatasetBase):
             raise ValueError("prefetch_depth must be greater than zero")
         if read_workers <= 0:
             raise ValueError("read_workers must be greater than zero")
+        if read_mode not in {"mmap", "stream"}:
+            raise ValueError("read_mode must be 'mmap' or 'stream'")
         self.cache_dir = Path(cache_dir)
         self.split = split
         self.length = length
@@ -56,6 +59,7 @@ class Dataset(_IterableDatasetBase):
         self.prefetch = prefetch
         self.prefetch_depth = prefetch_depth
         self.read_workers = read_workers
+        self.read_mode = read_mode
         self._inner: Any | None = None
 
     def __iter__(self):
@@ -91,6 +95,7 @@ class Dataset(_IterableDatasetBase):
             "prefetch": self.prefetch,
             "prefetch_depth": self.prefetch_depth if self.prefetch else 0,
             "read_workers": self.read_workers if self.prefetch else 0,
+            "read_mode": self.read_mode,
             "worker_mode": "rust_thread_prefetch" if self.prefetch else "single_process",
             "num_workers": 0,
             "num_samples": self.num_samples,
@@ -128,6 +133,7 @@ class Dataset(_IterableDatasetBase):
             "prefetch": self.prefetch,
             "prefetch_depth": self.prefetch_depth,
             "read_workers": self.read_workers,
+            "read_mode": self.read_mode,
         }
         options.update(
             {key: value for key, value in overrides.items() if value is not None}
@@ -148,6 +154,7 @@ class Dataset(_IterableDatasetBase):
             "pin_memory": self.pin_memory,
             "shuffle": self.shuffle,
             "seed": self.seed,
+            "read_mode": self.read_mode,
         }
         if self.prefetch:
             return MedkitCxrNativePrefetchDataset(
@@ -178,6 +185,7 @@ def DataLoader(
     prefetch: bool | None = None,
     prefetch_depth: int | None = None,
     read_workers: int | None = None,
+    read_mode: str | None = None,
     drop_last: bool = False,
     persistent_workers: bool = False,
     **kwargs: Any,
@@ -211,6 +219,7 @@ def DataLoader(
         "prefetch": prefetch,
         "prefetch_depth": prefetch_depth,
         "read_workers": read_workers,
+        "read_mode": read_mode,
     }
     overrides = {
         key: value
@@ -239,8 +248,9 @@ def datasets(
     splits: Iterable[str] = ("train", "val", "test"),
     pin_memory: bool = False,
     prefetch: bool = True,
-    prefetch_depth: int = 3,
+    prefetch_depth: int = 1,
     read_workers: int = 1,
+    read_mode: str = "mmap",
     seed: int = 0,
 ) -> dict[str, Dataset]:
     """Construct matching CXR datasets for common train/val/test splits."""
@@ -256,6 +266,7 @@ def datasets(
             prefetch=prefetch,
             prefetch_depth=prefetch_depth,
             read_workers=read_workers,
+            read_mode=read_mode,
         )
         for split in splits
     }

@@ -97,7 +97,6 @@ train_loader = medkit.cxr.DataLoader(
     train_ds,
     batch_size=32,
     shuffle=True,
-    pin_memory=True,
     prefetch=True,
 )
 ```
