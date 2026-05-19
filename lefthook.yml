@@ -1,0 +1,39 @@
+pre-push:
+  parallel: false
+  commands:
+    uv-sync:
+      run: uv sync --dev
+    rust-format:
+      run: cargo fmt --all --check
+    rust-clippy:
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
+    rust-tests:
+      run: cargo test --workspace --locked --exclude medkit-python
+    medkit-python-rust-tests:
+      run: uv run python scripts/run_medkit_python_rust_tests.py
+    python-api-contract:
+      run: uv run python scripts/check_python_api.py
+    python-compile:
+      run: |
+        uv run python - <<'PY'
+        from pathlib import Path
+        import py_compile
+
+        roots = [
+            Path("python"),
+            Path("scripts"),
+            Path("examples"),
+            Path("crates/medkit-benchmarks/scripts"),
+        ]
+        paths = sorted(
+            path
+            for root in roots
+            if root.exists()
+            for path in root.rglob("*.py")
+        )
+        for path in paths:
+            py_compile.compile(str(path), doraise=True)
+        print(f"compiled {len(paths)} Python files")
+        PY
+    python-tests:
+      run: uv run pytest tests/python -q

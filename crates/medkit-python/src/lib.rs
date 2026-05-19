@@ -1652,7 +1652,7 @@ def empty_like(tensor):
         .unwrap();
         assert_eq!(dataset.__len__(), 2);
 
-        let cache = open_cxr_cache(cxr_fixture.cache_dir.clone(), "train").unwrap();
+        let cache = open_cxr_cache(cxr_fixture.cache_dir.clone(), "train", "mmap").unwrap();
         assert_eq!(cache.__len__(), 3);
         assert_eq!(cache.image_shape(), (3, 1, 2, 2));
     }
@@ -1797,7 +1797,7 @@ def empty_like(tensor):
     fn cxr_cache_handle_allocates_and_fills_contiguous_and_indexed_batches() {
         let fixture = TinyCxrFixture::new("cxr-cache-handle-fill");
         with_fake_torch(|py| {
-            let cache = CxrCacheHandle::new(fixture.cache_dir.clone(), "train").unwrap();
+            let cache = CxrCacheHandle::new(fixture.cache_dir.clone(), "train", "mmap").unwrap();
 
             assert_eq!(cache.__len__(), 3);
             assert_eq!(cache.records(), 3);
@@ -1894,7 +1894,7 @@ def empty_like(tensor):
         let fixture = TinyCxrFixture::new("cxr-cache-null-torch");
         with_fake_torch(|py| {
             install_null_torch(py);
-            let cache = CxrCacheHandle::new(fixture.cache_dir.clone(), "train").unwrap();
+            let cache = CxrCacheHandle::new(fixture.cache_dir.clone(), "train", "mmap").unwrap();
 
             let error = cache
                 .allocate_cxr_batch(py, 1, false)
@@ -1908,7 +1908,7 @@ def empty_like(tensor):
     fn cxr_cache_handle_rejects_bad_batch_requests() {
         let fixture = TinyCxrFixture::new("cxr-cache-handle-errors");
         with_fake_torch(|py| {
-            let cache = CxrCacheHandle::new(fixture.cache_dir.clone(), "train").unwrap();
+            let cache = CxrCacheHandle::new(fixture.cache_dir.clone(), "train", "mmap").unwrap();
 
             let error = cache
                 .allocate_cxr_batch(py, 0, false)
@@ -2078,7 +2078,7 @@ def empty_like(tensor):
     fn cxr_prefetcher_worker_yields_contiguous_and_parallel_indexed_batches() {
         let fixture = TinyCxrFixture::new("cxr-prefetcher-worker");
         with_fake_torch(|py| {
-            let cache = CxrCacheHandle::new(fixture.cache_dir.clone(), "train").unwrap();
+            let cache = CxrCacheHandle::new(fixture.cache_dir.clone(), "train", "mmap").unwrap();
             let mut prefetcher = cache
                 .create_cxr_prefetcher(py, 2, vec![vec![], vec![0, 1], vec![2, 0]], false, 0, 2)
                 .unwrap();

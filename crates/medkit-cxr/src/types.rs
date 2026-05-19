@@ -45,8 +45,9 @@ pub struct CacheConfig {
     pub cache_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CxrCacheReadMode {
+    #[default]
     Mmap,
     Stream,
 }
@@ -57,12 +58,6 @@ impl CxrCacheReadMode {
             Self::Mmap => "mmap",
             Self::Stream => "stream",
         }
-    }
-}
-
-impl Default for CxrCacheReadMode {
-    fn default() -> Self {
-        Self::Mmap
     }
 }
 
