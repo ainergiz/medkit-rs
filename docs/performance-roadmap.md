@@ -155,7 +155,10 @@ Interpretation:
   memory fix.
 
 The next big CXR performance iteration should make medkit memory-conscious
-without giving up the deterministic cache contract:
+without giving up the deterministic cache contract, and it should also prove
+that the same cache design scales on larger GPUs where data loading can become
+visible again once model throughput increases. The L4 runs below are the
+memory-pressure regression target, not the ceiling for optimization.
 
 2026-05-19 local-source Modal validation has now implemented and measured the
 first lever, `read_mode = "mmap" | "stream"`, on the same L4/224px/batch64
@@ -199,11 +202,20 @@ Next implementation priorities:
    USS/private dirty memory, file-backed mappings, cache file size, and an
    estimated pinned-memory footprint so mmap accounting is not confused with
    private heap growth.
+6. Add a CXR scale-up matrix on at least one larger GPU target, such as L40S or
+   A100/H100 depending on Modal availability. Keep the L4/224px/batch64 matrix
+   for comparable memory regressions, but add 512px and larger-batch or
+   higher-throughput runs so the project does not optimize only for constrained
+   hosts.
 
 Success criteria:
 
 - On the same L4 CXR benchmark, the memory-conscious mode should keep medkit
   train throughput ahead of raw PyTorch while reducing host RSS materially.
+- On the larger-GPU CXR benchmark, speed mode and memory-conscious mode should
+  both be measured against a same-run raw PyTorch baseline so we can see whether
+  cache dtype, read mode, metadata suppression, and prefetch settings still
+  matter when GPU throughput rises.
 - The speed mode should keep the current low data-wait profile and document the
   extra RSS as an explicit cache/prefetch tradeoff.
 - Benchmark reports should make it clear whether memory is private heap,
