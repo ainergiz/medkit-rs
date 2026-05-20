@@ -200,10 +200,15 @@ promote:
 | async raw PyTorch direct H2D | L4 224/b64 float32 | 312.5/s | reference |
 | async medkit direct H2D | L4 224/b64 float32 | 361.1/s | keep |
 | async medkit `--gpu-prefetch-batches 1` | L4 224/b64 float32 | 365.3/s | neutral, needs stronger evidence |
+| async medkit `--gpu-prefetch-batches 1 --gpu-prefetch-reuse-buffers` | L4 224/b64 float32 | 361.9/s | do not promote |
 
 Async evidence batches:
 `cxr-async-l4-224-b64-direct-20260520-codex-r1` and
 `cxr-async-l4-224-b64-gpuprefetch1-20260520-codex-r0`.
+Reusable-buffer evidence batch:
+`cxr-async-l4-224-b64-gpuprefetch1-reuse-20260521-codex-r0`.
+The reusable mode proved allocation reuse, with 3 CUDA tensor allocations for
+186 tensor copies and zero shape misses per run, but did not improve throughput.
 
 The fixed block-shuffle rerun also does not justify a preset change:
 
