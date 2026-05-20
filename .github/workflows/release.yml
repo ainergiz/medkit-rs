@@ -93,7 +93,7 @@ jobs:
           python - <<'PY'
           import medkit_rs
 
-          assert medkit_rs.__version__ == "0.1.0"
+          assert medkit_rs.__version__ == "0.1.1"
           assert hasattr(medkit_rs, "cxr")
           PY
       - uses: actions/upload-artifact@v4

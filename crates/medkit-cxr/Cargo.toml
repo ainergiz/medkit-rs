@@ -1,6 +1,6 @@
 [package]
 name = "medkit-cxr"
-version = "0.1.0"
+version = "0.1.1"
 description = "Chest X-ray manifest, validation, split, and cache utilities for medkit-rs."
 edition.workspace = true
 authors.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "medkit-io"
-version = "0.1.0"
+version = "0.1.1"
 description = "Medical image metadata IO adapters for medkit-rs."
 edition.workspace = true
 authors.workspace = true

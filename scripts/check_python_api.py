@@ -1,4 +1,4 @@
-"""Check the public Python API expected for the 0.1.0 package."""
+"""Check the public Python API expected for the 0.1.1 package."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import medkit_rs as medkit
 
 
 def main() -> None:
-    assert medkit.__version__ == "0.1.0"
+    assert medkit.__version__ == "0.1.1"
     assert hasattr(medkit, "cxr")
     assert hasattr(medkit.cxr, "Dataset")
     assert hasattr(medkit.cxr, "DataLoader")

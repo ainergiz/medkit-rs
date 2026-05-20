@@ -1,6 +1,6 @@
 [package]
 name = "medkit-python-ffi"
-version = "0.1.0"
+version = "0.1.1"
 description = "C ABI batch extraction bridge for medkit-rs Python DataLoader adapters."
 edition.workspace = true
 authors.workspace = true

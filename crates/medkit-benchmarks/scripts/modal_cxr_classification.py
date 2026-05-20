@@ -18,7 +18,7 @@ VOLUME_ROOT = Path("/cache")
 WORK_DIR = VOLUME_ROOT / "cxr"
 REMOTE_REPORT_ROOT = VOLUME_ROOT / "results" / "cxr"
 MODAL_GPU = os.environ.get("MEDKIT_MODAL_GPU", "L4")
-MEDKIT_PACKAGE = os.environ.get("MEDKIT_MODAL_MEDKIT_PACKAGE", "medkit-rs==0.1.0")
+MEDKIT_PACKAGE = os.environ.get("MEDKIT_MODAL_MEDKIT_PACKAGE", "medkit-rs==0.1.1")
 USE_PUBLISHED_MEDKIT = os.environ.get("MEDKIT_MODAL_USE_PYPI", "1") != "0"
 LOCAL_REPO_ROOT = next(
     (

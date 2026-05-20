@@ -1,6 +1,6 @@
 [package]
 name = "medkit-bench"
-version = "0.1.0"
+version = "0.1.1"
 description = "Training data cache benchmarking for medkit-rs."
 edition.workspace = true
 authors.workspace = true

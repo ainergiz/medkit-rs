@@ -1,6 +1,6 @@
 [package]
 name = "medkit-transform"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lazy transform plans and deterministic preprocessing kernels for medkit-rs."
 edition.workspace = true
 authors.workspace = true
