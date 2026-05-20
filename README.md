@@ -68,43 +68,78 @@ cargo run -p medkit-cli -- cxr validate-cache data/cxr/.medkit/cache --split tra
 uv run --with torch examples/cxr_dropin_pytorch_train.py --cache-dir data/cxr/.medkit/cache --batch-size 32
 ```
 
-### CXR H100 Benchmark Recipe
+### CXR Benchmark Gates
 
 For current-source Modal benchmark runs, use the local package build until the
-published PyPI package includes the latest CXR prefetch arguments:
+published PyPI package includes the latest CXR prefetch arguments. The matrix
+launcher has repeatable raw+medkit gate presets that put all rows under one
+batch id and force a single Modal GPU selector.
+
+Dry-run a gate first when Modal is not available or before spending GPU time:
 
 ```bash
-MEDKIT_MODAL_USE_PYPI=0 python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
-  --batch-id cxr-confirm-h100-pinned-d2-rw4-local \
-  --baselines pytorch_raw,medkit_native_prefetch_pinned \
-  --cache-dtypes float32,uint8 \
-  --read-modes stream \
-  --image-size 512 \
-  --batch-size 32 \
-  --workers 8 \
-  --max-samples 6000 \
-  --max-train 4096 \
-  --max-val 1024 \
-  --max-test 1024 \
-  --epochs 1 \
-  --loader-batches 64 \
-  --warmup-batches 4 \
-  --profile-batches 128 \
-  --drop-last-train \
-  --prefetch-depth 2 \
-  --prefetch-read-workers 4 \
-  --no-include-metadata \
-  --max-eval-batches 1 \
-  --modal-gpu H100
+MEDKIT_MODAL_USE_PYPI=0 \
+MEDKIT_MODAL_CLI="uvx --python 3.11 modal" \
+python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
+  --gate h100-512-b32 \
+  --batch-id cxr-gate-h100-512-b32-$(date -u +%Y%m%d-%H%M) \
+  --dry-run
 ```
 
+Run the H100 512/b32 gate:
+
+```bash
+MEDKIT_MODAL_USE_PYPI=0 \
+MEDKIT_MODAL_CLI="uvx --python 3.11 modal" \
+python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
+  --gate h100-512-b32 \
+  --batch-id cxr-gate-h100-512-b32-$(date -u +%Y%m%d-%H%M)
+```
+
+Run the L4 224/b64 gate:
+
+```bash
+MEDKIT_MODAL_USE_PYPI=0 \
+MEDKIT_MODAL_CLI="uvx --python 3.11 modal" \
+python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
+  --gate l4-224-b64 \
+  --batch-id cxr-gate-l4-224-b64-$(date -u +%Y%m%d-%H%M)
+```
+
+Re-audit an existing batch without launching Modal:
+
+```bash
+python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
+  --audit-batch target/reports/cxr-current-tools/<batch-id>
+```
+
+`MEDKIT_MODAL_CLI` is optional, but the Python 3.11 Modal client avoided local
+heartbeat hangs observed with the globally installed Python 3.13 client during
+these gate runs.
+
 The current fastest confirmed CXR path is native prefetch with pinned batches,
-stream reads, `prefetch_depth=2`, and `prefetch_read_workers=4`. In the May 20,
-2026 H100 confirmation run on the public NIH ChestX-ray14 cache, raw PyTorch
-reached 194.7 train samples/s, while medkit pinned stream reached 379.8
-samples/s with float32 cache data and 377.4 samples/s with uint8 cache data.
-Both medkit rows used about 64 MB of estimated pinned batch memory and reported
-near-zero cache-image PSS.
+stream reads, `prefetch_depth=2`, and `prefetch_read_workers=4`. Audited May 20,
+2026 gates on the public NIH ChestX-ray14 cache produced:
+
+| Gate | Raw PyTorch | medkit pinned stream | Result |
+|---|---:|---:|---:|
+| H100 512/b32, float32 | 234.8/s | 379.9/s | medkit 1.62x faster |
+| H100 512/b32, uint8 | 234.8/s | 377.6/s | medkit 1.61x faster |
+| L4 224/b64, float32 | 304.7/s | 360.2/s | medkit 1.18x faster |
+
+All rows used 6,000 records, `--drop-last-train`, full profile windows, and
+passed batch audit. Stream rows reported near-zero cache-image PSS; H100
+medkit stream also reduced GPU-loop PSS from about 7.44 GB raw to about
+5.72 GB. Gate rows must retain `step-profile.json`,
+`summary-consistency.json`, `run-summary.json`, `environment.json`, and the
+row/batch summaries under `target/reports/cxr-current-tools/<batch-id>/`.
+Use `--shuffle-block-batches N` as an opt-in locality experiment for medkit
+rows: it shuffles contiguous blocks of `N` native batches instead of individual
+sample indices, preserving longer stream reads while still changing epoch order.
+Use `--gpu-prefetch-batches N` as an opt-in CUDA handoff experiment; it keeps
+CPU pinned batches copied ahead on a dedicated CUDA stream while the model step
+runs. The gate presets leave this at `0` until repeat evidence justifies
+promoting it.
 
 ## DICOM Decoder Policy
 
@@ -130,17 +165,22 @@ The CXR drop-in API exposes PyTorch-style dataset and loader helpers:
 ```python
 import medkit_rs as medkit
 
-train_ds = medkit.cxr.Dataset("data/cxr/.medkit/cache", split="train")
+train_ds = medkit.cxr.Dataset("data/cxr/.medkit/cache", split="train", preset="speed")
 train_loader = medkit.cxr.DataLoader(
     train_ds,
     batch_size=32,
     shuffle=True,
-    prefetch=True,
+    drop_last=True,
 )
 ```
 
 Batches use stable keys: `image`, `labels`, `mask`, and metadata sidecars such
 as `sample_id`, `patient_id`, `study_id`, and `image_id`.
+`preset="speed"` selects the current benchmark path: pinned native prefetch,
+stream reads, `prefetch_depth=2`, and `read_workers=4`. `preset="memory"` keeps
+stream reads with a shallow unpinned queue. For shuffled stream training,
+`shuffle_block_batches=N` can preserve local contiguous reads by shuffling
+native-batch blocks instead of individual samples.
 
 Free-threaded CPython builds such as `3.13t` and `3.14t` are not currently
 supported. The published wheels target normal CPython, and the optimized CXR

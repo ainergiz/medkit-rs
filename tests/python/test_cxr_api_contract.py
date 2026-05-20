@@ -12,25 +12,39 @@ import pytest
 def test_cxr_module_imports_and_validates_arguments() -> None:
     cxr = _import_or_skip("medkit_rs.cxr")
 
-    assert cxr.__all__ == ["Dataset", "DataLoader", "datasets"]
+    assert cxr.__all__ == ["Dataset", "DataLoader", "datasets", "presets"]
     assert hasattr(cxr, "Dataset")
     assert hasattr(cxr, "DataLoader")
+    assert cxr.presets()["speed"] == {
+        "pin_memory": True,
+        "prefetch": True,
+        "prefetch_depth": 2,
+        "read_workers": 4,
+        "read_mode": "stream",
+    }
+    assert cxr.presets()["memory"]["read_mode"] == "stream"
 
     with pytest.raises(ValueError, match="batch_size must be greater than zero"):
         cxr.Dataset("unused-cache", batch_size=0)
     with pytest.raises(ValueError, match="read_mode must be"):
         cxr.Dataset("unused-cache", read_mode="resident")
+    with pytest.raises(ValueError, match="preset must be"):
+        cxr.Dataset("unused-cache", preset="throughput")
+    with pytest.raises(ValueError, match="shuffle_block_batches must be non-negative"):
+        cxr.Dataset("unused-cache", shuffle_block_batches=-1)
 
     with pytest.raises(TypeError, match="expects a medkit_rs.cxr.Dataset"):
         cxr.DataLoader(object())
 
-    dataset = cxr.Dataset("unused-cache")
+    dataset = cxr.Dataset("unused-cache", preset="speed", drop_last=True)
+    assert dataset.pin_memory is True
+    assert dataset.prefetch_depth == 2
+    assert dataset.read_workers == 4
+    assert dataset.read_mode == "stream"
+    assert dataset.drop_last is True
 
     with pytest.raises(ValueError, match="must use num_workers=0"):
         cxr.DataLoader(dataset, num_workers=1)
-
-    with pytest.raises(ValueError, match="drop_last=True"):
-        cxr.DataLoader(dataset, drop_last=True)
 
     with pytest.raises(ValueError, match="persistent_workers"):
         cxr.DataLoader(dataset, persistent_workers=True)
@@ -84,6 +98,7 @@ def test_cxr_dataloader_contract_against_cli_cache_fixture() -> None:
         seed=13,
         pin_memory=False,
         prefetch=False,
+        shuffle_block_batches=2,
     )
 
     report = loader.report_metadata()
@@ -98,9 +113,13 @@ def test_cxr_dataloader_contract_against_cli_cache_fixture() -> None:
     assert report["read_workers"] == 0
     assert report["read_mode"] == "mmap"
     assert report["include_metadata"] is True
+    assert report["drop_last"] is False
+    assert report["shuffle_block_batches"] == 2
     assert report["worker_mode"] == "single_process"
     assert report["num_workers"] == 0
     assert report["num_samples"] == length
+    assert report["yielded_samples"] == length
+    assert report["dropped_samples"] == 0
     assert report["num_batches"] == 1
     assert report["targets"] == targets
     assert report["label_policy"]["uncertain"] == "ignore"

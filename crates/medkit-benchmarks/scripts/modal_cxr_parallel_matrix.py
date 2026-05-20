@@ -6,13 +6,14 @@ import argparse
 import json
 import math
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 LOCAL_REPO_ROOT = next(
@@ -29,6 +30,84 @@ SOURCE_REPORT_ROOT = LOCAL_REPO_ROOT / "target" / "reports" / "cxr"
 CURRENT_TOOLS_ROOT = LOCAL_REPO_ROOT / "target" / "reports" / "cxr-current-tools"
 CACHE_IMAGE_PSS_MIN_MB = 1.0
 CACHE_IMAGE_PSS_NEAR_ZERO_MB = 1.0
+RAW_MEDKIT_BASELINES = "pytorch_raw,medkit_native_prefetch_pinned"
+GATE_PRESETS: dict[str, dict[str, Any]] = {
+    "h100-512-b32": {
+        "baselines": RAW_MEDKIT_BASELINES,
+        "image_size": 512,
+        "cache_dtypes": "float32,uint8",
+        "batch_size": 32,
+        "workers": 8,
+        "max_samples": 6000,
+        "max_train": 4096,
+        "max_val": 1024,
+        "max_test": 1024,
+        "epochs": 1,
+        "loader_batches": 64,
+        "warmup_batches": 4,
+        "profile_batches": 128,
+        "drop_last_train": True,
+        "max_train_batches": 0,
+        "max_eval_batches": 1,
+        "prefetch_depth": 2,
+        "prefetch_read_workers": 4,
+        "shuffle_block_batches": 0,
+        "gpu_prefetch_batches": 0,
+        "read_modes": "stream",
+        "include_metadata": False,
+        "modal_gpu": "H100",
+    },
+    "l4-224-b64": {
+        "baselines": RAW_MEDKIT_BASELINES,
+        "image_size": 224,
+        "cache_dtypes": "float32",
+        "batch_size": 64,
+        "workers": 8,
+        "max_samples": 6000,
+        "max_train": 4096,
+        "max_val": 1024,
+        "max_test": 1024,
+        "epochs": 1,
+        "loader_batches": 64,
+        "warmup_batches": 4,
+        "profile_batches": 64,
+        "drop_last_train": True,
+        "max_train_batches": 0,
+        "max_eval_batches": 1,
+        "prefetch_depth": 2,
+        "prefetch_read_workers": 4,
+        "shuffle_block_batches": 0,
+        "gpu_prefetch_batches": 0,
+        "read_modes": "stream",
+        "include_metadata": False,
+        "modal_gpu": "L4",
+    },
+}
+GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
+    "baselines": ("--baselines",),
+    "image_size": ("--image-size",),
+    "cache_dtypes": ("--cache-dtypes", "--cache-dtype"),
+    "batch_size": ("--batch-size",),
+    "workers": ("--workers",),
+    "max_samples": ("--max-samples",),
+    "max_train": ("--max-train",),
+    "max_val": ("--max-val",),
+    "max_test": ("--max-test",),
+    "epochs": ("--epochs",),
+    "loader_batches": ("--loader-batches",),
+    "warmup_batches": ("--warmup-batches",),
+    "profile_batches": ("--profile-batches",),
+    "drop_last_train": ("--drop-last-train", "--no-drop-last-train"),
+    "max_train_batches": ("--max-train-batches",),
+    "max_eval_batches": ("--max-eval-batches",),
+    "prefetch_depth": ("--prefetch-depth",),
+    "prefetch_read_workers": ("--prefetch-read-workers",),
+    "shuffle_block_batches": ("--shuffle-block-batches",),
+    "gpu_prefetch_batches": ("--gpu-prefetch-batches",),
+    "read_modes": ("--read-modes", "--read-mode"),
+    "include_metadata": ("--include-metadata", "--no-include-metadata"),
+    "modal_gpu": ("--modal-gpu",),
+}
 
 
 @dataclass
@@ -50,13 +129,29 @@ class RunningRow:
     started_at: float
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Launch CXR Modal benchmark rows.")
+    parser.add_argument(
+        "--gate",
+        choices=sorted(GATE_PRESETS),
+        default="",
+        help="Apply a repeatable raw+medkit gate preset before launching rows.",
+    )
+    parser.add_argument(
+        "--list-gates",
+        action="store_true",
+        help="Print available gate presets as JSON and exit.",
+    )
+    parser.add_argument(
+        "--audit-batch",
+        type=Path,
+        help="Re-validate an existing batch artifact directory without launching Modal.",
+    )
     parser.add_argument("--batch-id", default="")
     parser.add_argument("--splits", default="")
     parser.add_argument(
         "--baselines",
-        default="pytorch_raw,monai_raw,torchxrayvision",
+        default=RAW_MEDKIT_BASELINES,
         help="Comma-separated baselines to launch as separate rows.",
     )
     parser.add_argument("--image-size", type=int, default=512)
@@ -76,6 +171,8 @@ def main() -> int:
     parser.add_argument("--max-eval-batches", type=int, default=0)
     parser.add_argument("--prefetch-depth", type=int, default=1)
     parser.add_argument("--prefetch-read-workers", type=int, default=1)
+    parser.add_argument("--shuffle-block-batches", type=int, default=0)
+    parser.add_argument("--gpu-prefetch-batches", type=int, default=0)
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
     parser.add_argument(
         "--read-modes",
@@ -98,36 +195,57 @@ def main() -> int:
         default="",
         help="Optional Modal GPU selector, passed as MEDKIT_MODAL_GPU to row commands.",
     )
-    args = parser.parse_args()
+    return parser
 
-    timestamp = time.strftime("%Y%m%d-%H%M")
-    batch_id = args.batch_id or (
-        f"nih-cxr14-current-tools-parallel-size{args.image_size}-"
-        f"b{args.batch_size}-{timestamp}"
-    )
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(raw_argv)
+    if args.gate:
+        apply_gate_preset(args, raw_argv)
+    return args
+
+
+def apply_gate_preset(args: argparse.Namespace, argv: Sequence[str]) -> None:
+    preset = GATE_PRESETS[args.gate]
+    for field, value in preset.items():
+        flags = GATE_OPTION_FLAGS[field]
+        if not option_was_provided(argv, flags):
+            setattr(args, field, value)
+
+
+def option_was_provided(argv: Sequence[str], flags: tuple[str, ...]) -> bool:
+    for item in argv:
+        for flag in flags:
+            if item == flag or item.startswith(f"{flag}="):
+                return True
+    return False
+
+
+def gate_catalog() -> dict[str, dict[str, Any]]:
+    return {
+        name: {
+            **preset,
+            "rows": [row.__dict__ for row in rows_for_settings(preset)],
+        }
+        for name, preset in GATE_PRESETS.items()
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    if args.list_gates:
+        print(json.dumps(gate_catalog(), indent=2, sort_keys=True))
+        return 0
+    if args.audit_batch:
+        return audit_batch(args.audit_batch)
+
+    batch_id = batch_id_for_args(args)
     batch_dir = CURRENT_TOOLS_ROOT / batch_id
     batch_dir.mkdir(parents=True, exist_ok=True)
 
-    baselines = parse_csv(args.baselines)
-    cache_dtypes = parse_csv(args.cache_dtypes) or [args.cache_dtype]
-    read_modes = parse_csv(args.read_modes) or [args.read_mode]
-    validate_choices("cache dtype", cache_dtypes, {"float32", "float16", "uint8"})
-    validate_choices("read mode", read_modes, {"mmap", "stream"})
-    rows = []
-    for baseline in baselines:
-        settings = matrix_settings_for_baseline(baseline, cache_dtypes, read_modes)
-        for cache_dtype, read_mode in settings:
-            rows.append(
-                Row(
-                    name=row_name(baseline, cache_dtype, read_mode),
-                    baseline=baseline,
-                    cache_dtype=cache_dtype,
-                    read_mode=read_mode,
-                    purpose=row_purpose(baseline, cache_dtype, read_mode),
-                )
-            )
-    if not rows:
-        raise ValueError("No baselines provided")
+    rows = rows_for_args(args)
 
     pending = list(rows)
     running: list[RunningRow] = []
@@ -138,6 +256,8 @@ def main() -> int:
         batch_dir / "batch-config.json",
         {
             "batch_id": batch_id,
+            "gate": args.gate or None,
+            "gate_preset": GATE_PRESETS.get(args.gate),
             "rows": [row.__dict__ for row in rows],
             "settings": vars(args),
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -217,7 +337,7 @@ def main() -> int:
 
 def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[str]:
     command = [
-        "modal",
+        *modal_cli_command(),
         "run",
         MODAL_SCRIPT,
         "--run-id",
@@ -251,6 +371,10 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         str(args.prefetch_depth),
         "--prefetch-read-workers",
         str(args.prefetch_read_workers),
+        "--shuffle-block-batches",
+        str(args.shuffle_block_batches),
+        "--gpu-prefetch-batches",
+        str(args.gpu_prefetch_batches),
         "--read-mode",
         row.read_mode,
         "--include-metadata" if args.include_metadata else "--no-include-metadata",
@@ -270,6 +394,10 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
     if args.force_rematerialize:
         command.append("--force-rematerialize")
     return command
+
+
+def modal_cli_command() -> list[str]:
+    return shlex.split(os.environ.get("MEDKIT_MODAL_CLI", "modal")) or ["modal"]
 
 
 def row_environment(args: argparse.Namespace) -> dict[str, str] | None:
@@ -311,6 +439,7 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
     profile = load_json_if_exists(row_dir / "step-profile.json")
     quality = load_json_if_exists(row_dir / "model-quality.json")
     environment = load_json_if_exists(row_dir / "environment.json")
+    summary_consistency = load_json_if_exists(row_dir / "summary-consistency.json")
     elapsed = time.perf_counter() - active.started_at
     validation_errors = validate_row_artifacts(
         active=active,
@@ -322,6 +451,7 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
         profile=profile,
         quality=quality,
         environment=environment,
+        summary_consistency=summary_consistency,
     )
     status = "ok" if not validation_errors else "failed"
     result = {
@@ -341,6 +471,7 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
         "profile": profile,
         "quality": quality,
         "environment": environment,
+        "summary_consistency": summary_consistency,
         "modal_status": modal_result.get("status") if modal_result else None,
         "validation_errors": validation_errors,
     }
@@ -401,9 +532,11 @@ def validate_row_artifacts(
     profile: dict[str, Any],
     quality: dict[str, Any],
     environment: dict[str, Any],
+    summary_consistency: dict[str, Any] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     baseline = active.row.baseline
+    summary_consistency = summary_consistency or {}
 
     if returncode != 0:
         errors.append(f"modal command returned {returncode}")
@@ -417,6 +550,8 @@ def validate_row_artifacts(
         errors.append("missing gpu-throughput.json")
     if not environment:
         errors.append("missing environment.json")
+    if not summary_consistency:
+        errors.append("missing summary-consistency.json")
     if modal_result and modal_result.get("status") != "ok":
         errors.append(f"modal-result status is {modal_result.get('status')!r}")
 
@@ -434,6 +569,18 @@ def validate_row_artifacts(
                 f"modal-result run-summary run_id {modal_run_id!r} "
                 f"!= expected {active.run_id!r}"
             )
+    compare_modal_artifact(
+        errors,
+        modal_result=modal_result,
+        artifact_name="run-summary.json",
+        local_artifact=run_summary,
+    )
+    compare_modal_artifact(
+        errors,
+        modal_result=modal_result,
+        artifact_name="summary-consistency.json",
+        local_artifact=summary_consistency,
+    )
 
     loader_row = loader.get(baseline)
     gpu_row = gpu.get(baseline)
@@ -491,6 +638,13 @@ def validate_row_artifacts(
                 f"environment read_mode {metadata.get('read_mode')!r} "
                 f"!= expected {active.row.read_mode!r}"
             )
+    validate_summary_provenance_artifacts(
+        errors=errors,
+        active=active,
+        run_summary=run_summary,
+        environment=environment,
+        summary_consistency=summary_consistency,
+    )
 
     for phase, row in [("loader", loader_row), ("gpu", gpu_row)]:
         pipeline = row.get("pipeline") or {}
@@ -520,6 +674,116 @@ def validate_row_artifacts(
         )
 
     return errors
+
+
+def compare_modal_artifact(
+    errors: list[str],
+    *,
+    modal_result: dict[str, Any],
+    artifact_name: str,
+    local_artifact: dict[str, Any],
+) -> None:
+    artifacts = modal_result.get("artifacts") if isinstance(modal_result, dict) else None
+    if not isinstance(artifacts, dict) or not local_artifact:
+        return
+    remote_artifact = artifacts.get(artifact_name)
+    if isinstance(remote_artifact, dict) and remote_artifact != local_artifact:
+        errors.append(f"modal-result {artifact_name} does not match local copy")
+
+
+def validate_summary_provenance_artifacts(
+    *,
+    errors: list[str],
+    active: RunningRow,
+    run_summary: dict[str, Any],
+    environment: dict[str, Any],
+    summary_consistency: dict[str, Any],
+) -> None:
+    if summary_consistency:
+        if summary_consistency.get("status") != "ok":
+            errors.append(
+                "summary-consistency status is "
+                f"{summary_consistency.get('status')!r}: "
+                + "; ".join(str(error) for error in summary_consistency.get("errors", []))
+            )
+        if summary_consistency.get("run_id") != active.run_id:
+            errors.append(
+                f"summary-consistency run_id {summary_consistency.get('run_id')!r} "
+                f"!= expected {active.run_id!r}"
+            )
+    if not run_summary:
+        return
+    provenance = run_summary.get("provenance")
+    if not isinstance(provenance, dict):
+        errors.append("run-summary provenance missing")
+        return
+    required_fields = (
+        "run_id",
+        "dataset_loaded",
+        "samples",
+        "targets",
+        "baselines",
+        "image_size",
+        "cache_image_size",
+        "cache_dtype",
+        "batch_size",
+        "drop_last_train",
+        "workers",
+        "prefetch_depth",
+        "prefetch_read_workers",
+        "shuffle_block_batches",
+        "gpu_prefetch_batches",
+        "read_mode",
+        "include_metadata",
+        "profile_batches",
+        "seed",
+        "cache",
+        "artifacts",
+    )
+    for field in required_fields:
+        if field not in provenance:
+            errors.append(f"run-summary provenance missing {field}")
+    if provenance.get("run_id") != active.run_id:
+        errors.append(f"provenance run_id {provenance.get('run_id')!r} != expected {active.run_id!r}")
+    if provenance.get("cache_dtype") != active.row.cache_dtype:
+        errors.append(
+            f"provenance cache_dtype {provenance.get('cache_dtype')!r} "
+            f"!= expected {active.row.cache_dtype!r}"
+        )
+    if provenance.get("read_mode") != active.row.read_mode:
+        errors.append(
+            f"provenance read_mode {provenance.get('read_mode')!r} "
+            f"!= expected {active.row.read_mode!r}"
+        )
+    if provenance.get("baselines") != [active.row.baseline]:
+        errors.append(
+            f"provenance baselines {provenance.get('baselines')!r} "
+            f"!= expected {[active.row.baseline]!r}"
+        )
+    metadata = environment.get("run_metadata") if isinstance(environment, dict) else {}
+    if isinstance(metadata, dict):
+        for field in (
+            "image_size",
+            "cache_image_size",
+            "batch_size",
+            "workers",
+            "prefetch_depth",
+            "prefetch_read_workers",
+            "shuffle_block_batches",
+            "gpu_prefetch_batches",
+            "profile_batches",
+            "seed",
+        ):
+            if provenance.get(field) != metadata.get(field):
+                errors.append(
+                    f"provenance {field} {provenance.get(field)!r} "
+                    f"!= environment {metadata.get(field)!r}"
+                )
+    artifacts = provenance.get("artifacts") or {}
+    if artifacts.get("summary_consistency") != "summary-consistency.json":
+        errors.append("provenance summary_consistency artifact path missing")
+    if profile_batches_requested(provenance) > 0 and artifacts.get("step_profile") != "step-profile.json":
+        errors.append("provenance step_profile artifact path missing")
 
 
 def validate_profile_artifacts(
@@ -780,7 +1044,7 @@ def append_pain_diary(path: Path, result: dict[str, Any]) -> None:
     gpu = (result.get("gpu") or {}).get(result.get("baseline"), {})
     quality = (result.get("quality") or {}).get(result.get("baseline"), {})
     if run_summary:
-        lines.append(f"- Run summary exists: yes")
+        lines.append("- Run summary exists: yes")
     else:
         lines.append("- Run summary exists: no")
     if loader:
@@ -801,6 +1065,128 @@ def append_pain_diary(path: Path, result: dict[str, Any]) -> None:
     lines.append("- What medkit should copy: fill after artifact review.")
     with path.open("a") as handle:
         handle.write("\n".join(lines) + "\n")
+
+
+def batch_id_for_args(args: argparse.Namespace) -> str:
+    timestamp = time.strftime("%Y%m%d-%H%M")
+    if args.batch_id:
+        return args.batch_id
+    if args.gate:
+        return f"cxr-gate-{args.gate}-{timestamp}"
+    return f"nih-cxr14-current-tools-parallel-size{args.image_size}-b{args.batch_size}-{timestamp}"
+
+
+def rows_for_args(args: argparse.Namespace) -> list[Row]:
+    return rows_for_settings(
+        {
+            "baselines": args.baselines,
+            "cache_dtypes": args.cache_dtypes,
+            "cache_dtype": args.cache_dtype,
+            "read_modes": args.read_modes,
+            "read_mode": args.read_mode,
+        }
+    )
+
+
+def rows_for_settings(settings: dict[str, Any]) -> list[Row]:
+    baselines = parse_csv(str(settings.get("baselines", "")))
+    cache_dtypes = parse_csv(str(settings.get("cache_dtypes", ""))) or [
+        str(settings.get("cache_dtype", "float32"))
+    ]
+    read_modes = parse_csv(str(settings.get("read_modes", ""))) or [
+        str(settings.get("read_mode", "mmap"))
+    ]
+    validate_choices("cache dtype", cache_dtypes, {"float32", "float16", "uint8"})
+    validate_choices("read mode", read_modes, {"mmap", "stream"})
+    rows = []
+    for baseline in baselines:
+        row_settings = matrix_settings_for_baseline(baseline, cache_dtypes, read_modes)
+        for cache_dtype, read_mode in row_settings:
+            rows.append(
+                Row(
+                    name=row_name(baseline, cache_dtype, read_mode),
+                    baseline=baseline,
+                    cache_dtype=cache_dtype,
+                    read_mode=read_mode,
+                    purpose=row_purpose(baseline, cache_dtype, read_mode),
+                )
+            )
+    if not rows:
+        raise ValueError("No baselines provided")
+    return rows
+
+
+def audit_batch(batch_dir: Path) -> int:
+    config = load_json_if_exists(batch_dir / "batch-config.json")
+    if not config:
+        raise FileNotFoundError(f"Missing batch-config.json in {batch_dir}")
+    batch_id = str(config.get("batch_id") or batch_dir.name)
+    rows = [Row(**row) for row in config.get("rows", [])]
+    if not rows:
+        settings = config.get("settings") or {}
+        rows = rows_for_settings(settings)
+    completed: list[dict[str, Any]] = []
+    started = time.perf_counter()
+    for row in rows:
+        run_id = run_id_for(batch_id, row)
+        row_dir = batch_dir / run_id
+        if not row_dir.exists():
+            source_dir = SOURCE_REPORT_ROOT / run_id
+            if source_dir.exists():
+                row_dir.mkdir(parents=True, exist_ok=True)
+                (row_dir / "launcher-command.txt").write_text(
+                    "adopted existing source report during audit\n"
+                )
+            else:
+                completed.append(
+                    {
+                        "run_id": run_id,
+                        "baseline": row.baseline,
+                        "cache_dtype": row.cache_dtype,
+                        "read_mode": row.read_mode,
+                        "purpose": row.purpose,
+                        "returncode": 1,
+                        "status": "failed",
+                        "elapsed_seconds": 0.0,
+                        "report_dir": str(row_dir),
+                        "validation_errors": [f"missing row directory {row_dir}"],
+                    }
+                )
+                continue
+        modal_result = load_json_if_exists(row_dir / "modal-result.json")
+        returncode = int(modal_result.get("returncode") or 0) if modal_result else 0
+        completed.append(
+            collect_existing_row(
+                batch_dir=batch_dir,
+                row=row,
+                run_id=run_id,
+                returncode=returncode,
+            )
+        )
+    write_batch_summary(batch_dir, batch_id, completed, running=[], pending=[], batch_started=started)
+    failures = [row for row in completed if row.get("status") != "ok"]
+    print(json.dumps({"batch_id": batch_id, "status": "failed" if failures else "ok", "failures": failures}, indent=2, sort_keys=True))
+    return 1 if failures else 0
+
+
+def collect_existing_row(
+    *,
+    batch_dir: Path,
+    row: Row,
+    run_id: str,
+    returncode: int,
+) -> dict[str, Any]:
+    active = type(
+        "CompletedRow",
+        (),
+        {
+            "row": row,
+            "run_id": run_id,
+            "command": [],
+            "started_at": time.perf_counter(),
+        },
+    )()
+    return collect_row(active, batch_dir, returncode)
 
 
 def parse_csv(value: str) -> list[str]:

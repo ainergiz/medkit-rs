@@ -305,9 +305,13 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         seed: int = 0,
         read_mode: str = "mmap",
         include_metadata: bool = False,
+        drop_last: bool = False,
+        shuffle_block_batches: int = 0,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+        if shuffle_block_batches < 0:
+            raise ValueError("shuffle_block_batches must be non-negative")
         read_mode = _validate_cxr_read_mode(read_mode)
         self.cache_dir = Path(cache_dir)
         self.split = split
@@ -318,6 +322,8 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         self.seed = seed
         self.read_mode = read_mode
         self.include_metadata = include_metadata
+        self.drop_last = drop_last
+        self.shuffle_block_batches = shuffle_block_batches
         self._handle = None
         self._records = 0
         self._targets: list[str] = []
@@ -328,7 +334,8 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         torch = _torch()
         handle = self._ensure_open()
         worker = torch.utils.data.get_worker_info()
-        length = len(self)
+        sample_length = len(self)
+        iter_length = self._iter_length()
         if worker is None:
             start = 0
             step = self.batch_size
@@ -338,18 +345,21 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         index = start
         buffer = handle.allocate_cxr_batch(self.batch_size, pin_memory=self.pin_memory)
         if self.shuffle:
-            order = list(range(length))
-            random.Random(self.seed).shuffle(order)
-            while index < length:
-                indices = order[index : min(index + self.batch_size, length)]
+            order = self._sample_order(sample_length)
+            while index < iter_length:
+                indices = order[index : index + self.batch_size]
                 yield handle.fill_cxr_indices_buffer(
                     buffer, indices, include_metadata=self.include_metadata
                 )
                 index += step
             return
-        while index < length:
+        while index < iter_length:
             start_index = index % self._records
-            current = min(self.batch_size, length - index, self._records - start_index)
+            current = min(
+                self.batch_size,
+                iter_length - index,
+                self._records - start_index,
+            )
             yield handle.fill_cxr_batch_buffer(
                 buffer,
                 start_index,
@@ -372,10 +382,60 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         self._ensure_open()
         return self._image_shape
 
+    def report_metadata(self) -> dict[str, Any]:
+        iter_length = self._iter_length()
+        return {
+            "dataset": "medkit_rs.dataset.MedkitCxrNativeBatchIterableDataset",
+            "cache_dir": str(self.cache_dir),
+            "split": self.split,
+            "batch_size": self.batch_size,
+            "shuffle": self.shuffle,
+            "pin_memory": self.pin_memory,
+            "prefetch": False,
+            "prefetch_depth": 0,
+            "read_workers": 0,
+            "prefetch_read_workers": 0,
+            "read_mode": self.read_mode,
+            "include_metadata": self.include_metadata,
+            "drop_last": self.drop_last,
+            "shuffle_block_batches": self.shuffle_block_batches,
+            "worker_mode": "single_process",
+            "num_workers": 0,
+            "num_samples": len(self),
+            "yielded_samples": iter_length,
+            "dropped_samples": len(self) - iter_length,
+            "num_batches": self._num_batches(),
+            "targets": self.targets,
+            "image_shape": list(self.image_shape),
+        }
+
     def __getstate__(self) -> dict[str, Any]:
         state = dict(self.__dict__)
         state["_handle"] = None
         return state
+
+    def _iter_length(self) -> int:
+        length = len(self)
+        if not self.drop_last:
+            return length
+        return length - (length % self.batch_size)
+
+    def _num_batches(self) -> int:
+        length = len(self)
+        if self.drop_last:
+            return length // self.batch_size
+        return (length + self.batch_size - 1) // self.batch_size
+
+    def _sample_order(self, length: int) -> list[int]:
+        order = list(range(length))
+        rng = random.Random(self.seed)
+        if self.shuffle_block_batches <= 0:
+            rng.shuffle(order)
+            return order
+        block_size = self.batch_size * self.shuffle_block_batches
+        blocks = [order[start : start + block_size] for start in range(0, length, block_size)]
+        rng.shuffle(blocks)
+        return [index for block in blocks for index in block]
 
     def _ensure_open(self):
         if self._handle is not None:
@@ -413,6 +473,8 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         read_workers: int = 1,
         read_mode: str = "mmap",
         include_metadata: bool = False,
+        drop_last: bool = False,
+        shuffle_block_batches: int = 0,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
@@ -420,6 +482,8 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
             raise ValueError("prefetch_depth must be greater than zero")
         if read_workers <= 0:
             raise ValueError("read_workers must be greater than zero")
+        if shuffle_block_batches < 0:
+            raise ValueError("shuffle_block_batches must be non-negative")
         read_mode = _validate_cxr_read_mode(read_mode)
         self.cache_dir = Path(cache_dir)
         self.split = split
@@ -432,6 +496,8 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         self.read_workers = read_workers
         self.read_mode = read_mode
         self.include_metadata = include_metadata
+        self.drop_last = drop_last
+        self.shuffle_block_batches = shuffle_block_batches
         self._handle = None
         self._records = 0
         self._targets: list[str] = []
@@ -486,6 +552,33 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         self._ensure_open()
         return self._image_shape
 
+    def report_metadata(self) -> dict[str, Any]:
+        iter_length = self._iter_length()
+        return {
+            "dataset": "medkit_rs.dataset.MedkitCxrNativePrefetchDataset",
+            "cache_dir": str(self.cache_dir),
+            "split": self.split,
+            "batch_size": self.batch_size,
+            "shuffle": self.shuffle,
+            "pin_memory": self.pin_memory,
+            "prefetch": True,
+            "prefetch_depth": self.prefetch_depth,
+            "read_workers": self.read_workers,
+            "prefetch_read_workers": self.read_workers,
+            "read_mode": self.read_mode,
+            "include_metadata": self.include_metadata,
+            "drop_last": self.drop_last,
+            "shuffle_block_batches": self.shuffle_block_batches,
+            "worker_mode": "rust_thread_prefetch",
+            "num_workers": 0,
+            "num_samples": len(self),
+            "yielded_samples": iter_length,
+            "dropped_samples": len(self) - iter_length,
+            "num_batches": self._num_batches(),
+            "targets": self.targets,
+            "image_shape": list(self.image_shape),
+        }
+
     def __getstate__(self) -> dict[str, Any]:
         state = dict(self.__dict__)
         state["_handle"] = None
@@ -493,13 +586,37 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
 
     def _batch_indices(self) -> list[list[int]]:
         length = len(self)
-        order = list(range(length))
-        if self.shuffle:
-            random.Random(self.seed).shuffle(order)
+        iter_length = self._iter_length()
+        order = self._sample_order(length)
         return [
-            order[index : min(index + self.batch_size, length)]
-            for index in range(0, length, self.batch_size)
+            order[index : index + self.batch_size]
+            for index in range(0, iter_length, self.batch_size)
         ]
+
+    def _iter_length(self) -> int:
+        length = len(self)
+        if not self.drop_last:
+            return length
+        return length - (length % self.batch_size)
+
+    def _num_batches(self) -> int:
+        length = len(self)
+        if self.drop_last:
+            return length // self.batch_size
+        return (length + self.batch_size - 1) // self.batch_size
+
+    def _sample_order(self, length: int) -> list[int]:
+        order = list(range(length))
+        if not self.shuffle:
+            return order
+        rng = random.Random(self.seed)
+        if self.shuffle_block_batches <= 0:
+            rng.shuffle(order)
+            return order
+        block_size = self.batch_size * self.shuffle_block_batches
+        blocks = [order[start : start + block_size] for start in range(0, length, block_size)]
+        rng.shuffle(blocks)
+        return [index for block in blocks for index in block]
 
     def _ensure_open(self):
         if self._handle is not None:

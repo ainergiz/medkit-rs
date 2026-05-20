@@ -475,8 +475,22 @@ def test_cxr_native_batch_iterable_covers_range_shuffle_and_validation(
         {"mode": "range", "start": 0, "count": 2, "include_metadata": False},
         {"mode": "range", "start": 2, "count": 1, "include_metadata": False},
     ]
+    assert dataset.report_metadata()["drop_last"] is False
     assert dataset.__getstate__()["_handle"] is None
     assert dataset._ensure_open() is dataset._handle
+
+    drop_last = ds.MedkitCxrNativeBatchIterableDataset(
+        tmp_path, length=3, batch_size=2, drop_last=True
+    )
+    assert list(drop_last) == [
+        {"mode": "range", "start": 0, "count": 2, "include_metadata": False}
+    ]
+    drop_last_report = drop_last.report_metadata()
+    assert drop_last_report["drop_last"] is True
+    assert drop_last_report["num_samples"] == 3
+    assert drop_last_report["yielded_samples"] == 2
+    assert drop_last_report["dropped_samples"] == 1
+    assert drop_last_report["num_batches"] == 1
 
     shuffled = ds.MedkitCxrNativeBatchIterableDataset(
         tmp_path, length=4, batch_size=3, shuffle=True, seed=7
@@ -485,6 +499,23 @@ def test_cxr_native_batch_iterable_covers_range_shuffle_and_validation(
     assert [batch["mode"] for batch in batches] == ["indices", "indices"]
     assert sorted(batches[0]["indices"] + batches[1]["indices"]) == [0, 1, 2, 3]
     assert all(batch["include_metadata"] is False for batch in batches)
+
+    block_shuffled = ds.MedkitCxrNativeBatchIterableDataset(
+        tmp_path, length=4, batch_size=2, shuffle=True, seed=7, shuffle_block_batches=1
+    )
+    block_batches = list(block_shuffled)
+    assert block_batches[0]["indices"] in ([0, 1], [2, 3])
+    assert block_batches[1]["indices"] in ([0, 1], [2, 3])
+    assert block_batches[0]["indices"] != block_batches[1]["indices"]
+    assert block_shuffled.report_metadata()["shuffle_block_batches"] == 1
+
+    shuffled_drop_last = ds.MedkitCxrNativeBatchIterableDataset(
+        tmp_path, length=3, batch_size=2, shuffle=True, seed=7, drop_last=True
+    )
+    shuffled_drop_batches = list(shuffled_drop_last)
+    assert len(shuffled_drop_batches) == 1
+    assert len(shuffled_drop_batches[0]["indices"]) == 2
+    assert set(shuffled_drop_batches[0]["indices"]).issubset({0, 1, 2})
 
     with_metadata = ds.MedkitCxrNativeBatchIterableDataset(
         tmp_path, length=2, batch_size=2, include_metadata=True
@@ -499,6 +530,8 @@ def test_cxr_native_batch_iterable_covers_range_shuffle_and_validation(
         ds.MedkitCxrNativeBatchIterableDataset(tmp_path, length=5)
     with pytest.raises(ValueError, match="read_mode must be"):
         ds.MedkitCxrNativeBatchIterableDataset(tmp_path, read_mode="resident")
+    with pytest.raises(ValueError, match="shuffle_block_batches must be non-negative"):
+        ds.MedkitCxrNativeBatchIterableDataset(tmp_path, shuffle_block_batches=-1)
 
     worker_ds = reload_dataset_module(
         monkeypatch, types.SimpleNamespace(id=1, num_workers=2)
@@ -542,6 +575,19 @@ def test_cxr_prefetch_iterable_batches_releases_and_worker_guard(
         ds.MedkitCxrNativePrefetchDataset(tmp_path, length=4, batch_size=2, shuffle=False)
         ._batch_indices()
     ) == 2
+    assert ds.MedkitCxrNativePrefetchDataset(
+        tmp_path, length=4, batch_size=2, shuffle=True, seed=7, shuffle_block_batches=1
+    )._batch_indices() in ([[0, 1], [2, 3]], [[2, 3], [0, 1]])
+    drop_last = ds.MedkitCxrNativePrefetchDataset(
+        tmp_path, length=3, batch_size=2, drop_last=True
+    )
+    assert drop_last._batch_indices() == [[0, 1]]
+    drop_last_report = drop_last.report_metadata()
+    assert drop_last_report["drop_last"] is True
+    assert drop_last_report["prefetch"] is True
+    assert drop_last_report["yielded_samples"] == 2
+    assert drop_last_report["dropped_samples"] == 1
+    assert drop_last_report["num_batches"] == 1
     assert dataset.targets == ["No Finding", "Pneumonia"]
     assert dataset.image_shape == (4, 1, 8, 8)
     assert list(dataset) == [{"batch": 1}, {"batch": 2}]
@@ -570,6 +616,8 @@ def test_cxr_prefetch_iterable_batches_releases_and_worker_guard(
         ds.MedkitCxrNativePrefetchDataset(tmp_path, length=5)
     with pytest.raises(ValueError, match="read_mode must be"):
         ds.MedkitCxrNativePrefetchDataset(tmp_path, read_mode="resident")
+    with pytest.raises(ValueError, match="shuffle_block_batches must be non-negative"):
+        ds.MedkitCxrNativePrefetchDataset(tmp_path, shuffle_block_batches=-1)
     FakeCxrCacheHandle.records = 0
     with pytest.raises(ValueError, match="contains no records"):
         ds.MedkitCxrNativePrefetchDataset(tmp_path)
@@ -777,6 +825,16 @@ def test_cxr_facade_routes_options_and_metadata(
     install_fake_native(monkeypatch, ds)
     cxr = importlib.import_module("medkit_rs.cxr")
     FakeCxrCacheHandle.records = 4
+    assert cxr.presets()["speed"] == {
+        "pin_memory": True,
+        "prefetch": True,
+        "prefetch_depth": 2,
+        "read_workers": 4,
+        "read_mode": "stream",
+    }
+    preset_copy = cxr.presets()
+    preset_copy["speed"]["read_workers"] = 99
+    assert cxr.presets()["speed"]["read_workers"] == 4
     (tmp_path / "cache-metadata.json").write_text(
         json.dumps(
             {
@@ -807,12 +865,46 @@ def test_cxr_facade_routes_options_and_metadata(
     assert report["transform_fingerprint"] == "abc"
     assert report["read_mode"] == "stream"
     assert report["include_metadata"] is False
+    assert report["drop_last"] is False
+    assert report["yielded_samples"] == 4
+    assert report["dropped_samples"] == 0
     assert report["worker_mode"] == "single_process"
     assert len(dataset) == 2
     assert list(dataset) == [
         {"mode": "range", "start": 0, "count": 2, "include_metadata": False},
         {"mode": "range", "start": 2, "count": 2, "include_metadata": False},
     ]
+
+    drop_last_dataset = cxr.Dataset(
+        tmp_path,
+        length=3,
+        batch_size=2,
+        prefetch=False,
+        drop_last=True,
+    )
+    assert drop_last_dataset.num_batches == 1
+    assert len(drop_last_dataset) == 1
+    assert list(drop_last_dataset) == [
+        {"mode": "range", "start": 0, "count": 2, "include_metadata": False}
+    ]
+    drop_last_report = drop_last_dataset.report_metadata()
+    assert drop_last_report["drop_last"] is True
+    assert drop_last_report["num_samples"] == 3
+    assert drop_last_report["yielded_samples"] == 2
+    assert drop_last_report["dropped_samples"] == 1
+
+    speed_dataset = cxr.Dataset(tmp_path, length=3, batch_size=2, preset="speed")
+    assert speed_dataset.preset == "speed"
+    assert speed_dataset.pin_memory is True
+    assert speed_dataset.prefetch is True
+    assert speed_dataset.prefetch_depth == 2
+    assert speed_dataset.read_workers == 4
+    assert speed_dataset.read_mode == "stream"
+    speed_report = speed_dataset.report_metadata()
+    assert speed_report["preset"] == "speed"
+    assert speed_report["prefetch_depth"] == 2
+    assert speed_report["read_workers"] == 4
+    assert speed_report["prefetch_read_workers"] == 4
 
     loader = cxr.DataLoader(
         dataset,
@@ -822,28 +914,52 @@ def test_cxr_facade_routes_options_and_metadata(
         pin_memory=True,
         read_mode="mmap",
         include_metadata=True,
+        drop_last=True,
+        shuffle_block_batches=2,
     )
     assert isinstance(loader, FakeLoader)
     assert loader.dataset.batch_size == 1
     assert loader.dataset.shuffle is True
     assert loader.dataset.read_mode == "mmap"
     assert loader.dataset.include_metadata is True
+    assert loader.dataset.drop_last is True
+    assert loader.dataset.shuffle_block_batches == 2
     assert loader.report_metadata()["batch_size"] == 1
     assert loader.report_metadata()["include_metadata"] is True
+    assert loader.report_metadata()["drop_last"] is True
+    assert loader.report_metadata()["shuffle_block_batches"] == 2
+
+    preset_loader = cxr.DataLoader(
+        cxr.Dataset(tmp_path, length=3, batch_size=2, prefetch=False),
+        preset="speed",
+        drop_last=True,
+    )
+    assert preset_loader.dataset.preset == "speed"
+    assert preset_loader.dataset.pin_memory is True
+    assert preset_loader.dataset.prefetch is True
+    assert preset_loader.dataset.prefetch_depth == 2
+    assert preset_loader.dataset.read_workers == 4
+    assert preset_loader.dataset.read_mode == "stream"
+    assert preset_loader.dataset.drop_last is True
 
     split_map = cxr.datasets(
         tmp_path,
         batch_size=1,
         splits=("train", "val"),
         prefetch=False,
-        read_mode="stream",
+        preset="memory",
         include_metadata=True,
+        shuffle_block_batches=3,
     )
     assert sorted(split_map) == ["train", "val"]
     assert split_map["train"].shuffle is True
     assert split_map["val"].shuffle is False
+    assert split_map["train"].preset == "memory"
     assert split_map["train"].read_mode == "stream"
+    assert split_map["train"].pin_memory is False
+    assert split_map["train"].prefetch is False
     assert split_map["train"].include_metadata is True
+    assert split_map["train"].shuffle_block_batches == 3
 
     bad_metadata = tmp_path / "bad"
     bad_metadata.mkdir()
@@ -859,9 +975,12 @@ def test_cxr_facade_routes_options_and_metadata(
         cxr.Dataset(tmp_path, read_workers=0)
     with pytest.raises(ValueError, match="read_mode must be"):
         cxr.Dataset(tmp_path, read_mode="resident")
+    with pytest.raises(ValueError, match="shuffle_block_batches must be non-negative"):
+        cxr.Dataset(tmp_path, shuffle_block_batches=-1)
 
     prefetch_dataset = cxr.Dataset(tmp_path, length=2, batch_size=1, prefetch=True)
     assert prefetch_dataset.report_metadata()["prefetch_depth"] == 1
+    assert prefetch_dataset.report_metadata()["prefetch_read_workers"] == 1
     assert list(prefetch_dataset) == [{"batch": 1}, {"batch": 2}]
     assert FakeCxrCacheHandle.last_prefetch_kwargs is not None
     assert FakeCxrCacheHandle.last_prefetch_kwargs["prefetch_depth"] == 1

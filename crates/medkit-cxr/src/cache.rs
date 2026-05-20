@@ -37,6 +37,13 @@ struct CxrIndexedRun {
 #[derive(Debug)]
 struct CxrIndexedRunRead {
     out_indices: Vec<usize>,
+    image_start: usize,
+    label_start: usize,
+}
+
+#[derive(Debug)]
+struct CxrIndexedChunkRead {
+    runs: Vec<CxrIndexedRunRead>,
     images: Vec<f32>,
     labels: Vec<f32>,
     masks: Vec<f32>,
@@ -719,26 +726,12 @@ impl CxrCacheReader {
             return Ok(0);
         }
 
-        let mut order: Vec<(usize, usize)> = indices
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(out_index, sample_index)| (sample_index, out_index))
-            .collect();
-        for (sample_index, _) in &order {
-            if *sample_index >= self.samples() {
-                return Err(CxrError::Message(format!(
-                    "sample index {sample_index} out of bounds for {} samples",
-                    self.samples()
-                )));
-            }
-        }
-        order.sort_unstable_by_key(|(sample_index, _)| *sample_index);
+        let runs = self.indexed_runs(indices)?;
 
         if self.read_mode == CxrCacheReadMode::Stream {
             return self
                 .fill_indexed_runs_streaming(
-                    &self.indexed_runs(indices)?,
+                    &runs,
                     self.stream_files()?,
                     CacheSplitBuffers {
                         images: image_out,
@@ -749,29 +742,43 @@ impl CxrCacheReader {
                 .map(|metrics| metrics.samples);
         }
 
-        let mut cursor = 0usize;
-        while cursor < order.len() {
-            let start_sample = order[cursor].0;
-            let mut end = cursor + 1;
-            while end < order.len() && order[end].0 == order[end - 1].0 + 1 {
-                end += 1;
-            }
-            let run_samples = end - cursor;
-            let image_offset = start_sample
+        let max_run_samples = max_indexed_run_samples(&runs);
+        let max_image_values = checked_value_count(
+            max_run_samples,
+            self.image_values_per_sample,
+            "image scratch",
+        )?;
+        let max_label_values =
+            checked_value_count(max_run_samples, self.target_count, "label scratch")?;
+        let mut image_scratch = vec![0.0f32; max_image_values];
+        let mut label_scratch = vec![0.0f32; max_label_values];
+        let mut mask_scratch = vec![0.0f32; max_label_values];
+        let mut outputs = CacheSplitBuffers {
+            images: image_out,
+            labels: labels_out,
+            masks: masks_out,
+        };
+
+        for run in &runs {
+            let run_samples = run.out_indices.len();
+            let image_values =
+                checked_value_count(run_samples, self.image_values_per_sample, "image scratch")?;
+            let label_values =
+                checked_value_count(run_samples, self.target_count, "label scratch")?;
+            let image_offset = run
+                .start_sample
                 .checked_mul(self.image_values_per_sample)
                 .ok_or_else(|| CxrError::Message("image offset overflow".to_string()))?;
-            let label_offset = start_sample
+            let label_offset = run
+                .start_sample
                 .checked_mul(self.target_count)
                 .ok_or_else(|| CxrError::Message("label offset overflow".to_string()))?;
-            let mut image_scratch = vec![0.0f32; run_samples * self.image_values_per_sample];
-            let mut label_scratch = vec![0.0f32; run_samples * self.target_count];
-            let mut mask_scratch = vec![0.0f32; run_samples * self.target_count];
             self.read_image_range(
                 self.images_mmap.as_deref(),
                 self.images_file.as_deref(),
                 &self.images_path,
                 image_offset,
-                &mut image_scratch,
+                &mut image_scratch[..image_values],
                 "images",
             )?;
             self.read_f32_range(
@@ -779,7 +786,7 @@ impl CxrCacheReader {
                 self.labels_file.as_deref(),
                 &self.labels_path,
                 label_offset,
-                &mut label_scratch,
+                &mut label_scratch[..label_values],
                 "labels",
             )?;
             self.read_f32_range(
@@ -787,28 +794,19 @@ impl CxrCacheReader {
                 self.masks_file.as_deref(),
                 &self.masks_path,
                 label_offset,
-                &mut mask_scratch,
+                &mut mask_scratch[..label_values],
                 "masks",
             )?;
 
-            for (run_index, (_sample_index, out_index)) in order[cursor..end].iter().enumerate() {
-                let src_image_start = run_index * self.image_values_per_sample;
-                let dst_image_start = *out_index * self.image_values_per_sample;
-                image_out[dst_image_start..dst_image_start + self.image_values_per_sample]
-                    .copy_from_slice(
-                        &image_scratch
-                            [src_image_start..src_image_start + self.image_values_per_sample],
-                    );
-                let src_label_start = run_index * self.target_count;
-                let dst_label_start = *out_index * self.target_count;
-                labels_out[dst_label_start..dst_label_start + self.target_count].copy_from_slice(
-                    &label_scratch[src_label_start..src_label_start + self.target_count],
-                );
-                masks_out[dst_label_start..dst_label_start + self.target_count].copy_from_slice(
-                    &mask_scratch[src_label_start..src_label_start + self.target_count],
-                );
-            }
-            cursor = end;
+            scatter_indexed_run(
+                &run.out_indices,
+                &image_scratch[..image_values],
+                &label_scratch[..label_values],
+                &mask_scratch[..label_values],
+                self.image_values_per_sample,
+                self.target_count,
+                &mut outputs,
+            );
         }
 
         Ok(samples)
@@ -878,11 +876,11 @@ impl CxrCacheReader {
 
         let read_start = Instant::now();
         let chunk_size = runs.len().div_ceil(worker_count);
-        let run_reads = thread::scope(|scope| {
+        let chunk_reads = thread::scope(|scope| {
             let mut handles = Vec::new();
             for chunk in runs.chunks(chunk_size) {
                 handles.push(scope.spawn(move || {
-                    read_indexed_runs(
+                    read_indexed_run_chunk(
                         chunk,
                         files,
                         self.image_dtype,
@@ -893,32 +891,38 @@ impl CxrCacheReader {
                 }));
             }
 
-            let mut run_reads = Vec::with_capacity(runs.len());
+            let mut chunk_reads = Vec::with_capacity(handles.len());
             for handle in handles {
-                let mut chunk_reads = handle.join().expect("indexed CXR read worker panicked")?;
-                run_reads.append(&mut chunk_reads);
+                chunk_reads.push(handle.join().expect("indexed CXR read worker panicked")?);
             }
-            Ok::<_, CxrError>(run_reads)
+            Ok::<_, CxrError>(chunk_reads)
         })?;
         let read_micros = read_start.elapsed().as_micros();
 
         let scatter_start = Instant::now();
-        for run_read in &run_reads {
-            for (run_index, out_index) in run_read.out_indices.iter().copied().enumerate() {
-                let src_image_start = run_index * self.image_values_per_sample;
-                let dst_image_start = out_index * self.image_values_per_sample;
-                image_out[dst_image_start..dst_image_start + self.image_values_per_sample]
-                    .copy_from_slice(
-                        &run_read.images
-                            [src_image_start..src_image_start + self.image_values_per_sample],
-                    );
-                let src_label_start = run_index * self.target_count;
-                let dst_label_start = out_index * self.target_count;
-                labels_out[dst_label_start..dst_label_start + self.target_count].copy_from_slice(
-                    &run_read.labels[src_label_start..src_label_start + self.target_count],
-                );
-                masks_out[dst_label_start..dst_label_start + self.target_count].copy_from_slice(
-                    &run_read.masks[src_label_start..src_label_start + self.target_count],
+        let mut outputs = CacheSplitBuffers {
+            images: image_out,
+            labels: labels_out,
+            masks: masks_out,
+        };
+        for chunk_read in &chunk_reads {
+            for run_read in &chunk_read.runs {
+                let run_samples = run_read.out_indices.len();
+                let image_values = checked_value_count(
+                    run_samples,
+                    self.image_values_per_sample,
+                    "image scratch",
+                )?;
+                let label_values =
+                    checked_value_count(run_samples, self.target_count, "label scratch")?;
+                scatter_indexed_run(
+                    &run_read.out_indices,
+                    &chunk_read.images[run_read.image_start..run_read.image_start + image_values],
+                    &chunk_read.labels[run_read.label_start..run_read.label_start + label_values],
+                    &chunk_read.masks[run_read.label_start..run_read.label_start + label_values],
+                    self.image_values_per_sample,
+                    self.target_count,
+                    &mut outputs,
                 );
             }
         }
@@ -938,13 +942,32 @@ impl CxrCacheReader {
         &self,
         runs: &[CxrIndexedRun],
         files: CacheSplitFiles<'_>,
-        outputs: CacheSplitBuffers<'_>,
+        mut outputs: CacheSplitBuffers<'_>,
     ) -> Result<CxrIndexedReadMetrics, CxrError> {
         let mut samples = 0usize;
         let mut read_micros = 0u128;
         let mut scatter_micros = 0u128;
+        let max_run_samples = max_indexed_run_samples(runs);
+        let max_image_values = checked_value_count(
+            max_run_samples,
+            self.image_values_per_sample,
+            "image scratch",
+        )?;
+        let max_label_values =
+            checked_value_count(max_run_samples, self.target_count, "label scratch")?;
+        let mut image_scratch = vec![0.0f32; max_image_values];
+        let mut label_scratch = vec![0.0f32; max_label_values];
+        let mut mask_scratch = vec![0.0f32; max_label_values];
+        let mut image_byte_scratch = image_file_byte_scratch(self.image_dtype, max_image_values)?;
         for run in runs {
-            samples += run.out_indices.len();
+            samples = samples.checked_add(run.out_indices.len()).ok_or_else(|| {
+                CxrError::Message("indexed run sample count overflow".to_string())
+            })?;
+            let run_samples = run.out_indices.len();
+            let image_values =
+                checked_value_count(run_samples, self.image_values_per_sample, "image scratch")?;
+            let label_values =
+                checked_value_count(run_samples, self.target_count, "label scratch")?;
             let image_offset = run
                 .start_sample
                 .checked_mul(self.image_values_per_sample)
@@ -953,42 +976,33 @@ impl CxrCacheReader {
                 .start_sample
                 .checked_mul(self.target_count)
                 .ok_or_else(|| CxrError::Message("label offset overflow".to_string()))?;
-            let mut image_scratch =
-                vec![0.0f32; run.out_indices.len() * self.image_values_per_sample];
-            let mut label_scratch = vec![0.0f32; run.out_indices.len() * self.target_count];
-            let mut mask_scratch = vec![0.0f32; run.out_indices.len() * self.target_count];
             let read_start = Instant::now();
-            read_image_range_from_file(
+            read_image_range_from_file_with_scratch(
                 files.images,
                 self.image_dtype,
                 &self.summary.normalization,
                 image_offset,
-                &mut image_scratch,
+                &mut image_scratch[..image_values],
+                &mut image_byte_scratch,
             )?;
-            read_f32_range_from_file(files.labels, label_offset, &mut label_scratch)?;
-            read_f32_range_from_file(files.masks, label_offset, &mut mask_scratch)?;
+            read_f32_range_from_file(
+                files.labels,
+                label_offset,
+                &mut label_scratch[..label_values],
+            )?;
+            read_f32_range_from_file(files.masks, label_offset, &mut mask_scratch[..label_values])?;
             read_micros += read_start.elapsed().as_micros();
 
             let scatter_start = Instant::now();
-            for (run_index, out_index) in run.out_indices.iter().copied().enumerate() {
-                let src_image_start = run_index * self.image_values_per_sample;
-                let dst_image_start = out_index * self.image_values_per_sample;
-                outputs.images[dst_image_start..dst_image_start + self.image_values_per_sample]
-                    .copy_from_slice(
-                        &image_scratch
-                            [src_image_start..src_image_start + self.image_values_per_sample],
-                    );
-                let src_label_start = run_index * self.target_count;
-                let dst_label_start = out_index * self.target_count;
-                outputs.labels[dst_label_start..dst_label_start + self.target_count]
-                    .copy_from_slice(
-                        &label_scratch[src_label_start..src_label_start + self.target_count],
-                    );
-                outputs.masks[dst_label_start..dst_label_start + self.target_count]
-                    .copy_from_slice(
-                        &mask_scratch[src_label_start..src_label_start + self.target_count],
-                    );
-            }
+            scatter_indexed_run(
+                &run.out_indices,
+                &image_scratch[..image_values],
+                &label_scratch[..label_values],
+                &mask_scratch[..label_values],
+                self.image_values_per_sample,
+                self.target_count,
+                &mut outputs,
+            );
             scatter_micros += scatter_start.elapsed().as_micros();
         }
         let image_values = samples * self.image_values_per_sample;
@@ -1141,6 +1155,61 @@ impl CxrCacheReader {
         Ok(runs)
     }
 }
+
+fn max_indexed_run_samples(runs: &[CxrIndexedRun]) -> usize {
+    runs.iter()
+        .map(|run| run.out_indices.len())
+        .max()
+        .unwrap_or(0)
+}
+
+fn checked_value_count(
+    samples: usize,
+    values_per_sample: usize,
+    kind: &str,
+) -> Result<usize, CxrError> {
+    samples
+        .checked_mul(values_per_sample)
+        .ok_or_else(|| CxrError::Message(format!("{kind} value count overflow")))
+}
+
+fn scatter_indexed_run(
+    out_indices: &[usize],
+    image_scratch: &[f32],
+    label_scratch: &[f32],
+    mask_scratch: &[f32],
+    image_values_per_sample: usize,
+    target_count: usize,
+    outputs: &mut CacheSplitBuffers<'_>,
+) {
+    for (run_index, out_index) in out_indices.iter().copied().enumerate() {
+        let src_image_start = run_index * image_values_per_sample;
+        let dst_image_start = out_index * image_values_per_sample;
+        outputs.images[dst_image_start..dst_image_start + image_values_per_sample].copy_from_slice(
+            &image_scratch[src_image_start..src_image_start + image_values_per_sample],
+        );
+
+        let src_label_start = run_index * target_count;
+        let dst_label_start = out_index * target_count;
+        outputs.labels[dst_label_start..dst_label_start + target_count]
+            .copy_from_slice(&label_scratch[src_label_start..src_label_start + target_count]);
+        outputs.masks[dst_label_start..dst_label_start + target_count]
+            .copy_from_slice(&mask_scratch[src_label_start..src_label_start + target_count]);
+    }
+}
+
+fn image_file_byte_scratch(dtype: CxrCacheDType, image_values: usize) -> Result<Vec<u8>, CxrError> {
+    match dtype {
+        CxrCacheDType::Float32 => Ok(Vec::new()),
+        CxrCacheDType::Float16 | CxrCacheDType::Uint8 => {
+            let byte_len = image_values
+                .checked_mul(dtype.bytes_per_value())
+                .ok_or_else(|| CxrError::Message("image byte scratch overflow".to_string()))?;
+            Ok(vec![0u8; byte_len])
+        }
+    }
+}
+
 fn write_cache_split(
     cache_dir: &Path,
     split: &str,
@@ -1840,7 +1909,7 @@ fn read_image_range_from_mmap(
         }
         CxrCacheDType::Uint8 => {
             let bytes = mmap_value_bytes(mmap, start_value, out.len(), dtype.bytes_per_value())?;
-            decode_uint8_image_values(bytes.iter().copied(), normalization, out);
+            decode_uint8_image_values(bytes, normalization, out);
             Ok(())
         }
     }
@@ -1865,17 +1934,38 @@ fn mmap_value_bytes(
         .ok_or_else(|| CxrError::Message("cache mmap range is out of bounds".to_string()))
 }
 
-fn read_indexed_runs(
+fn read_indexed_run_chunk(
     runs: &[CxrIndexedRun],
     files: CacheSplitFiles<'_>,
     image_dtype: CxrCacheDType,
     normalization: &Normalization,
     image_values_per_sample: usize,
     target_count: usize,
-) -> Result<Vec<CxrIndexedRunRead>, CxrError> {
-    let mut reads = Vec::with_capacity(runs.len());
+) -> Result<CxrIndexedChunkRead, CxrError> {
+    let total_samples = runs.iter().try_fold(0usize, |total, run| {
+        total
+            .checked_add(run.out_indices.len())
+            .ok_or_else(|| CxrError::Message("indexed run sample count overflow".to_string()))
+    })?;
+    let total_image_values =
+        checked_value_count(total_samples, image_values_per_sample, "image scratch")?;
+    let total_label_values = checked_value_count(total_samples, target_count, "label scratch")?;
+    let max_image_values = checked_value_count(
+        max_indexed_run_samples(runs),
+        image_values_per_sample,
+        "image scratch",
+    )?;
+    let mut images = vec![0.0f32; total_image_values];
+    let mut labels = vec![0.0f32; total_label_values];
+    let mut masks = vec![0.0f32; total_label_values];
+    let mut image_byte_scratch = image_file_byte_scratch(image_dtype, max_image_values)?;
+    let mut run_reads = Vec::with_capacity(runs.len());
+    let mut image_cursor = 0usize;
+    let mut label_cursor = 0usize;
     for run in runs {
         let run_len = run.out_indices.len();
+        let image_values = checked_value_count(run_len, image_values_per_sample, "image scratch")?;
+        let label_values = checked_value_count(run_len, target_count, "label scratch")?;
         let image_offset = run
             .start_sample
             .checked_mul(image_values_per_sample)
@@ -1884,26 +1974,38 @@ fn read_indexed_runs(
             .start_sample
             .checked_mul(target_count)
             .ok_or_else(|| CxrError::Message("label offset overflow".to_string()))?;
-        let mut image_scratch = vec![0.0f32; run_len * image_values_per_sample];
-        let mut label_scratch = vec![0.0f32; run_len * target_count];
-        let mut mask_scratch = vec![0.0f32; run_len * target_count];
-        read_image_range_from_file(
+        read_image_range_from_file_with_scratch(
             files.images,
             image_dtype,
             normalization,
             image_offset,
-            &mut image_scratch,
+            &mut images[image_cursor..image_cursor + image_values],
+            &mut image_byte_scratch,
         )?;
-        read_f32_range_from_file(files.labels, label_offset, &mut label_scratch)?;
-        read_f32_range_from_file(files.masks, label_offset, &mut mask_scratch)?;
-        reads.push(CxrIndexedRunRead {
+        read_f32_range_from_file(
+            files.labels,
+            label_offset,
+            &mut labels[label_cursor..label_cursor + label_values],
+        )?;
+        read_f32_range_from_file(
+            files.masks,
+            label_offset,
+            &mut masks[label_cursor..label_cursor + label_values],
+        )?;
+        run_reads.push(CxrIndexedRunRead {
             out_indices: run.out_indices.clone(),
-            images: image_scratch,
-            labels: label_scratch,
-            masks: mask_scratch,
+            image_start: image_cursor,
+            label_start: label_cursor,
         });
+        image_cursor += image_values;
+        label_cursor += label_values;
     }
-    Ok(reads)
+    Ok(CxrIndexedChunkRead {
+        runs: run_reads,
+        images,
+        labels,
+        masks,
+    })
 }
 
 fn read_f32_range_from_file(
@@ -1939,13 +2041,39 @@ fn read_image_range_from_file(
     start_value: usize,
     out: &mut [f32],
 ) -> Result<(), CxrError> {
+    let mut byte_scratch = Vec::new();
+    read_image_range_from_file_with_scratch(
+        file,
+        dtype,
+        normalization,
+        start_value,
+        out,
+        &mut byte_scratch,
+    )
+}
+
+fn read_image_range_from_file_with_scratch(
+    file: &File,
+    dtype: CxrCacheDType,
+    normalization: &Normalization,
+    start_value: usize,
+    out: &mut [f32],
+    byte_scratch: &mut Vec<u8>,
+) -> Result<(), CxrError> {
     match dtype {
         CxrCacheDType::Float32 => read_f32_range_from_file(file, start_value, out),
         CxrCacheDType::Float16 => {
-            let mut bytes = vec![0u8; out.len() * dtype.bytes_per_value()];
+            let byte_len = out
+                .len()
+                .checked_mul(dtype.bytes_per_value())
+                .ok_or_else(|| CxrError::Message("cache byte length overflow".to_string()))?;
+            if byte_scratch.len() < byte_len {
+                byte_scratch.resize(byte_len, 0);
+            }
+            let bytes = &mut byte_scratch[..byte_len];
             read_exact_at(
                 file,
-                &mut bytes,
+                bytes,
                 byte_offset_for(start_value, dtype.bytes_per_value())?,
             )?;
             for (slot, chunk) in out.iter_mut().zip(bytes.chunks_exact(2)) {
@@ -1955,10 +2083,14 @@ fn read_image_range_from_file(
             Ok(())
         }
         CxrCacheDType::Uint8 => {
-            let mut bytes = vec![0u8; out.len()];
+            let byte_len = out.len();
+            if byte_scratch.len() < byte_len {
+                byte_scratch.resize(byte_len, 0);
+            }
+            let bytes = &mut byte_scratch[..byte_len];
             read_exact_at(
                 file,
-                &mut bytes,
+                bytes,
                 byte_offset_for(start_value, dtype.bytes_per_value())?,
             )?;
             decode_uint8_image_values(bytes, normalization, out);
@@ -1967,14 +2099,20 @@ fn read_image_range_from_file(
     }
 }
 
-fn decode_uint8_image_values(
-    values: impl IntoIterator<Item = u8>,
-    normalization: &Normalization,
-    out: &mut [f32],
-) {
-    for (slot, value) in out.iter_mut().zip(values) {
-        let scaled = value as f32 / 255.0;
-        *slot = (scaled - normalization.mean) / normalization.std;
+fn decode_uint8_image_values(values: &[u8], normalization: &Normalization, out: &mut [f32]) {
+    debug_assert_eq!(values.len(), out.len());
+    if normalization.std == 0.0 {
+        for (slot, value) in out.iter_mut().zip(values.iter().copied()) {
+            let scaled = value as f32 / 255.0;
+            *slot = (scaled - normalization.mean) / normalization.std;
+        }
+        return;
+    }
+
+    let scale = 1.0f32 / (255.0 * normalization.std);
+    let bias = -normalization.mean / normalization.std;
+    for (slot, value) in out.iter_mut().zip(values.iter().copied()) {
+        *slot = value as f32 * scale + bias;
     }
 }
 

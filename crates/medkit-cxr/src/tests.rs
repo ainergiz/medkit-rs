@@ -1562,6 +1562,99 @@ fn cxr_cache_reader_decodes_compact_image_dtypes() {
 }
 
 #[test]
+fn stream_indexed_uint8_reads_match_mmap_with_normalization() {
+    let root = unique_test_dir();
+    let cache_dir = root.join("cache");
+    let mut summary = write_synthetic_cache(&cache_dir, 4, 2, &["A", "B"]);
+    fs::remove_file(cache_dir.join("train-images.float32.dat")).unwrap();
+
+    let values = [
+        0_u8, 64, 128, 255, 10, 20, 30, 40, 50, 80, 120, 160, 200, 220, 240, 250,
+    ];
+    let images_name = "train-images.uint8.dat";
+    let images_path = cache_dir.join(images_name);
+    fs::write(&images_path, values).unwrap();
+
+    summary.dtype = CxrCacheDType::Uint8.as_str().to_string();
+    summary.normalization = Normalization {
+        mean: 0.5,
+        std: 0.25,
+    };
+    summary.image_size_policy.dtype = CxrCacheDType::Uint8.as_str().to_string();
+    let split = summary.splits.get_mut("train").unwrap();
+    split.images_path = images_name.to_string();
+    split.images_sha256 = hash_file(&images_path).unwrap();
+    summary.cache_size_bytes = directory_size(&cache_dir).unwrap();
+    write_json(&cache_dir.join("cache-metadata.json"), &summary).unwrap();
+
+    let indices = [3, 0, 2];
+    let image_len = indices.len() * 4;
+    let label_len = indices.len() * 2;
+    let stream_reader =
+        CxrCacheReader::open_with_read_mode(&cache_dir, "train", CxrCacheReadMode::Stream).unwrap();
+
+    let mut stream_images = vec![0.0; image_len];
+    let mut stream_labels = vec![0.0; label_len];
+    let mut stream_masks = vec![0.0; label_len];
+    stream_reader
+        .fill_indices(
+            &indices,
+            &mut stream_images,
+            &mut stream_labels,
+            &mut stream_masks,
+        )
+        .unwrap();
+
+    let mut parallel_images = vec![0.0; image_len];
+    let mut parallel_labels = vec![0.0; label_len];
+    let mut parallel_masks = vec![0.0; label_len];
+    let metrics = stream_reader
+        .fill_indices_parallel(
+            &indices,
+            &mut parallel_images,
+            &mut parallel_labels,
+            &mut parallel_masks,
+            2,
+        )
+        .unwrap();
+    assert_eq!(metrics.samples, indices.len());
+    assert_eq!(metrics.runs, 2);
+    assert_eq!(metrics.workers, 2);
+    assert_eq!(parallel_images, stream_images);
+    assert_eq!(parallel_labels, stream_labels);
+    assert_eq!(parallel_masks, stream_masks);
+
+    let mmap_reader = CxrCacheReader::open(&cache_dir, "train").unwrap();
+    let mut mmap_images = vec![0.0; image_len];
+    let mut mmap_labels = vec![0.0; label_len];
+    let mut mmap_masks = vec![0.0; label_len];
+    mmap_reader
+        .fill_indices(
+            &indices,
+            &mut mmap_images,
+            &mut mmap_labels,
+            &mut mmap_masks,
+        )
+        .unwrap();
+    assert_eq!(stream_labels, mmap_labels);
+    assert_eq!(stream_masks, mmap_masks);
+
+    for (actual, expected) in stream_images.iter().zip(&mmap_images) {
+        assert!((actual - expected).abs() <= 1.0e-6);
+    }
+
+    let mut expected_images = Vec::new();
+    for sample in indices {
+        for value in &values[sample * 4..sample * 4 + 4] {
+            expected_images.push((*value as f32 / 255.0 - 0.5) / 0.25);
+        }
+    }
+    for (actual, expected) in stream_images.iter().zip(&expected_images) {
+        assert!((actual - expected).abs() <= 1.0e-6);
+    }
+}
+
+#[test]
 fn indexed_read_buffer_errors_cover_all_entry_points() {
     let root = unique_test_dir();
     let cache_dir = root.join("cache");

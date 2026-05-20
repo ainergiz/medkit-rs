@@ -67,6 +67,7 @@ ALL_NIH_LABELS = (
 )
 SMAPS_HEADER_RE = re.compile(r"^[0-9a-fA-F]+-[0-9a-fA-F]+\s")
 H2D_TIMING_DIRECT_COPY = "direct_copy_completion_elapsed"
+H2D_TIMING_CUDA_PREFETCH_STREAM = "cuda_prefetch_stream_elapsed"
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,22 @@ class SampleRecord:
     width: int
     height: int
     labels: dict[str, int | None]
+    split: str = ""
+    sha256: str = ""
+
+
+@dataclass
+class DevicePrefetchBatch:
+    image: Any
+    labels: Any
+    mask: Any
+    samples: int
+    tensor_bytes: int
+    h2d_bytes: int
+    h2d_start: Any
+    h2d_end: Any
+    ready_event: Any
+    data_wait_seconds: float
     split: str = ""
     sha256: str = ""
 
@@ -126,6 +143,24 @@ def main() -> int:
     )
     parser.add_argument("--prefetch-depth", type=int, default=1)
     parser.add_argument("--prefetch-read-workers", type=int, default=1)
+    parser.add_argument(
+        "--shuffle-block-batches",
+        type=int,
+        default=0,
+        help=(
+            "For medkit native CXR loaders, shuffle blocks of this many batches "
+            "instead of individual samples. 0 keeps full random shuffle."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-prefetch-batches",
+        type=int,
+        default=0,
+        help=(
+            "Opt-in CUDA stream prefetch depth for training batches. 0 uses the "
+            "direct per-step H2D copy path."
+        ),
+    )
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
     parser.add_argument("--include-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
@@ -198,8 +233,18 @@ def main() -> int:
         "batch_size": args.batch_size,
         "drop_last_train": args.drop_last_train,
         "workers": args.workers,
+        "max_samples": args.max_samples,
+        "max_train": args.max_train,
+        "max_val": args.max_val,
+        "max_test": args.max_test,
+        "loader_batches": args.loader_batches,
+        "warmup_batches": args.warmup_batches,
+        "max_train_batches": args.max_train_batches,
+        "max_eval_batches": args.max_eval_batches,
         "prefetch_depth": args.prefetch_depth,
         "prefetch_read_workers": args.prefetch_read_workers,
+        "shuffle_block_batches": args.shuffle_block_batches,
+        "gpu_prefetch_batches": args.gpu_prefetch_batches,
         "profile_batches": args.profile_batches,
         "read_mode": args.read_mode,
         "include_metadata": args.include_metadata,
@@ -209,7 +254,13 @@ def main() -> int:
     }
 
     materialize_start = time.perf_counter()
-    if args.force_rematerialize or not manifest_path.exists():
+    records: list[SampleRecord] | None = None
+    if not args.force_rematerialize and manifest_path.exists():
+        records = load_manifest_if_compatible(
+            manifest_path,
+            requested_samples=args.max_samples,
+        )
+    if records is None:
         records, dataset_name = materialize_hf_subset(
             dataset_name=args.dataset,
             fallback_names=DATASET_FALLBACKS,
@@ -220,7 +271,6 @@ def main() -> int:
             targets=targets,
         )
     else:
-        records = load_manifest(manifest_path)
         dataset_name = args.dataset
     materialize_seconds = time.perf_counter() - materialize_start
     run_metadata["dataset_loaded"] = dataset_name
@@ -320,6 +370,15 @@ def main() -> int:
     memory = memory_summary(reports)
     write_json(report_dir / "memory-summary.json", memory)
     write_json(report_dir / "subgroup-report.json", subgroup_report(records, reports["quality"]))
+    provenance = build_run_provenance(
+        args=args,
+        run_id=run_id,
+        run_metadata=run_metadata,
+        manifest_summary=manifest_summary,
+        split_report=split_report,
+        cache_report=cache_report,
+        environment=env_report,
+    )
 
     summary = {
         "run_id": run_id,
@@ -349,8 +408,24 @@ def main() -> int:
             if report.get("status") == "ok"
         },
         "memory": memory,
+        "provenance": provenance,
     }
     write_json(report_dir / "run-summary.json", summary)
+    consistency = validate_run_summary_consistency(
+        summary=summary,
+        run_metadata=run_metadata,
+        manifest_summary=manifest_summary,
+        split_report=split_report,
+        cache_report=cache_report,
+        reports=reports,
+        environment=env_report,
+    )
+    write_json(report_dir / "summary-consistency.json", consistency)
+    if consistency["status"] != "ok":
+        raise RuntimeError(
+            "Run summary/provenance consistency failed: "
+            + "; ".join(consistency["errors"])
+        )
     if args.out:
         write_json(args.out, summary)
     print(json.dumps(summary, indent=2))
@@ -1046,6 +1121,7 @@ def run_all_baselines(
                 workers=args.workers,
                 prefetch_depth=args.prefetch_depth,
                 prefetch_read_workers=args.prefetch_read_workers,
+                shuffle_block_batches=args.shuffle_block_batches,
                 read_mode=args.read_mode,
                 include_metadata=args.include_metadata,
                 seed=args.seed,
@@ -1080,6 +1156,7 @@ def run_all_baselines(
                 drop_last_train=args.drop_last_train,
                 warmup_batches=args.warmup_batches,
                 profile_batches=args.profile_batches,
+                gpu_prefetch_batches=args.gpu_prefetch_batches,
                 seed=args.seed,
             )
             reports["gpu"][baseline] = train_report
@@ -1117,6 +1194,7 @@ def make_loader_factory(
     workers: int,
     prefetch_depth: int,
     prefetch_read_workers: int,
+    shuffle_block_batches: int,
     read_mode: str,
     include_metadata: bool,
     seed: int,
@@ -1246,6 +1324,7 @@ def make_loader_factory(
                 split=split,
                 read_mode=read_mode,
                 include_metadata=include_metadata,
+                shuffle_block_batches=shuffle_block_batches,
             )
             loader = medkit_rs.cxr.DataLoader(
                 dataset,
@@ -1258,6 +1337,7 @@ def make_loader_factory(
                 read_workers=prefetch_read_workers,
                 read_mode=read_mode,
                 include_metadata=include_metadata,
+                shuffle_block_batches=shuffle_block_batches,
             )
             return with_report_metadata(
                 loader,
@@ -1275,6 +1355,7 @@ def make_loader_factory(
                     "prefetch_read_workers": prefetch_read_workers,
                     "read_mode": read_mode,
                     "include_metadata": include_metadata,
+                    "shuffle_block_batches": shuffle_block_batches,
                     "shuffle": shuffle,
                     "native_prefetch": True,
                     "dropin_api": True,
@@ -1296,6 +1377,7 @@ def make_loader_factory(
                 seed=seed,
                 read_mode=read_mode,
                 include_metadata=include_metadata,
+                shuffle_block_batches=shuffle_block_batches,
             )
             loader = torch.utils.data.DataLoader(
                 dataset,
@@ -1316,6 +1398,7 @@ def make_loader_factory(
                     "pin_memory": pin_memory,
                     "read_mode": read_mode,
                     "include_metadata": include_metadata,
+                    "shuffle_block_batches": shuffle_block_batches,
                     "shuffle": shuffle,
                     "native_prefetch": False,
                 },
@@ -1360,6 +1443,7 @@ def make_loader_factory(
                     "prefetch_read_workers": prefetch_read_workers,
                     "read_mode": read_mode,
                     "include_metadata": include_metadata,
+                    "shuffle_block_batches": shuffle_block_batches,
                     "shuffle": shuffle,
                     "native_prefetch": True,
                     "native_prefetch_threads": 1,
@@ -1964,6 +2048,7 @@ def train_and_evaluate(
     drop_last_train: bool,
     warmup_batches: int,
     profile_batches: int,
+    gpu_prefetch_batches: int,
     seed: int,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     set_torch_seed(torch, seed)
@@ -1971,7 +2056,10 @@ def train_and_evaluate(
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4, weight_decay=1.0e-4)
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
     autocast_enabled = device.type == "cuda"
-    h2d_timing_mode = H2D_TIMING_DIRECT_COPY
+    gpu_prefetch_active = device.type == "cuda" and gpu_prefetch_batches > 0
+    h2d_timing_mode = (
+        H2D_TIMING_CUDA_PREFETCH_STREAM if gpu_prefetch_active else H2D_TIMING_DIRECT_COPY
+    )
     if warmup_batches > 0:
         run_warmup_steps(
             torch=torch,
@@ -2000,23 +2088,47 @@ def train_and_evaluate(
     model.train()
     for _epoch in range(epochs):
         iterator = iter(train_loader)
-        while True:
-            wait_start = time.perf_counter()
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                break
-            wait_seconds = time.perf_counter() - wait_start
-            data_wait_seconds += wait_seconds
-            batch_samples = batch_sample_count(batch)
-            if should_skip_incomplete_train_batch(
-                batch_samples=batch_samples,
+        prefetcher = (
+            CudaBatchPrefetcher(
+                torch=torch,
+                loader_iterator=iterator,
+                device=device,
                 batch_size=batch_size,
                 drop_last_train=drop_last_train,
-            ):
-                skipped_incomplete_batches += 1
-                skipped_incomplete_samples += batch_samples
-                continue
+                depth=gpu_prefetch_batches,
+            )
+            if gpu_prefetch_active
+            else None
+        )
+        while True:
+            prefetched: DevicePrefetchBatch | None = None
+            if prefetcher is not None:
+                prefetched = prefetcher.pop()
+                if prefetched is None:
+                    skipped_incomplete_batches += prefetcher.skipped_incomplete_batches
+                    skipped_incomplete_samples += prefetcher.skipped_incomplete_samples
+                    break
+                batch = None
+                batch_samples = prefetched.samples
+                wait_seconds = prefetched.data_wait_seconds
+                data_wait_seconds += wait_seconds
+            else:
+                wait_start = time.perf_counter()
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    break
+                wait_seconds = time.perf_counter() - wait_start
+                data_wait_seconds += wait_seconds
+                batch_samples = batch_sample_count(batch)
+                if should_skip_incomplete_train_batch(
+                    batch_samples=batch_samples,
+                    batch_size=batch_size,
+                    drop_last_train=drop_last_train,
+                ):
+                    skipped_incomplete_batches += 1
+                    skipped_incomplete_samples += batch_samples
+                    continue
             step_start = time.perf_counter()
             profile_this_batch = profile_batches > 0 and len(profile_records) < profile_batches
             cuda_profile = profile_this_batch and device.type == "cuda"
@@ -2025,23 +2137,32 @@ def train_and_evaluate(
             backward_start = backward_end = None
             optimizer_start = optimizer_end = None
 
-            max_batch_tensor_bytes = max(max_batch_tensor_bytes, batch_tensor_bytes(batch))
-            h2d_wall_start = time.perf_counter()
-            if cuda_profile:
-                h2d_start = torch.cuda.Event(enable_timing=True)
-                h2d_end = torch.cuda.Event(enable_timing=True)
-                h2d_start.record()
-            image = batch["image"].to(device, non_blocking=True).float()
-            labels = batch["labels"].to(device, non_blocking=True).float()
-            mask = batch["mask"].to(device, non_blocking=True).float()
-            if cuda_profile:
-                h2d_end.record()
-            h2d_wall_ms = (time.perf_counter() - h2d_wall_start) * 1000.0
-            h2d_bytes += (
-                batch["image"].numel() * 4
-                + batch["labels"].numel() * 4
-                + batch["mask"].numel() * 4
-            )
+            if prefetched is not None:
+                max_batch_tensor_bytes = max(max_batch_tensor_bytes, prefetched.tensor_bytes)
+                torch.cuda.current_stream(device).wait_event(prefetched.ready_event)
+                image = prefetched.image.float()
+                labels = prefetched.labels.float()
+                mask = prefetched.mask.float()
+                h2d_bytes += prefetched.h2d_bytes
+                h2d_wall_ms = 0.0
+            else:
+                max_batch_tensor_bytes = max(max_batch_tensor_bytes, batch_tensor_bytes(batch))
+                h2d_wall_start = time.perf_counter()
+                if cuda_profile:
+                    h2d_start = torch.cuda.Event(enable_timing=True)
+                    h2d_end = torch.cuda.Event(enable_timing=True)
+                    h2d_start.record()
+                image = batch["image"].to(device, non_blocking=True).float()
+                labels = batch["labels"].to(device, non_blocking=True).float()
+                mask = batch["mask"].to(device, non_blocking=True).float()
+                if cuda_profile:
+                    h2d_end.record()
+                h2d_wall_ms = (time.perf_counter() - h2d_wall_start) * 1000.0
+                h2d_bytes += (
+                    batch["image"].numel() * 4
+                    + batch["labels"].numel() * 4
+                    + batch["mask"].numel() * 4
+                )
             optimizer.zero_grad(set_to_none=True)
             forward_wall_start = time.perf_counter()
             if cuda_profile:
@@ -2078,6 +2199,8 @@ def train_and_evaluate(
             if cuda_profile:
                 optimizer_end.record()
             optimizer_wall_ms = (time.perf_counter() - optimizer_wall_start) * 1000.0
+            if prefetcher is not None:
+                prefetcher.fill()
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             step_elapsed = time.perf_counter() - step_start
@@ -2086,7 +2209,11 @@ def train_and_evaluate(
             samples += batch_samples
             if profile_this_batch:
                 if cuda_profile:
-                    h2d_ms = float(h2d_start.elapsed_time(h2d_end))
+                    h2d_ms = (
+                        float(prefetched.h2d_start.elapsed_time(prefetched.h2d_end))
+                        if prefetched is not None
+                        else float(h2d_start.elapsed_time(h2d_end))
+                    )
                     forward_ms = float(forward_start.elapsed_time(forward_end))
                     backward_ms = float(backward_start.elapsed_time(backward_end))
                     optimizer_ms = float(optimizer_start.elapsed_time(optimizer_end))
@@ -2110,6 +2237,9 @@ def train_and_evaluate(
                 )
             batches += 1
             if max_train_batches > 0 and batches >= max_train_batches:
+                if prefetcher is not None:
+                    skipped_incomplete_batches += prefetcher.skipped_incomplete_batches
+                    skipped_incomplete_samples += prefetcher.skipped_incomplete_samples
                 break
         if max_train_batches > 0 and batches >= max_train_batches:
             break
@@ -2136,6 +2266,8 @@ def train_and_evaluate(
         "epochs_requested": epochs,
         "train_batch_size": batch_size,
         "drop_last_train": drop_last_train,
+        "gpu_prefetch_batches": gpu_prefetch_batches,
+        "gpu_prefetch_batches_active": gpu_prefetch_active,
         "h2d_timing_mode": h2d_timing_mode,
         "skipped_incomplete_batches": skipped_incomplete_batches,
         "skipped_incomplete_samples": skipped_incomplete_samples,
@@ -2182,6 +2314,84 @@ def should_skip_incomplete_train_batch(
     drop_last_train: bool,
 ) -> bool:
     return drop_last_train and batch_size > 0 and batch_samples != batch_size
+
+
+class CudaBatchPrefetcher:
+    def __init__(
+        self,
+        *,
+        torch: Any,
+        loader_iterator: Any,
+        device: Any,
+        batch_size: int,
+        drop_last_train: bool,
+        depth: int,
+    ):
+        self.torch = torch
+        self.loader_iterator = loader_iterator
+        self.device = device
+        self.batch_size = batch_size
+        self.drop_last_train = drop_last_train
+        self.depth = max(1, depth)
+        self.copy_stream = torch.cuda.Stream(device=device)
+        self.queue: list[DevicePrefetchBatch] = []
+        self.exhausted = False
+        self.skipped_incomplete_batches = 0
+        self.skipped_incomplete_samples = 0
+        self.fill()
+
+    def fill(self) -> None:
+        while len(self.queue) < self.depth and not self.exhausted:
+            wait_start = time.perf_counter()
+            try:
+                cpu_batch = next(self.loader_iterator)
+            except StopIteration:
+                self.exhausted = True
+                break
+            wait_seconds = time.perf_counter() - wait_start
+            samples = batch_sample_count(cpu_batch)
+            if should_skip_incomplete_train_batch(
+                batch_samples=samples,
+                batch_size=self.batch_size,
+                drop_last_train=self.drop_last_train,
+            ):
+                self.skipped_incomplete_batches += 1
+                self.skipped_incomplete_samples += samples
+                continue
+
+            h2d_start = self.torch.cuda.Event(enable_timing=True)
+            h2d_end = self.torch.cuda.Event(enable_timing=True)
+            with self.torch.cuda.stream(self.copy_stream):
+                h2d_start.record()
+                image = cpu_batch["image"].to(self.device, non_blocking=True)
+                labels = cpu_batch["labels"].to(self.device, non_blocking=True)
+                mask = cpu_batch["mask"].to(self.device, non_blocking=True)
+                h2d_end.record()
+            self.queue.append(
+                DevicePrefetchBatch(
+                    image=image,
+                    labels=labels,
+                    mask=mask,
+                    samples=samples,
+                    tensor_bytes=batch_tensor_bytes(cpu_batch),
+                    h2d_bytes=(
+                        cpu_batch["image"].numel() * 4
+                        + cpu_batch["labels"].numel() * 4
+                        + cpu_batch["mask"].numel() * 4
+                    ),
+                    h2d_start=h2d_start,
+                    h2d_end=h2d_end,
+                    ready_event=h2d_end,
+                    data_wait_seconds=wait_seconds,
+                )
+            )
+
+    def pop(self) -> DevicePrefetchBatch | None:
+        if not self.queue:
+            self.fill()
+        if not self.queue:
+            return None
+        return self.queue.pop(0)
 
 
 def profile_report_for_baseline(
@@ -2496,6 +2706,311 @@ def subgroup_report(records: Sequence[SampleRecord], quality: dict[str, Any]) ->
     }
 
 
+def build_run_provenance(
+    *,
+    args: argparse.Namespace,
+    run_id: str,
+    run_metadata: dict[str, Any],
+    manifest_summary: dict[str, Any],
+    split_report: dict[str, Any],
+    cache_report: dict[str, Any],
+    environment: dict[str, Any],
+    argv: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "provenance_schema_version": 1,
+        "run_id": run_id,
+        "command": [str(part) for part in (argv if argv is not None else sys.argv)],
+        "script": str(Path(__file__).resolve()),
+        "cwd": os.getcwd(),
+        "git_commit": environment.get("git_commit"),
+        "git_status_short": environment.get("git_status_short"),
+        "modal_gpu": os.environ.get("MEDKIT_MODAL_GPU"),
+        "benchmark_uses_local_source": os.environ.get("MEDKIT_BENCHMARK_USE_LOCAL_SOURCE"),
+        "dataset_requested": run_metadata.get("dataset_requested"),
+        "dataset_loaded": run_metadata.get("dataset_loaded"),
+        "samples": manifest_summary.get("samples"),
+        "splits": split_report.get("counts", {}),
+        "targets": list(run_metadata.get("targets", [])),
+        "baselines": list(run_metadata.get("baselines", [])),
+        "image_size": run_metadata.get("image_size"),
+        "cache_image_size": run_metadata.get("cache_image_size"),
+        "cache_dtype": run_metadata.get("cache_dtype"),
+        "batch_size": run_metadata.get("batch_size"),
+        "drop_last_train": run_metadata.get("drop_last_train"),
+        "workers": run_metadata.get("workers"),
+        "prefetch_depth": run_metadata.get("prefetch_depth"),
+        "prefetch_read_workers": run_metadata.get("prefetch_read_workers"),
+        "shuffle_block_batches": run_metadata.get("shuffle_block_batches"),
+        "gpu_prefetch_batches": run_metadata.get("gpu_prefetch_batches"),
+        "read_mode": run_metadata.get("read_mode"),
+        "include_metadata": run_metadata.get("include_metadata"),
+        "profile_batches": run_metadata.get("profile_batches"),
+        "loader_batches": run_metadata.get("loader_batches"),
+        "warmup_batches": run_metadata.get("warmup_batches"),
+        "max_train_batches": run_metadata.get("max_train_batches"),
+        "max_eval_batches": run_metadata.get("max_eval_batches"),
+        "seed": run_metadata.get("seed"),
+        "cache": {
+            "cache_dir": cache_report.get("cache_dir"),
+            "cache_reused": cache_report.get("cache_reused"),
+            "dtype": cache_report.get("dtype"),
+            "image_size": cache_report.get("image_size"),
+            "transform_fingerprint": cache_report.get("transform_fingerprint"),
+            "source_manifest_checksum": cache_report.get("source_manifest_checksum"),
+            "split_samples": {
+                split: details.get("samples")
+                for split, details in (cache_report.get("splits") or {}).items()
+                if isinstance(details, dict)
+            },
+        },
+        "artifacts": {
+            "run_summary": "run-summary.json",
+            "summary_consistency": "summary-consistency.json",
+            "step_profile": "step-profile.json",
+            "environment": "environment.json",
+        },
+    }
+
+
+def validate_run_summary_consistency(
+    *,
+    summary: dict[str, Any],
+    run_metadata: dict[str, Any],
+    manifest_summary: dict[str, Any],
+    split_report: dict[str, Any],
+    cache_report: dict[str, Any],
+    reports: dict[str, dict[str, dict[str, Any]]],
+    environment: dict[str, Any],
+) -> dict[str, Any]:
+    errors = run_summary_consistency_errors(
+        summary=summary,
+        run_metadata=run_metadata,
+        manifest_summary=manifest_summary,
+        split_report=split_report,
+        cache_report=cache_report,
+        reports=reports,
+        environment=environment,
+    )
+    return {
+        "status": "ok" if not errors else "failed",
+        "run_id": summary.get("run_id"),
+        "errors": errors,
+        "checks": {
+            "summary_matches_provenance": not errors,
+            "profile_requested": int(run_metadata.get("profile_batches") or 0),
+            "baselines": list(run_metadata.get("baselines", [])),
+        },
+    }
+
+
+def run_summary_consistency_errors(
+    *,
+    summary: dict[str, Any],
+    run_metadata: dict[str, Any],
+    manifest_summary: dict[str, Any],
+    split_report: dict[str, Any],
+    cache_report: dict[str, Any],
+    reports: dict[str, dict[str, dict[str, Any]]],
+    environment: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    provenance = summary.get("provenance")
+    if not isinstance(provenance, dict):
+        errors.append("run-summary provenance missing")
+        provenance = {}
+
+    expect_equal(errors, "summary.run_id", summary.get("run_id"), run_metadata.get("run_id"))
+    expect_equal(errors, "provenance.run_id", provenance.get("run_id"), run_metadata.get("run_id"))
+    expect_equal(
+        errors,
+        "summary.dataset_loaded",
+        summary.get("dataset_loaded"),
+        run_metadata.get("dataset_loaded"),
+    )
+    expect_equal(
+        errors,
+        "manifest.dataset_loaded",
+        manifest_summary.get("dataset_loaded"),
+        run_metadata.get("dataset_loaded"),
+    )
+    expect_equal(errors, "summary.samples", summary.get("samples"), manifest_summary.get("samples"))
+    expect_equal(errors, "provenance.samples", provenance.get("samples"), manifest_summary.get("samples"))
+    expect_equal(errors, "summary.targets", summary.get("targets"), list(run_metadata.get("targets", [])))
+    expect_equal(errors, "provenance.targets", provenance.get("targets"), list(run_metadata.get("targets", [])))
+    expect_equal(
+        errors,
+        "provenance.baselines",
+        provenance.get("baselines"),
+        list(run_metadata.get("baselines", [])),
+    )
+
+    split_counts = split_report.get("counts") or {}
+    if isinstance(split_counts, dict):
+        expect_equal(
+            errors,
+            "manifest split sample total",
+            sum_numeric_values(split_counts),
+            manifest_summary.get("samples"),
+        )
+        expect_equal(errors, "provenance.splits", provenance.get("splits"), split_counts)
+    else:
+        errors.append("split_report.counts missing")
+
+    cache_splits = cache_report.get("splits") or {}
+    if isinstance(cache_splits, dict):
+        cache_split_samples = {
+            split: details.get("samples")
+            for split, details in cache_splits.items()
+            if isinstance(details, dict)
+        }
+        expect_equal(errors, "cache split samples", cache_split_samples, split_counts)
+        expect_equal(
+            errors,
+            "provenance.cache.split_samples",
+            (provenance.get("cache") or {}).get("split_samples"),
+            cache_split_samples,
+        )
+    else:
+        errors.append("cache_report.splits missing")
+
+    for field in (
+        "image_size",
+        "cache_image_size",
+        "cache_dtype",
+        "batch_size",
+        "drop_last_train",
+        "workers",
+        "prefetch_depth",
+        "prefetch_read_workers",
+        "shuffle_block_batches",
+        "gpu_prefetch_batches",
+        "read_mode",
+        "include_metadata",
+        "profile_batches",
+        "loader_batches",
+        "warmup_batches",
+        "max_train_batches",
+        "max_eval_batches",
+        "seed",
+    ):
+        expect_equal(errors, f"provenance.{field}", provenance.get(field), run_metadata.get(field))
+
+    cache_provenance = provenance.get("cache") or {}
+    expect_equal(errors, "cache.dtype", cache_report.get("dtype"), run_metadata.get("cache_dtype"))
+    expect_equal(errors, "cache.image_size", cache_report.get("image_size"), run_metadata.get("cache_image_size"))
+    expect_equal(
+        errors,
+        "provenance.cache.transform_fingerprint",
+        cache_provenance.get("transform_fingerprint"),
+        cache_report.get("transform_fingerprint"),
+    )
+    expect_equal(
+        errors,
+        "provenance.cache.source_manifest_checksum",
+        cache_provenance.get("source_manifest_checksum"),
+        cache_report.get("source_manifest_checksum"),
+    )
+
+    env_metadata = environment.get("run_metadata")
+    if isinstance(env_metadata, dict):
+        expect_equal(errors, "environment.run_metadata", env_metadata, run_metadata)
+    else:
+        errors.append("environment.run_metadata missing")
+
+    expected_loader = rounded_samples_per_second(reports.get("loader", {}), digits=3)
+    expected_gpu = rounded_samples_per_second(reports.get("gpu", {}), digits=3)
+    expected_quality = rounded_quality_metric(reports.get("quality", {}), "macro_auroc", digits=5)
+    expect_equal(
+        errors,
+        "summary.loader_samples_per_second",
+        summary.get("loader_samples_per_second"),
+        expected_loader,
+    )
+    expect_equal(
+        errors,
+        "summary.train_samples_per_second",
+        summary.get("train_samples_per_second"),
+        expected_gpu,
+    )
+    expect_equal(
+        errors,
+        "summary.quality_macro_auroc",
+        summary.get("quality_macro_auroc"),
+        expected_quality,
+    )
+    expect_equal(errors, "summary.memory", summary.get("memory"), memory_summary(reports))
+
+    requested_profile_batches = int(run_metadata.get("profile_batches") or 0)
+    expected_profile = {
+        name: report.get("summary")
+        for name, report in (reports.get("profile") or {}).items()
+        if report.get("status") == "ok"
+    }
+    expect_equal(errors, "summary.profile", summary.get("profile"), expected_profile)
+    if requested_profile_batches > 0:
+        for baseline in run_metadata.get("baselines", []):
+            gpu_report = (reports.get("gpu") or {}).get(baseline, {})
+            profile_report = (reports.get("profile") or {}).get(baseline, {})
+            if gpu_report.get("status") != "ok":
+                continue
+            if profile_report.get("status") != "ok":
+                errors.append(f"profile report for {baseline!r} is not ok")
+                continue
+            records = profile_report.get("records")
+            profile_summary = profile_report.get("summary")
+            if not isinstance(records, list):
+                errors.append(f"profile report for {baseline!r} records missing")
+                continue
+            if not isinstance(profile_summary, dict):
+                errors.append(f"profile report for {baseline!r} summary missing")
+                continue
+            if profile_summary.get("profile_artifact_path") != "step-profile.json":
+                errors.append(f"profile report for {baseline!r} missing step-profile artifact path")
+            expect_equal(
+                errors,
+                f"profile profiled_batches for {baseline}",
+                profile_summary.get("profiled_batches"),
+                len(records),
+            )
+
+    return errors
+
+
+def expect_equal(errors: list[str], label: str, left: Any, right: Any) -> None:
+    if left != right:
+        errors.append(f"{label} mismatch: {left!r} != {right!r}")
+
+
+def sum_numeric_values(values: dict[str, Any]) -> int:
+    return sum(int(value) for value in values.values())
+
+
+def rounded_samples_per_second(
+    section: dict[str, dict[str, Any]],
+    *,
+    digits: int,
+) -> dict[str, float]:
+    return {
+        name: round(report["samples_per_second"], digits)
+        for name, report in section.items()
+        if "samples_per_second" in report
+    }
+
+
+def rounded_quality_metric(
+    section: dict[str, dict[str, Any]],
+    metric: str,
+    *,
+    digits: int,
+) -> dict[str, float]:
+    return {
+        name: round(report.get(metric, float("nan")), digits)
+        for name, report in section.items()
+        if report.get("status") == "ok"
+    }
+
+
 def environment_report(run_metadata: dict[str, Any]) -> dict[str, Any]:
     report = {
         "python": sys.version,
@@ -2599,6 +3114,17 @@ def load_manifest(path: Path) -> list[SampleRecord]:
         records.append(
             SampleRecord(**{key: value for key, value in row.items() if key in allowed_fields})
         )
+    return records
+
+
+def load_manifest_if_compatible(
+    path: Path,
+    *,
+    requested_samples: int,
+) -> list[SampleRecord] | None:
+    records = load_manifest(path)
+    if requested_samples > 0 and len(records) != requested_samples:
+        return None
     return records
 
 
