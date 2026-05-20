@@ -1298,6 +1298,26 @@ def with_report_metadata(loader: Any, metadata: dict[str, Any]) -> Any:
     return loader
 
 
+def metadata_from_dataset_report(dataset: Any, fallback: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(fallback)
+    report_metadata = getattr(dataset, "report_metadata", None)
+    if callable(report_metadata):
+        report = report_metadata()
+        if isinstance(report, dict):
+            metadata.update(report)
+    for key in (
+        "baseline",
+        "cache_dtype",
+        "dataset_api",
+        "loader_api",
+        "dropin_api",
+        "native_prefetch_threads",
+    ):
+        if key in fallback:
+            metadata[key] = fallback[key]
+    return metadata
+
+
 def make_loader_factory(
     *,
     baseline: str,
@@ -1502,8 +1522,8 @@ def make_loader_factory(
                 pin_memory=False,
                 persistent_workers=False,
             )
-            return with_report_metadata(
-                loader,
+            metadata = metadata_from_dataset_report(
+                dataset,
                 {
                     "baseline": baseline,
                     "cache_dir": str(cache_dir),
@@ -1519,6 +1539,7 @@ def make_loader_factory(
                     "native_prefetch": False,
                 },
             )
+            return with_report_metadata(loader, metadata)
 
         return make_native_loader
     if baseline in {"medkit_native_prefetch", "medkit_native_prefetch_pinned"}:
@@ -1546,8 +1567,8 @@ def make_loader_factory(
                 pin_memory=False,
                 persistent_workers=False,
             )
-            return with_report_metadata(
-                loader,
+            metadata = metadata_from_dataset_report(
+                dataset,
                 {
                     "baseline": baseline,
                     "cache_dir": str(cache_dir),
@@ -1566,6 +1587,7 @@ def make_loader_factory(
                     "native_prefetch_threads": 1,
                 },
             )
+            return with_report_metadata(loader, metadata)
 
         return make_native_prefetch_loader
     if baseline == "webdataset":

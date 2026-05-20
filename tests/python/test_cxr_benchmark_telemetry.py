@@ -584,7 +584,18 @@ def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_pa
     class FakeDataset:
         def __init__(self, **kwargs):
             captured.update(kwargs)
+            self.kwargs = kwargs
             self.shuffle_block_batches = kwargs["shuffle_block_batches"]
+
+        def report_metadata(self):
+            return {
+                "worker_mode": "fake_actual_dataset_report",
+                "read_mode": self.kwargs["read_mode"],
+                "include_metadata": self.kwargs["include_metadata"],
+                "shuffle_block_batches": self.kwargs["shuffle_block_batches"],
+                "prefetch_depth": self.kwargs["prefetch_depth"],
+                "prefetch_read_workers": self.kwargs["read_workers"],
+            }
 
     fake_torch = types.SimpleNamespace(
         utils=types.SimpleNamespace(
@@ -627,6 +638,32 @@ def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_pa
     assert captured["read_workers"] == 4
     assert captured["include_metadata"] is True
     assert loader.report_metadata()["shuffle_block_batches"] == 8
+    assert loader.report_metadata()["worker_mode"] == "fake_actual_dataset_report"
+    assert loader.report_metadata()["prefetch_read_workers"] == 4
+
+
+def test_matrix_pipeline_validation_rejects_policy_drift():
+    matrix = load_matrix_module()
+    errors: list[str] = []
+
+    matrix.validate_pipeline_request_metadata(
+        errors=errors,
+        context="gpu",
+        pipeline={
+            "native_prefetch": True,
+            "shuffle_block_batches": 0,
+            "prefetch_depth": 1,
+            "prefetch_read_workers": 4,
+        },
+        metadata={
+            "shuffle_block_batches": 8,
+            "prefetch_depth": 2,
+            "prefetch_read_workers": 4,
+        },
+    )
+
+    assert any("shuffle_block_batches 0 != expected 8" in error for error in errors)
+    assert any("prefetch_depth 1 != expected 2" in error for error in errors)
 
 
 def test_matrix_row_validation_requires_summary_consistency_and_provenance():

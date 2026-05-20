@@ -992,6 +992,12 @@ def validate_row_artifacts(
             )
         if active.row.baseline.startswith("medkit") and pipeline.get("include_metadata") is not False:
             errors.append(f"{phase} pipeline include_metadata is not false")
+        validate_pipeline_request_metadata(
+            errors=errors,
+            context=phase,
+            pipeline=pipeline,
+            metadata=metadata,
+        )
         validate_cache_pss_semantics(
             errors=errors,
             context=phase,
@@ -1001,6 +1007,34 @@ def validate_row_artifacts(
         )
 
     return errors
+
+
+def validate_pipeline_request_metadata(
+    *,
+    errors: list[str],
+    context: str,
+    pipeline: dict[str, Any],
+    metadata: dict[str, Any],
+) -> None:
+    if not metadata or not pipeline:
+        return
+    expected_shuffle_blocks = metadata.get("shuffle_block_batches")
+    if (
+        expected_shuffle_blocks is not None
+        and pipeline.get("shuffle_block_batches") != expected_shuffle_blocks
+    ):
+        errors.append(
+            f"{context} pipeline shuffle_block_batches "
+            f"{pipeline.get('shuffle_block_batches')!r} != expected {expected_shuffle_blocks!r}"
+        )
+    if pipeline.get("native_prefetch"):
+        for field in ("prefetch_depth", "prefetch_read_workers"):
+            expected = metadata.get(field)
+            if expected is not None and pipeline.get(field) != expected:
+                errors.append(
+                    f"{context} pipeline {field} {pipeline.get(field)!r} "
+                    f"!= expected {expected!r}"
+                )
 
 
 def validate_memory_telemetry(
