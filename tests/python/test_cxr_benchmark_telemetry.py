@@ -350,6 +350,7 @@ def test_run_summary_consistency_accepts_matching_provenance_and_rejects_drift()
         "prefetch_read_workers": 4,
         "shuffle_block_batches": 0,
         "gpu_prefetch_batches": 0,
+        "gpu_prefetch_reuse_buffers": False,
         "sync_every_step": True,
         "loss_pos_weight": "none",
         "quality_gate": False,
@@ -494,6 +495,7 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
     assert h100_args.profile_batches == 128
     assert h100_args.shuffle_block_batches == 0
     assert h100_args.gpu_prefetch_batches == 0
+    assert h100_args.gpu_prefetch_reuse_buffers is False
     assert h100_args.sync_every_step is True
     assert h100_args.repeats == 3
     assert h100_args.fail_fast is True
@@ -519,6 +521,7 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
         assert command[0] == "MEDKIT_MODAL_GPU=H100"
         assert "--shuffle-block-batches" in command
         assert "--gpu-prefetch-batches" in command
+        assert "--no-gpu-prefetch-reuse-buffers" in command
         assert "--sync-every-step" in command
 
     l4_args = matrix.parse_args(
@@ -531,6 +534,7 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
             "8",
             "--gpu-prefetch-batches",
             "2",
+            "--gpu-prefetch-reuse-buffers",
             "--repeats",
             "1",
         ]
@@ -543,6 +547,7 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
     assert l4_args.profile_batches == 64
     assert l4_args.shuffle_block_batches == 8
     assert l4_args.gpu_prefetch_batches == 2
+    assert l4_args.gpu_prefetch_reuse_buffers is True
     assert l4_args.sync_every_step is True
     assert l4_args.repeats == 1
     assert [matrix.run_id_for("repeat-l4", row) for row in l4_rows] == [
@@ -589,6 +594,9 @@ def test_modal_cxr_wrapper_exposes_sync_policy():
     assert "sync_every_step: bool = True" in text
     assert '"--sync-every-step" if sync_every_step else "--no-sync-every-step"' in text
     assert "sync_every_step=sync_every_step" in text
+    assert "gpu_prefetch_reuse_buffers: bool = False" in text
+    assert "--gpu-prefetch-reuse-buffers" in text
+    assert "gpu_prefetch_reuse_buffers=gpu_prefetch_reuse_buffers" in text
 
 
 def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_path):
@@ -734,6 +742,7 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
             "prefetch_read_workers": 4,
             "shuffle_block_batches": 0,
             "gpu_prefetch_batches": 0,
+            "gpu_prefetch_reuse_buffers": False,
             "sync_every_step": True,
             "loss_pos_weight": "none",
             "quality_gate": False,
@@ -764,6 +773,7 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
             "prefetch_read_workers": 4,
             "shuffle_block_batches": 0,
             "gpu_prefetch_batches": 0,
+            "gpu_prefetch_reuse_buffers": False,
             "sync_every_step": True,
             "loss_pos_weight": "none",
             "quality_gate": False,

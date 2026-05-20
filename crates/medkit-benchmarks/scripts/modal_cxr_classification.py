@@ -120,6 +120,7 @@ def run_cxr_benchmark(
     read_mode: str = "mmap",
     shuffle_block_batches: int = 0,
     gpu_prefetch_batches: int = 0,
+    gpu_prefetch_reuse_buffers: bool = False,
     sync_every_step: bool = True,
     loss_pos_weight: str = "none",
     quality_gate: bool = False,
@@ -183,6 +184,9 @@ def run_cxr_benchmark(
         str(shuffle_block_batches),
         "--gpu-prefetch-batches",
         str(gpu_prefetch_batches),
+        "--gpu-prefetch-reuse-buffers"
+        if gpu_prefetch_reuse_buffers
+        else "--no-gpu-prefetch-reuse-buffers",
         "--sync-every-step" if sync_every_step else "--no-sync-every-step",
         "--loss-pos-weight",
         loss_pos_weight,
@@ -270,6 +274,7 @@ def main(
     read_mode: str = "mmap",
     shuffle_block_batches: int = 0,
     gpu_prefetch_batches: int = 0,
+    gpu_prefetch_reuse_buffers: bool = False,
     sync_every_step: bool = True,
     loss_pos_weight: str = "none",
     quality_gate: bool = False,
@@ -310,6 +315,7 @@ def main(
         read_mode=read_mode,
         shuffle_block_batches=shuffle_block_batches,
         gpu_prefetch_batches=gpu_prefetch_batches,
+        gpu_prefetch_reuse_buffers=gpu_prefetch_reuse_buffers,
         sync_every_step=sync_every_step,
         loss_pos_weight=loss_pos_weight,
         quality_gate=quality_gate,

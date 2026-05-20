@@ -98,6 +98,7 @@ class DevicePrefetchBatch:
     h2d_end: Any
     ready_event: Any
     data_wait_seconds: float
+    slot_index: int | None = None
     split: str = ""
     sha256: str = ""
 
@@ -159,6 +160,15 @@ def main() -> int:
         help=(
             "Opt-in CUDA stream prefetch depth for training batches. 0 uses the "
             "direct per-step H2D copy path."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-prefetch-reuse-buffers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Experimental: copy CUDA-prefetched batches into a fixed ring of GPU "
+            "buffers instead of allocating new device tensors each batch."
         ),
     )
     parser.add_argument(
@@ -277,6 +287,7 @@ def main() -> int:
         "prefetch_read_workers": args.prefetch_read_workers,
         "shuffle_block_batches": args.shuffle_block_batches,
         "gpu_prefetch_batches": args.gpu_prefetch_batches,
+        "gpu_prefetch_reuse_buffers": args.gpu_prefetch_reuse_buffers,
         "sync_every_step": args.sync_every_step,
         "profile_batches": args.profile_batches,
         "read_mode": args.read_mode,
@@ -1282,6 +1293,7 @@ def run_all_baselines(
                 warmup_batches=args.warmup_batches,
                 profile_batches=args.profile_batches,
                 gpu_prefetch_batches=args.gpu_prefetch_batches,
+                gpu_prefetch_reuse_buffers=args.gpu_prefetch_reuse_buffers,
                 sync_every_step=args.sync_every_step,
                 loss_pos_weight_values=loss_pos_weight_values,
                 loss_pos_weight_mode=args.loss_pos_weight,
@@ -2200,6 +2212,7 @@ def train_and_evaluate(
     warmup_batches: int,
     profile_batches: int,
     gpu_prefetch_batches: int,
+    gpu_prefetch_reuse_buffers: bool,
     sync_every_step: bool,
     loss_pos_weight_values: Sequence[float] | None,
     loss_pos_weight_mode: str,
@@ -2216,6 +2229,7 @@ def train_and_evaluate(
         else None
     )
     gpu_prefetch_active = device.type == "cuda" and gpu_prefetch_batches > 0
+    gpu_prefetch_reuse_buffers_active = gpu_prefetch_active and gpu_prefetch_reuse_buffers
     h2d_timing_mode = (
         H2D_TIMING_CUDA_PREFETCH_STREAM if gpu_prefetch_active else H2D_TIMING_DIRECT_COPY
     )
@@ -2246,6 +2260,9 @@ def train_and_evaluate(
     batches = 0
     skipped_incomplete_batches = 0
     skipped_incomplete_samples = 0
+    gpu_prefetch_buffer_allocations = 0
+    gpu_prefetch_buffer_copies = 0
+    gpu_prefetch_buffer_shape_misses = 0
     train_start = time.perf_counter()
     model.train()
     for _epoch in range(epochs):
@@ -2258,6 +2275,7 @@ def train_and_evaluate(
                 batch_size=batch_size,
                 drop_last_train=drop_last_train,
                 depth=gpu_prefetch_batches,
+                reuse_buffers=gpu_prefetch_reuse_buffers,
             )
             if gpu_prefetch_active
             else None
@@ -2363,6 +2381,7 @@ def train_and_evaluate(
                 optimizer_end.record()
             optimizer_wall_ms = (time.perf_counter() - optimizer_wall_start) * 1000.0
             if prefetcher is not None:
+                prefetcher.release(prefetched)
                 prefetcher.fill()
             if device.type == "cuda" and sync_every_step_effective:
                 torch.cuda.synchronize(device)
@@ -2408,6 +2427,11 @@ def train_and_evaluate(
                     skipped_incomplete_batches += prefetcher.skipped_incomplete_batches
                     skipped_incomplete_samples += prefetcher.skipped_incomplete_samples
                 break
+        if prefetcher is not None:
+            stats = prefetcher.stats()
+            gpu_prefetch_buffer_allocations += stats["buffer_allocations"]
+            gpu_prefetch_buffer_copies += stats["buffer_copies"]
+            gpu_prefetch_buffer_shape_misses += stats["buffer_shape_misses"]
         if max_train_batches > 0 and batches >= max_train_batches:
             break
     if device.type == "cuda" and not sync_every_step_effective:
@@ -2438,6 +2462,11 @@ def train_and_evaluate(
         "drop_last_train": drop_last_train,
         "gpu_prefetch_batches": gpu_prefetch_batches,
         "gpu_prefetch_batches_active": gpu_prefetch_active,
+        "gpu_prefetch_reuse_buffers": gpu_prefetch_reuse_buffers,
+        "gpu_prefetch_reuse_buffers_active": gpu_prefetch_reuse_buffers_active,
+        "gpu_prefetch_buffer_allocations": gpu_prefetch_buffer_allocations,
+        "gpu_prefetch_buffer_copies": gpu_prefetch_buffer_copies,
+        "gpu_prefetch_buffer_shape_misses": gpu_prefetch_buffer_shape_misses,
         "sync_every_step": sync_every_step,
         "sync_every_step_effective": sync_every_step_effective,
         "loss_pos_weight": loss_pos_weight_mode,
@@ -2523,6 +2552,7 @@ class CudaBatchPrefetcher:
         batch_size: int,
         drop_last_train: bool,
         depth: int,
+        reuse_buffers: bool = False,
     ):
         self.torch = torch
         self.loader_iterator = loader_iterator
@@ -2530,8 +2560,15 @@ class CudaBatchPrefetcher:
         self.batch_size = batch_size
         self.drop_last_train = drop_last_train
         self.depth = max(1, depth)
+        self.reuse_buffers = reuse_buffers
         self.copy_stream = torch.cuda.Stream(device=device)
         self.queue: list[DevicePrefetchBatch] = []
+        self.buffer_slots: list[dict[str, Any] | None] = [None] * self.depth
+        self.free_slots = list(range(self.depth)) if self.reuse_buffers else []
+        self.release_events: list[Any | None] = [None] * self.depth
+        self.buffer_allocations = 0
+        self.buffer_copies = 0
+        self.buffer_shape_misses = 0
         self.exhausted = False
         self.skipped_incomplete_batches = 0
         self.skipped_incomplete_samples = 0
@@ -2539,6 +2576,8 @@ class CudaBatchPrefetcher:
 
     def fill(self) -> None:
         while len(self.queue) < self.depth and not self.exhausted:
+            if self.reuse_buffers and not self.free_slots:
+                break
             wait_start = time.perf_counter()
             try:
                 cpu_batch = next(self.loader_iterator)
@@ -2556,13 +2595,22 @@ class CudaBatchPrefetcher:
                 self.skipped_incomplete_samples += samples
                 continue
 
+            slot_index = self.free_slots.pop(0) if self.reuse_buffers else None
             h2d_start = self.torch.cuda.Event(enable_timing=True)
             h2d_end = self.torch.cuda.Event(enable_timing=True)
             with self.torch.cuda.stream(self.copy_stream):
+                if slot_index is not None and self.release_events[slot_index] is not None:
+                    self.copy_stream.wait_event(self.release_events[slot_index])
+                    self.release_events[slot_index] = None
                 h2d_start.record()
-                image = cpu_batch["image"].to(self.device, non_blocking=True)
-                labels = cpu_batch["labels"].to(self.device, non_blocking=True)
-                mask = cpu_batch["mask"].to(self.device, non_blocking=True)
+                if slot_index is None:
+                    image = cpu_batch["image"].to(self.device, non_blocking=True)
+                    labels = cpu_batch["labels"].to(self.device, non_blocking=True)
+                    mask = cpu_batch["mask"].to(self.device, non_blocking=True)
+                else:
+                    image = self._copy_to_slot(slot_index, "image", cpu_batch["image"])
+                    labels = self._copy_to_slot(slot_index, "labels", cpu_batch["labels"])
+                    mask = self._copy_to_slot(slot_index, "mask", cpu_batch["mask"])
                 h2d_end.record()
             self.queue.append(
                 DevicePrefetchBatch(
@@ -2580,6 +2628,7 @@ class CudaBatchPrefetcher:
                     h2d_end=h2d_end,
                     ready_event=h2d_end,
                     data_wait_seconds=wait_seconds,
+                    slot_index=slot_index,
                 )
             )
 
@@ -2589,6 +2638,43 @@ class CudaBatchPrefetcher:
         if not self.queue:
             return None
         return self.queue.pop(0)
+
+    def release(self, batch: DevicePrefetchBatch | None) -> None:
+        if batch is None or batch.slot_index is None:
+            return
+        release_event = self.torch.cuda.Event(enable_timing=False)
+        release_event.record(self.torch.cuda.current_stream(self.device))
+        self.release_events[batch.slot_index] = release_event
+        self.free_slots.append(batch.slot_index)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "buffer_allocations": self.buffer_allocations,
+            "buffer_copies": self.buffer_copies,
+            "buffer_shape_misses": self.buffer_shape_misses,
+        }
+
+    def _copy_to_slot(self, slot_index: int, key: str, source: Any) -> Any:
+        slot = self.buffer_slots[slot_index]
+        if slot is None:
+            slot = {}
+            self.buffer_slots[slot_index] = slot
+        target = slot.get(key)
+        if target is None:
+            target = self.torch.empty_like(source, device=self.device)
+            slot[key] = target
+            self.buffer_allocations += 1
+        elif (
+            tuple(target.shape) != tuple(source.shape)
+            or target.dtype != source.dtype
+        ):
+            target = self.torch.empty_like(source, device=self.device)
+            slot[key] = target
+            self.buffer_allocations += 1
+            self.buffer_shape_misses += 1
+        target.copy_(source, non_blocking=True)
+        self.buffer_copies += 1
+        return target
 
 
 def profile_report_for_baseline(
@@ -3038,6 +3124,7 @@ def build_run_provenance(
         "prefetch_read_workers": run_metadata.get("prefetch_read_workers"),
         "shuffle_block_batches": run_metadata.get("shuffle_block_batches"),
         "gpu_prefetch_batches": run_metadata.get("gpu_prefetch_batches"),
+        "gpu_prefetch_reuse_buffers": run_metadata.get("gpu_prefetch_reuse_buffers"),
         "sync_every_step": run_metadata.get("sync_every_step"),
         "loss_pos_weight": run_metadata.get("loss_pos_weight"),
         "read_mode": run_metadata.get("read_mode"),
@@ -3187,6 +3274,7 @@ def run_summary_consistency_errors(
         "prefetch_read_workers",
         "shuffle_block_batches",
         "gpu_prefetch_batches",
+        "gpu_prefetch_reuse_buffers",
         "sync_every_step",
         "loss_pos_weight",
         "read_mode",
