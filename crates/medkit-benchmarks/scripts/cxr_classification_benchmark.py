@@ -66,6 +66,7 @@ ALL_NIH_LABELS = (
     "No Finding",
 )
 SMAPS_HEADER_RE = re.compile(r"^[0-9a-fA-F]+-[0-9a-fA-F]+\s")
+H2D_TIMING_DIRECT_COPY = "direct_copy_completion_elapsed"
 
 
 @dataclass(frozen=True)
@@ -109,8 +110,20 @@ def main() -> int:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-eval-batches", type=int, default=0)
+    parser.add_argument(
+        "--drop-last-train",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip incomplete training batches so every model step uses the requested batch size.",
+    )
     parser.add_argument("--loader-batches", type=int, default=64)
     parser.add_argument("--warmup-batches", type=int, default=2)
+    parser.add_argument(
+        "--profile-batches",
+        type=int,
+        default=0,
+        help="Record per-step timing for this many post-warmup training batches.",
+    )
     parser.add_argument("--prefetch-depth", type=int, default=1)
     parser.add_argument("--prefetch-read-workers", type=int, default=1)
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
@@ -183,9 +196,11 @@ def main() -> int:
         "cache_image_size": cache_size,
         "cache_dtype": args.cache_dtype,
         "batch_size": args.batch_size,
+        "drop_last_train": args.drop_last_train,
         "workers": args.workers,
         "prefetch_depth": args.prefetch_depth,
         "prefetch_read_workers": args.prefetch_read_workers,
+        "profile_batches": args.profile_batches,
         "read_mode": args.read_mode,
         "include_metadata": args.include_metadata,
         "epochs": args.epochs,
@@ -298,6 +313,8 @@ def main() -> int:
 
     write_json(report_dir / "loader-throughput.json", reports["loader"])
     write_json(report_dir / "gpu-throughput.json", reports["gpu"])
+    if any(report.get("status") != "disabled" for report in reports["profile"].values()):
+        write_json(report_dir / "step-profile.json", reports["profile"])
     write_json(report_dir / "model-quality.json", reports["quality"])
     write_json(report_dir / "threshold-report.json", reports["thresholds"])
     memory = memory_summary(reports)
@@ -324,6 +341,11 @@ def main() -> int:
         "quality_macro_auroc": {
             name: round(report.get("macro_auroc", float("nan")), 5)
             for name, report in reports["quality"].items()
+            if report.get("status") == "ok"
+        },
+        "profile": {
+            name: report.get("summary")
+            for name, report in reports["profile"].items()
             if report.get("status") == "ok"
         },
         "memory": memory,
@@ -1007,6 +1029,7 @@ def run_all_baselines(
     reports: dict[str, dict[str, Any]] = {
         "loader": {},
         "gpu": {},
+        "profile": {},
         "quality": {},
         "thresholds": {},
     }
@@ -1043,7 +1066,7 @@ def run_all_baselines(
                 max_batches=args.loader_batches,
                 baseline=baseline,
             )
-            train_report, quality_report, threshold_report = train_and_evaluate(
+            train_report, quality_report, threshold_report, profile_report = train_and_evaluate(
                 torch=torch,
                 baseline=baseline,
                 train_loader=loader_factory("train", shuffle=True),
@@ -1051,12 +1074,16 @@ def run_all_baselines(
                 targets=targets,
                 device=device,
                 epochs=args.epochs,
+                batch_size=args.batch_size,
                 max_train_batches=args.max_train_batches,
                 max_eval_batches=args.max_eval_batches,
+                drop_last_train=args.drop_last_train,
                 warmup_batches=args.warmup_batches,
+                profile_batches=args.profile_batches,
                 seed=args.seed,
             )
             reports["gpu"][baseline] = train_report
+            reports["profile"][baseline] = profile_report
             reports["quality"][baseline] = quality_report
             reports["thresholds"][baseline] = threshold_report
         except Exception as error:
@@ -1067,6 +1094,7 @@ def run_all_baselines(
             }
             reports["loader"].setdefault(baseline, failed)
             reports["gpu"][baseline] = failed
+            reports["profile"][baseline] = failed
             reports["quality"][baseline] = failed
             reports["thresholds"][baseline] = failed
     return reports
@@ -1930,16 +1958,20 @@ def train_and_evaluate(
     targets: Sequence[str],
     device: Any,
     epochs: int,
+    batch_size: int,
     max_train_batches: int,
     max_eval_batches: int,
+    drop_last_train: bool,
     warmup_batches: int,
+    profile_batches: int,
     seed: int,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     set_torch_seed(torch, seed)
     model = make_model(torch, len(targets)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4, weight_decay=1.0e-4)
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
     autocast_enabled = device.type == "cuda"
+    h2d_timing_mode = H2D_TIMING_DIRECT_COPY
     if warmup_batches > 0:
         run_warmup_steps(
             torch=torch,
@@ -1959,8 +1991,11 @@ def train_and_evaluate(
     step_seconds = 0.0
     h2d_bytes = 0
     max_batch_tensor_bytes = 0
+    profile_records: list[dict[str, Any]] = []
     samples = 0
     batches = 0
+    skipped_incomplete_batches = 0
+    skipped_incomplete_samples = 0
     train_start = time.perf_counter()
     model.train()
     for _epoch in range(epochs):
@@ -1971,18 +2006,48 @@ def train_and_evaluate(
                 batch = next(iterator)
             except StopIteration:
                 break
-            data_wait_seconds += time.perf_counter() - wait_start
+            wait_seconds = time.perf_counter() - wait_start
+            data_wait_seconds += wait_seconds
+            batch_samples = batch_sample_count(batch)
+            if should_skip_incomplete_train_batch(
+                batch_samples=batch_samples,
+                batch_size=batch_size,
+                drop_last_train=drop_last_train,
+            ):
+                skipped_incomplete_batches += 1
+                skipped_incomplete_samples += batch_samples
+                continue
             step_start = time.perf_counter()
+            profile_this_batch = profile_batches > 0 and len(profile_records) < profile_batches
+            cuda_profile = profile_this_batch and device.type == "cuda"
+            h2d_start = h2d_end = None
+            forward_start = forward_end = None
+            backward_start = backward_end = None
+            optimizer_start = optimizer_end = None
+
             max_batch_tensor_bytes = max(max_batch_tensor_bytes, batch_tensor_bytes(batch))
+            h2d_wall_start = time.perf_counter()
+            if cuda_profile:
+                h2d_start = torch.cuda.Event(enable_timing=True)
+                h2d_end = torch.cuda.Event(enable_timing=True)
+                h2d_start.record()
             image = batch["image"].to(device, non_blocking=True).float()
             labels = batch["labels"].to(device, non_blocking=True).float()
             mask = batch["mask"].to(device, non_blocking=True).float()
+            if cuda_profile:
+                h2d_end.record()
+            h2d_wall_ms = (time.perf_counter() - h2d_wall_start) * 1000.0
             h2d_bytes += (
                 batch["image"].numel() * 4
                 + batch["labels"].numel() * 4
                 + batch["mask"].numel() * 4
             )
             optimizer.zero_grad(set_to_none=True)
+            forward_wall_start = time.perf_counter()
+            if cuda_profile:
+                forward_start = torch.cuda.Event(enable_timing=True)
+                forward_end = torch.cuda.Event(enable_timing=True)
+                forward_start.record()
             with torch.cuda.amp.autocast(enabled=autocast_enabled):
                 logits = model(image)
                 raw_loss = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -1991,14 +2056,58 @@ def train_and_evaluate(
                     reduction="none",
                 )
                 loss = (raw_loss * mask).sum() / mask.sum().clamp_min(1.0)
+            if cuda_profile:
+                forward_end.record()
+            forward_wall_ms = (time.perf_counter() - forward_wall_start) * 1000.0
+            backward_wall_start = time.perf_counter()
+            if cuda_profile:
+                backward_start = torch.cuda.Event(enable_timing=True)
+                backward_end = torch.cuda.Event(enable_timing=True)
+                backward_start.record()
             scaler.scale(loss).backward()
+            if cuda_profile:
+                backward_end.record()
+            backward_wall_ms = (time.perf_counter() - backward_wall_start) * 1000.0
+            optimizer_wall_start = time.perf_counter()
+            if cuda_profile:
+                optimizer_start = torch.cuda.Event(enable_timing=True)
+                optimizer_end = torch.cuda.Event(enable_timing=True)
+                optimizer_start.record()
             scaler.step(optimizer)
             scaler.update()
+            if cuda_profile:
+                optimizer_end.record()
+            optimizer_wall_ms = (time.perf_counter() - optimizer_wall_start) * 1000.0
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
-            step_seconds += time.perf_counter() - step_start
+            step_elapsed = time.perf_counter() - step_start
+            step_seconds += step_elapsed
             losses.append(float(loss.detach().cpu().item()))
-            samples += int(image.shape[0])
+            samples += batch_samples
+            if profile_this_batch:
+                if cuda_profile:
+                    h2d_ms = float(h2d_start.elapsed_time(h2d_end))
+                    forward_ms = float(forward_start.elapsed_time(forward_end))
+                    backward_ms = float(backward_start.elapsed_time(backward_end))
+                    optimizer_ms = float(optimizer_start.elapsed_time(optimizer_end))
+                else:
+                    h2d_ms = h2d_wall_ms
+                    forward_ms = forward_wall_ms
+                    backward_ms = backward_wall_ms
+                    optimizer_ms = optimizer_wall_ms
+                profile_records.append(
+                    {
+                        "batch_index": batches,
+                        "samples": batch_samples,
+                        "data_wait_ms": wait_seconds * 1000.0,
+                        "h2d_ms": h2d_ms,
+                        "h2d_timing_mode": h2d_timing_mode,
+                        "forward_ms": forward_ms,
+                        "backward_ms": backward_ms,
+                        "optimizer_ms": optimizer_ms,
+                        "total_step_ms": step_elapsed * 1000.0,
+                    }
+                )
             batches += 1
             if max_train_batches > 0 and batches >= max_train_batches:
                 break
@@ -2025,6 +2134,11 @@ def train_and_evaluate(
         "samples": samples,
         "batches": batches,
         "epochs_requested": epochs,
+        "train_batch_size": batch_size,
+        "drop_last_train": drop_last_train,
+        "h2d_timing_mode": h2d_timing_mode,
+        "skipped_incomplete_batches": skipped_incomplete_batches,
+        "skipped_incomplete_samples": skipped_incomplete_samples,
         "train_ms": total_seconds * 1000.0,
         "samples_per_second": samples / max(total_seconds, sys.float_info.epsilon),
         "data_wait_percent": 100.0 * data_wait_seconds / max(total_seconds, sys.float_info.epsilon),
@@ -2040,13 +2154,133 @@ def train_and_evaluate(
         "h2d_gb_per_second_estimate": (h2d_bytes / (1024.0**3))
         / max(total_seconds, sys.float_info.epsilon),
     }
+    profile_report = profile_report_for_baseline(
+        baseline=baseline,
+        requested_batches=profile_batches,
+        records=profile_records,
+        h2d_timing_mode=h2d_timing_mode,
+    )
+    if profile_report.get("status") == "ok":
+        train_report.update(profile_report["summary"])
     if hasattr(train_loader, "report_metadata"):
         train_report["pipeline"] = train_loader.report_metadata()
     train_report["memory"] = memory_snapshot(
         pipeline=train_report.get("pipeline"),
         max_batch_tensor_bytes=max_batch_tensor_bytes,
     )
-    return train_report, quality, thresholds
+    return train_report, quality, thresholds, profile_report
+
+
+def batch_sample_count(batch: dict[str, Any]) -> int:
+    return int(batch["image"].shape[0])
+
+
+def should_skip_incomplete_train_batch(
+    *,
+    batch_samples: int,
+    batch_size: int,
+    drop_last_train: bool,
+) -> bool:
+    return drop_last_train and batch_size > 0 and batch_samples != batch_size
+
+
+def profile_report_for_baseline(
+    *,
+    baseline: str,
+    requested_batches: int,
+    records: list[dict[str, Any]],
+    h2d_timing_mode: str = H2D_TIMING_DIRECT_COPY,
+) -> dict[str, Any]:
+    if requested_batches <= 0:
+        return {
+            "status": "disabled",
+            "baseline": baseline,
+            "requested_batches": requested_batches,
+            "records": [],
+            "summary": {},
+    }
+    summary = summarize_profile_records(records)
+    summary["profile_artifact_path"] = "step-profile.json"
+    summary.setdefault("profile_h2d_timing_mode", h2d_timing_mode)
+    return {
+        "status": "ok" if records else "failed",
+        "baseline": baseline,
+        "requested_batches": requested_batches,
+        "records": records,
+        "summary": summary,
+    }
+
+
+def summarize_profile_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    profiled_samples = sum(int(record.get("samples", 0)) for record in records)
+    data_wait_total_ms = sum(float(record.get("data_wait_ms", 0.0)) for record in records)
+    total_step_ms = sum(float(record.get("total_step_ms", 0.0)) for record in records)
+    end_to_end_ms = data_wait_total_ms + total_step_ms
+    summary: dict[str, Any] = {
+        "profiled_batches": len(records),
+        "profiled_samples": profiled_samples,
+        "profile_data_wait_total_ms": data_wait_total_ms,
+        "profile_total_step_ms": total_step_ms,
+        "profile_train_samples_per_s": (
+            1000.0 * profiled_samples / total_step_ms if total_step_ms > 0.0 else 0.0
+        ),
+        "profile_end_to_end_ms": end_to_end_ms,
+        "profile_end_to_end_samples_per_s": (
+            1000.0 * profiled_samples / end_to_end_ms if end_to_end_ms > 0.0 else 0.0
+        ),
+    }
+    required_profile_fields = {
+        "data_wait_ms",
+        "h2d_ms",
+        "forward_ms",
+        "backward_ms",
+        "optimizer_ms",
+    }
+    for field in (
+        "data_wait_ms",
+        "h2d_ms",
+        "forward_ms",
+        "backward_ms",
+        "optimizer_ms",
+    ):
+        if field not in required_profile_fields and not any(field in record for record in records):
+            continue
+        values = [float(record.get(field, 0.0)) for record in records]
+        stats = profile_stats(values)
+        summary[f"profile_{field}_mean"] = stats["mean"]
+        summary[f"profile_{field}_p50"] = stats["p50"]
+        summary[f"profile_{field}_p95"] = stats["p95"]
+    h2d_modes = sorted(
+        {
+            str(record["h2d_timing_mode"])
+            for record in records
+            if record.get("h2d_timing_mode")
+        }
+    )
+    if len(h2d_modes) == 1:
+        summary["profile_h2d_timing_mode"] = h2d_modes[0]
+    elif len(h2d_modes) > 1:
+        summary["profile_h2d_timing_mode"] = "mixed"
+    return summary
+
+
+def profile_stats(values: list[float]) -> dict[str, float]:
+    finite_values = [value for value in values if math.isfinite(value)]
+    if not finite_values:
+        return {"mean": 0.0, "p50": 0.0, "p95": 0.0}
+    ordered = sorted(finite_values)
+    return {
+        "mean": sum(ordered) / len(ordered),
+        "p50": percentile_nearest_rank(ordered, 50.0),
+        "p95": percentile_nearest_rank(ordered, 95.0),
+    }
+
+
+def percentile_nearest_rank(ordered_values: list[float], percentile: float) -> float:
+    if not ordered_values:
+        return 0.0
+    rank = max(1, math.ceil((percentile / 100.0) * len(ordered_values)))
+    return ordered_values[min(rank, len(ordered_values)) - 1]
 
 
 def run_warmup_steps(

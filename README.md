@@ -68,6 +68,44 @@ cargo run -p medkit-cli -- cxr validate-cache data/cxr/.medkit/cache --split tra
 uv run --with torch examples/cxr_dropin_pytorch_train.py --cache-dir data/cxr/.medkit/cache --batch-size 32
 ```
 
+### CXR H100 Benchmark Recipe
+
+For current-source Modal benchmark runs, use the local package build until the
+published PyPI package includes the latest CXR prefetch arguments:
+
+```bash
+MEDKIT_MODAL_USE_PYPI=0 python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
+  --batch-id cxr-confirm-h100-pinned-d2-rw4-local \
+  --baselines pytorch_raw,medkit_native_prefetch_pinned \
+  --cache-dtypes float32,uint8 \
+  --read-modes stream \
+  --image-size 512 \
+  --batch-size 32 \
+  --workers 8 \
+  --max-samples 6000 \
+  --max-train 4096 \
+  --max-val 1024 \
+  --max-test 1024 \
+  --epochs 1 \
+  --loader-batches 64 \
+  --warmup-batches 4 \
+  --profile-batches 128 \
+  --drop-last-train \
+  --prefetch-depth 2 \
+  --prefetch-read-workers 4 \
+  --no-include-metadata \
+  --max-eval-batches 1 \
+  --modal-gpu H100
+```
+
+The current fastest confirmed CXR path is native prefetch with pinned batches,
+stream reads, `prefetch_depth=2`, and `prefetch_read_workers=4`. In the May 20,
+2026 H100 confirmation run on the public NIH ChestX-ray14 cache, raw PyTorch
+reached 194.7 train samples/s, while medkit pinned stream reached 379.8
+samples/s with float32 cache data and 377.4 samples/s with uint8 cache data.
+Both medkit rows used about 64 MB of estimated pinned batch memory and reported
+near-zero cache-image PSS.
+
 ## DICOM Decoder Policy
 
 The default DICOM pixel backend is `medkit-native`. It keeps normal builds
