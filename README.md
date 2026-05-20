@@ -191,10 +191,23 @@ CUDA-prefetch evidence batches:
 `cxr-opt-l4-224-b64-gpuprefetch1-20260520-codex-r0`,
 and `cxr-opt-h100-512-b32-gpuprefetch1-20260520-codex-r0`.
 
-Initial block-shuffle batches from 2026-05-20 are not used as promotion
-evidence because the native prefetch benchmark reported `shuffle_block_batches`
-without passing it into `MedkitCxrNativePrefetchDataset`. Re-run block-shuffle
-screens after that wiring fix before changing the speed preset.
+The fixed block-shuffle rerun also does not justify a preset change:
+
+| Experiment | Shape | Mean train throughput | Decision |
+|---|---:|---:|---|
+| baseline medkit stream | L4 224/b64 float32 | 362.4/s | keep |
+| `--shuffle-block-batches 8` | L4 224/b64 float32 | 367.6/s | neutral, needs stronger evidence |
+| baseline medkit stream | H100 512/b32 float32 | 376.0/s | keep |
+| `--shuffle-block-batches 8` | H100 512/b32 float32 | 368.1/s | do not promote |
+| baseline medkit stream | H100 512/b32 uint8 | 378.7/s | keep |
+| `--shuffle-block-batches 8` | H100 512/b32 uint8 | 379.8/s | neutral, do not promote globally |
+
+Fixed block-shuffle evidence batches:
+`cxr-opt-l4-224-b64-blockshuffle8-fixed-20260520-codex-r0` and
+`cxr-opt-h100-512-b32-blockshuffle8-fixed-20260520-codex-r0`. Earlier
+block-shuffle batches from 2026-05-20 are not used as promotion evidence
+because the native prefetch benchmark reported `shuffle_block_batches` without
+passing it into `MedkitCxrNativePrefetchDataset`.
 
 ## DICOM Decoder Policy
 
