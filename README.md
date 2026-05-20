@@ -142,6 +142,14 @@ train_loader = medkit.cxr.DataLoader(
 Batches use stable keys: `image`, `labels`, `mask`, and metadata sidecars such
 as `sample_id`, `patient_id`, `study_id`, and `image_id`.
 
+Free-threaded CPython builds such as `3.13t` and `3.14t` are not currently
+supported. The published wheels target normal CPython, and the optimized CXR
+path already moves hot data loading work into Rust-native prefetch threads
+rather than Python bytecode threads. Supporting free-threaded Python is future
+work: it requires a PyO3/maturin upgrade, dedicated `cp313t`/`cp314t` wheels,
+and a thread-safety audit of the PyO3/Torch boundary, especially raw tensor
+pointer writes, shared batch buffers, and native prefetch slot ownership.
+
 ## Development
 
 Create the development environment and build the native Python extension:
