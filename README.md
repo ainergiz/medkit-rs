@@ -191,6 +191,20 @@ CUDA-prefetch evidence batches:
 `cxr-opt-l4-224-b64-gpuprefetch1-20260520-codex-r0`,
 and `cxr-opt-h100-512-b32-gpuprefetch1-20260520-codex-r0`.
 
+An asynchronous L4 rerun with per-step CUDA synchronization disabled and
+profiling disabled showed a small GPU-prefetch lift, but still not enough to
+promote:
+
+| Experiment | Shape | Mean train throughput | Decision |
+|---|---:|---:|---|
+| async raw PyTorch direct H2D | L4 224/b64 float32 | 312.5/s | reference |
+| async medkit direct H2D | L4 224/b64 float32 | 361.1/s | keep |
+| async medkit `--gpu-prefetch-batches 1` | L4 224/b64 float32 | 365.3/s | neutral, needs stronger evidence |
+
+Async evidence batches:
+`cxr-async-l4-224-b64-direct-20260520-codex-r1` and
+`cxr-async-l4-224-b64-gpuprefetch1-20260520-codex-r0`.
+
 The fixed block-shuffle rerun also does not justify a preset change:
 
 | Experiment | Shape | Mean train throughput | Decision |
