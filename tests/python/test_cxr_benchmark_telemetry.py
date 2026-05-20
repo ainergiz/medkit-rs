@@ -572,6 +572,63 @@ def test_matrix_modal_cli_command_can_be_overridden(monkeypatch):
     assert command[:5] == ["uvx", "--python", "3.11", "modal", "run"]
 
 
+def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_path):
+    benchmark = load_benchmark_module()
+    captured: dict[str, object] = {}
+
+    class FakeDataLoader:
+        def __init__(self, dataset, **kwargs):
+            self.dataset = dataset
+            self.kwargs = kwargs
+
+    class FakeDataset:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.shuffle_block_batches = kwargs["shuffle_block_batches"]
+
+    fake_torch = types.SimpleNamespace(
+        utils=types.SimpleNamespace(
+            data=types.SimpleNamespace(DataLoader=FakeDataLoader)
+        )
+    )
+    fake_medkit = types.SimpleNamespace(MedkitCxrNativePrefetchDataset=FakeDataset)
+
+    monkeypatch.setattr(benchmark, "import_torch", lambda: fake_torch)
+    monkeypatch.setattr(benchmark, "import_numpy", lambda: types.SimpleNamespace())
+    monkeypatch.setattr(benchmark, "import_medkit_rs", lambda: fake_medkit)
+    monkeypatch.setattr(benchmark, "cache_normalization", lambda _cache_dir: (0.5, 0.25))
+    monkeypatch.setattr(benchmark, "cache_dtype_from_metadata", lambda _cache_dir: "float32")
+
+    factory = benchmark.make_loader_factory(
+        baseline="medkit_native_prefetch_pinned",
+        records=[],
+        targets=["Pneumonia"],
+        cache_dir=tmp_path,
+        webdataset_dir=tmp_path / "webdataset",
+        image_size=224,
+        batch_size=64,
+        workers=4,
+        prefetch_depth=2,
+        prefetch_read_workers=4,
+        shuffle_block_batches=8,
+        read_mode="stream",
+        include_metadata=True,
+        seed=17,
+    )
+
+    loader = factory("train", shuffle=True)
+
+    assert isinstance(loader, FakeDataLoader)
+    assert loader.dataset.shuffle_block_batches == 8
+    assert captured["shuffle_block_batches"] == 8
+    assert captured["shuffle"] is True
+    assert captured["read_mode"] == "stream"
+    assert captured["prefetch_depth"] == 2
+    assert captured["read_workers"] == 4
+    assert captured["include_metadata"] is True
+    assert loader.report_metadata()["shuffle_block_batches"] == 8
+
+
 def test_matrix_row_validation_requires_summary_consistency_and_provenance():
     benchmark = load_benchmark_module()
     matrix = load_matrix_module()

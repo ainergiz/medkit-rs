@@ -1537,6 +1537,7 @@ def make_loader_factory(
                 read_workers=prefetch_read_workers,
                 read_mode=read_mode,
                 include_metadata=include_metadata,
+                shuffle_block_batches=shuffle_block_batches,
             )
             loader = torch.utils.data.DataLoader(
                 dataset,

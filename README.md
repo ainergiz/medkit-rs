@@ -175,26 +175,26 @@ overlap. Raw reached 306.2 train samples/s, macro AUROC 0.636, and macro AUPRC
 0.175. Medkit reached 363.8 train samples/s, macro AUROC 0.690, and macro AUPRC
 0.180.
 
-The first next-layer optimization screens did not justify changing the speed
-preset:
+The first next-layer CUDA-prefetch optimization screens did not justify changing
+the speed preset:
 
 | Experiment | Shape | Mean train throughput | Decision |
 |---|---:|---:|---|
 | baseline medkit stream | L4 224/b64 float32 | 362.4/s | keep |
 | `--gpu-prefetch-batches 1` | L4 224/b64 float32 | 359.5/s | do not promote |
-| `--shuffle-block-batches 8` | L4 224/b64 float32 | 359.8/s | do not promote |
 | baseline medkit stream | H100 512/b32 float32 | 376.0/s | keep |
 | `--gpu-prefetch-batches 1` | H100 512/b32 float32 | 376.5/s | neutral, do not promote |
-| `--shuffle-block-batches 8` | H100 512/b32 float32 | 364.3/s | do not promote |
 | baseline medkit stream | H100 512/b32 uint8 | 378.7/s | keep |
 | `--gpu-prefetch-batches 1` | H100 512/b32 uint8 | 374.1/s | do not promote |
-| `--shuffle-block-batches 8` | H100 512/b32 uint8 | 379.6/s | neutral, needs stronger evidence |
 
-Evidence batches:
+CUDA-prefetch evidence batches:
 `cxr-opt-l4-224-b64-gpuprefetch1-20260520-codex-r0`,
-`cxr-opt-l4-224-b64-blockshuffle8-20260520-codex-r0`,
-`cxr-opt-h100-512-b32-gpuprefetch1-20260520-codex-r0`, and
-`cxr-opt-h100-512-b32-blockshuffle8-20260520-codex-r0`.
+and `cxr-opt-h100-512-b32-gpuprefetch1-20260520-codex-r0`.
+
+Initial block-shuffle batches from 2026-05-20 are not used as promotion
+evidence because the native prefetch benchmark reported `shuffle_block_batches`
+without passing it into `MedkitCxrNativePrefetchDataset`. Re-run block-shuffle
+screens after that wiring fix before changing the speed preset.
 
 ## DICOM Decoder Policy
 
