@@ -843,6 +843,7 @@ def test_cxr_facade_routes_options_and_metadata(
                 "label_policy": {"uncertain": "ignore", "missing": "ignore"},
                 "transform_fingerprint": "abc",
                 "source_manifest_checksum": "def",
+                "splits": {"train": {"samples": 4}},
             }
         )
     )

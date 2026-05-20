@@ -113,6 +113,7 @@ class Dataset(_IterableDatasetBase):
         self.shuffle_block_batches = shuffle_block_batches
         self.preset = preset
         self._inner: Any | None = None
+        self._metadata_cache: dict[str, Any] | None = None
 
     def __iter__(self):
         return iter(self._ensure_inner())
@@ -219,6 +220,7 @@ class Dataset(_IterableDatasetBase):
         return self._inner
 
     def _build_inner(self):
+        self._validate_cache_layout()
         kwargs = {
             "cache_dir": self.cache_dir,
             "split": self.split,
@@ -240,14 +242,66 @@ class Dataset(_IterableDatasetBase):
             )
         return MedkitCxrNativeBatchIterableDataset(**kwargs)
 
+    def validate_cache(self) -> dict[str, Any]:
+        """Validate that ``cache_dir`` looks like a medkit CXR cache for ``split``."""
+
+        return dict(self._validate_cache_layout())
+
+    def _validate_cache_layout(self) -> dict[str, Any]:
+        metadata = self._read_cache_metadata(required=True)
+        splits = metadata.get("splits")
+        if not isinstance(splits, dict):
+            raise ValueError(
+                f"CXR cache metadata at {self.cache_dir / 'cache-metadata.json'} "
+                "does not contain a 'splits' object"
+            )
+        if self.split not in splits:
+            available = ", ".join(sorted(str(split) for split in splits)) or "none"
+            raise ValueError(
+                f"CXR cache split {self.split!r} was not found in "
+                f"{self.cache_dir / 'cache-metadata.json'}; available splits: {available}"
+            )
+        return metadata
+
     def _cache_metadata(self) -> dict[str, Any]:
+        return self._read_cache_metadata(required=False)
+
+    def _read_cache_metadata(self, *, required: bool) -> dict[str, Any]:
+        if self._metadata_cache is not None:
+            return self._metadata_cache
         path = self.cache_dir / "cache-metadata.json"
+        if not self.cache_dir.exists():
+            if required:
+                raise FileNotFoundError(
+                    f"CXR cache directory does not exist: {self.cache_dir}. "
+                    "Create one with `medkit cxr cache ...` or pass the directory "
+                    "containing cache-metadata.json."
+                )
+            return {}
         if not path.exists():
+            if required:
+                raise FileNotFoundError(
+                    f"CXR cache metadata not found: {path}. "
+                    "Expected a medkit CXR cache directory created by "
+                    "`medkit cxr cache ...`."
+                )
             return {}
         try:
-            return json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            metadata = json.loads(path.read_text())
+        except OSError as error:
+            if required:
+                raise OSError(f"could not read CXR cache metadata at {path}: {error}") from error
             return {}
+        except json.JSONDecodeError as error:
+            if required:
+                raise ValueError(f"CXR cache metadata is not valid JSON at {path}: {error}") from error
+            return {}
+        if not isinstance(metadata, dict):
+            if required:
+                raise ValueError(f"CXR cache metadata at {path} must be a JSON object")
+            return {}
+        self._metadata_cache = metadata
+        return metadata
 
 
 def DataLoader(

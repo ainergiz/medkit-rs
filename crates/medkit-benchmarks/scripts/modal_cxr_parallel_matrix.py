@@ -8,12 +8,13 @@ import math
 import os
 import shlex
 import shutil
+import statistics
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 
 LOCAL_REPO_ROOT = next(
@@ -56,6 +57,8 @@ GATE_PRESETS: dict[str, dict[str, Any]] = {
         "read_modes": "stream",
         "include_metadata": False,
         "modal_gpu": "H100",
+        "repeats": 3,
+        "fail_fast": True,
     },
     "l4-224-b64": {
         "baselines": RAW_MEDKIT_BASELINES,
@@ -81,6 +84,8 @@ GATE_PRESETS: dict[str, dict[str, Any]] = {
         "read_modes": "stream",
         "include_metadata": False,
         "modal_gpu": "L4",
+        "repeats": 3,
+        "fail_fast": True,
     },
 }
 GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
@@ -107,6 +112,8 @@ GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
     "read_modes": ("--read-modes", "--read-mode"),
     "include_metadata": ("--include-metadata", "--no-include-metadata"),
     "modal_gpu": ("--modal-gpu",),
+    "repeats": ("--repeats",),
+    "fail_fast": ("--fail-fast", "--no-fail-fast"),
 }
 
 
@@ -117,6 +124,8 @@ class Row:
     cache_dtype: str
     read_mode: str
     purpose: str
+    repeat_index: int = 0
+    repeat_count: int = 1
 
 
 @dataclass
@@ -194,6 +203,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--modal-gpu",
         default="",
         help="Optional Modal GPU selector, passed as MEDKIT_MODAL_GPU to row commands.",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="Launch each logical matrix row this many times and aggregate repeat stats.",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Abort remaining rows after the first row validation failure.",
     )
     return parser
 
@@ -316,6 +337,7 @@ def main() -> int:
 
         time.sleep(5)
         still_running: list[RunningRow] = []
+        should_abort = False
         for active in running:
             returncode = active.process.poll()
             if returncode is None:
@@ -327,8 +349,22 @@ def main() -> int:
                 f"finished {active.run_id}: returncode={returncode} "
                 f"status={result.get('status')}"
             )
+            if args.fail_fast and result.get("status") != "ok":
+                should_abort = True
         running = still_running
         write_batch_summary(batch_dir, batch_id, completed, running, pending, batch_started)
+        if should_abort:
+            terminate_running_rows(running)
+            write_batch_summary(
+                batch_dir,
+                batch_id,
+                completed,
+                running=[],
+                pending=[],
+                batch_started=batch_started,
+                fail_fast_aborted=True,
+            )
+            return 1
 
     write_batch_summary(batch_dir, batch_id, completed, running, pending, batch_started)
     failures = [row for row in completed if row.get("status") != "ok"]
@@ -459,6 +495,8 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
         "baseline": active.row.baseline,
         "cache_dtype": active.row.cache_dtype,
         "read_mode": active.row.read_mode,
+        "repeat_index": active.row.repeat_index,
+        "repeat_count": active.row.repeat_count,
         "purpose": active.row.purpose,
         "returncode": returncode,
         "status": status,
@@ -498,11 +536,15 @@ def write_batch_summary(
     running: list[RunningRow],
     pending: list[Row],
     batch_started: float,
+    *,
+    fail_fast_aborted: bool = False,
 ) -> None:
+    repeat_summary = summarize_repeats(completed, running, pending)
     summary = {
         "batch_id": batch_id,
         "status": "running" if running or pending else "ok",
         "elapsed_seconds": time.perf_counter() - batch_started,
+        "fail_fast_aborted": fail_fast_aborted,
         "completed": completed,
         "running": [
             {
@@ -510,15 +552,227 @@ def write_batch_summary(
                 "baseline": active.row.baseline,
                 "cache_dtype": active.row.cache_dtype,
                 "read_mode": active.row.read_mode,
+                "repeat_index": active.row.repeat_index,
+                "repeat_count": active.row.repeat_count,
                 "elapsed_seconds": time.perf_counter() - active.started_at,
             }
             for active in running
         ],
         "pending": [row.__dict__ for row in pending],
+        "repeat_summary": repeat_summary,
     }
     if any(row.get("status") != "ok" for row in completed):
         summary["status"] = "failed" if not running else "running_with_failures"
     write_json(batch_dir / "batch-summary.json", summary)
+    write_json(batch_dir / "repeat-summary.json", repeat_summary)
+
+
+def terminate_running_rows(running: list[RunningRow]) -> None:
+    for active in running:
+        if active.process.poll() is not None:
+            continue
+        active.process.terminate()
+    deadline = time.monotonic() + 20.0
+    for active in running:
+        if active.process.poll() is not None:
+            continue
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            active.process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            active.process.kill()
+
+
+def summarize_repeats(
+    completed: list[dict[str, Any]],
+    running: list[RunningRow],
+    pending: list[Row],
+) -> dict[str, Any]:
+    expected: dict[str, dict[str, Any]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for result in completed:
+        key = repeat_group_key(result)
+        expected.setdefault(key, repeat_group_descriptor(result))
+        groups.setdefault(key, []).append(result)
+    for active in running:
+        key = repeat_group_key(active.row)
+        expected.setdefault(key, repeat_group_descriptor(active.row))
+    for row in pending:
+        key = repeat_group_key(row)
+        expected.setdefault(key, repeat_group_descriptor(row))
+
+    summaries: dict[str, Any] = {}
+    for key, descriptor in sorted(expected.items()):
+        results = groups.get(key, [])
+        ok_results = [result for result in results if result.get("status") == "ok"]
+        failed_results = [result for result in results if result.get("status") != "ok"]
+        expected_repeats = max(
+            [
+                int(descriptor.get("repeat_count") or 1),
+                *[int(result.get("repeat_count") or 1) for result in results],
+            ]
+        )
+        metrics = repeat_metric_summary(ok_results)
+        if failed_results:
+            status = "failed"
+        elif len(ok_results) >= expected_repeats:
+            status = "ok"
+        else:
+            status = "running"
+        summaries[key] = {
+            **descriptor,
+            "status": status,
+            "expected_repeats": expected_repeats,
+            "completed_repeats": len(results),
+            "ok_repeats": len(ok_results),
+            "failed_repeats": len(failed_results),
+            "metrics": metrics,
+            "runs": [
+                {
+                    "run_id": result.get("run_id"),
+                    "status": result.get("status"),
+                    "repeat_index": result.get("repeat_index", 0),
+                    "validation_errors": result.get("validation_errors") or [],
+                }
+                for result in sorted(results, key=lambda item: int(item.get("repeat_index") or 0))
+            ],
+        }
+    comparisons = summarize_repeat_comparisons(summaries)
+    return {
+        "schema_version": 1,
+        "status": "failed"
+        if any(group["status"] == "failed" for group in summaries.values())
+        else "ok"
+        if summaries and all(group["status"] == "ok" for group in summaries.values())
+        else "running",
+        "groups": summaries,
+        "comparisons": comparisons,
+    }
+
+
+def repeat_metric_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "train_samples_per_second": summarize_metric_values(
+            extract_metric(result, "train_samples_per_second") for result in results
+        ),
+        "profile_end_to_end_samples_per_second": summarize_metric_values(
+            extract_metric(result, "profile_end_to_end_samples_per_second") for result in results
+        ),
+        "loader_samples_per_second": summarize_metric_values(
+            extract_metric(result, "loader_samples_per_second") for result in results
+        ),
+        "data_wait_percent": summarize_metric_values(
+            extract_metric(result, "data_wait_percent") for result in results
+        ),
+        "gpu_pss_mb": summarize_metric_values(extract_metric(result, "gpu_pss_mb") for result in results),
+        "cache_image_pss_mb": summarize_metric_values(
+            extract_metric(result, "cache_image_pss_mb") for result in results
+        ),
+    }
+
+
+def summarize_repeat_comparisons(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    raw_groups = [
+        (key, group)
+        for key, group in groups.items()
+        if group.get("baseline") == "pytorch_raw"
+        and group.get("status") == "ok"
+        and metric_mean(group, "train_samples_per_second") is not None
+    ]
+    if not raw_groups:
+        return {}
+    raw_key, raw_group = raw_groups[0]
+    comparisons: dict[str, Any] = {}
+    for key, group in groups.items():
+        if group.get("baseline") == "pytorch_raw":
+            continue
+        train_speedup = ratio_or_none(
+            metric_mean(group, "train_samples_per_second"),
+            metric_mean(raw_group, "train_samples_per_second"),
+        )
+        profile_speedup = ratio_or_none(
+            metric_mean(group, "profile_end_to_end_samples_per_second"),
+            metric_mean(raw_group, "profile_end_to_end_samples_per_second"),
+        )
+        comparisons[f"{key}:vs:{raw_key}"] = {
+            "candidate": key,
+            "baseline": raw_key,
+            "status": "ok" if train_speedup is not None else "insufficient_data",
+            "train_samples_per_second_speedup": train_speedup,
+            "profile_end_to_end_speedup": profile_speedup,
+        }
+    return comparisons
+
+
+def metric_mean(group: dict[str, Any], metric: str) -> float | None:
+    value = ((group.get("metrics") or {}).get(metric) or {}).get("mean")
+    return numeric_value(value)
+
+
+def ratio_or_none(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator <= 0.0:
+        return None
+    return numerator / denominator
+
+
+def extract_metric(result: dict[str, Any], metric: str) -> float | None:
+    baseline = str(result.get("baseline") or "")
+    gpu_row = ((result.get("gpu") or {}).get(baseline) or {})
+    loader_row = ((result.get("loader") or {}).get(baseline) or {})
+    profile_row = ((result.get("profile") or {}).get(baseline) or {})
+    profile_summary = profile_row.get("summary") or {}
+    memory = gpu_row.get("memory") or {}
+    fields = {
+        "train_samples_per_second": gpu_row.get("samples_per_second"),
+        "profile_end_to_end_samples_per_second": profile_summary.get(
+            "profile_end_to_end_samples_per_s"
+        ),
+        "loader_samples_per_second": loader_row.get("samples_per_second"),
+        "data_wait_percent": gpu_row.get("data_wait_percent"),
+        "gpu_pss_mb": memory.get("smaps_pss_mb"),
+        "cache_image_pss_mb": memory.get("smaps_pss_cache_images_mb"),
+    }
+    return numeric_value(fields.get(metric))
+
+
+def summarize_metric_values(values: Iterable[float | None]) -> dict[str, Any]:
+    cleaned = [float(value) for value in values if value is not None and math.isfinite(value)]
+    if not cleaned:
+        return {"count": 0, "values": []}
+    mean = statistics.fmean(cleaned)
+    stdev = statistics.stdev(cleaned) if len(cleaned) > 1 else 0.0
+    return {
+        "count": len(cleaned),
+        "values": [round(value, 6) for value in cleaned],
+        "mean": mean,
+        "stdev": stdev,
+        "cv_percent": 100.0 * stdev / mean if mean else 0.0,
+        "min": min(cleaned),
+        "max": max(cleaned),
+    }
+
+
+def repeat_group_key(row: Row | dict[str, Any]) -> str:
+    baseline = row.baseline if isinstance(row, Row) else str(row.get("baseline"))
+    cache_dtype = row.cache_dtype if isinstance(row, Row) else str(row.get("cache_dtype"))
+    read_mode = row.read_mode if isinstance(row, Row) else str(row.get("read_mode"))
+    return f"{baseline}:{cache_dtype}:{read_mode}"
+
+
+def repeat_group_descriptor(row: Row | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(row, Row):
+        return {
+            "baseline": row.baseline,
+            "cache_dtype": row.cache_dtype,
+            "read_mode": row.read_mode,
+            "repeat_count": row.repeat_count,
+        }
+    return {
+        "baseline": row.get("baseline"),
+        "cache_dtype": row.get("cache_dtype"),
+        "read_mode": row.get("read_mode"),
+        "repeat_count": int(row.get("repeat_count") or 1),
+    }
 
 
 def validate_row_artifacts(
@@ -647,6 +901,11 @@ def validate_row_artifacts(
     )
 
     for phase, row in [("loader", loader_row), ("gpu", gpu_row)]:
+        validate_memory_telemetry(
+            errors=errors,
+            context=phase,
+            memory=row.get("memory") or {},
+        )
         pipeline = row.get("pipeline") or {}
         if not pipeline and active.row.baseline.startswith("medkit"):
             errors.append(f"{phase} pipeline metadata missing")
@@ -674,6 +933,32 @@ def validate_row_artifacts(
         )
 
     return errors
+
+
+def validate_memory_telemetry(
+    *,
+    errors: list[str],
+    context: str,
+    memory: dict[str, Any],
+) -> None:
+    if not isinstance(memory, dict) or not memory:
+        errors.append(f"{context} memory telemetry missing")
+        return
+    required = (
+        "psutil_pss_mb",
+        "psutil_uss_mb",
+        "smaps_pss_mb",
+        "smaps_uss_mb",
+        "smaps_pss_file_mb",
+        "smaps_pss_anon_mb",
+    )
+    for field in required:
+        value = numeric_value(memory.get(field))
+        if value is None or not math.isfinite(value) or value < 0.0:
+            errors.append(f"{context} memory {field} invalid: {memory.get(field)!r}")
+    sources = memory.get("sources")
+    if not isinstance(sources, list) or "/proc/self/smaps" not in sources:
+        errors.append(f"{context} memory sources missing /proc/self/smaps")
 
 
 def compare_modal_artifact(
@@ -1015,6 +1300,7 @@ def initial_pain_diary(row: Row, run_id: str, command: list[str]) -> str:
         f"# Pain Diary: {run_id}\n\n"
         f"Run id: `{run_id}`\n\n"
         f"Tool: `{row.baseline}`\n\n"
+        f"Repeat: `{row.repeat_index + 1}/{row.repeat_count}`\n\n"
         f"Purpose: {row.purpose}\n\n"
         "Start state: launched by `modal_cxr_parallel_matrix.py`.\n\n"
         "Command:\n\n"
@@ -1084,6 +1370,7 @@ def rows_for_args(args: argparse.Namespace) -> list[Row]:
             "cache_dtype": args.cache_dtype,
             "read_modes": args.read_modes,
             "read_mode": args.read_mode,
+            "repeats": args.repeats,
         }
     )
 
@@ -1096,21 +1383,27 @@ def rows_for_settings(settings: dict[str, Any]) -> list[Row]:
     read_modes = parse_csv(str(settings.get("read_modes", ""))) or [
         str(settings.get("read_mode", "mmap"))
     ]
+    repeats = int(settings.get("repeats") or 1)
+    if repeats <= 0:
+        raise ValueError("repeats must be greater than zero")
     validate_choices("cache dtype", cache_dtypes, {"float32", "float16", "uint8"})
     validate_choices("read mode", read_modes, {"mmap", "stream"})
     rows = []
-    for baseline in baselines:
-        row_settings = matrix_settings_for_baseline(baseline, cache_dtypes, read_modes)
-        for cache_dtype, read_mode in row_settings:
-            rows.append(
-                Row(
-                    name=row_name(baseline, cache_dtype, read_mode),
-                    baseline=baseline,
-                    cache_dtype=cache_dtype,
-                    read_mode=read_mode,
-                    purpose=row_purpose(baseline, cache_dtype, read_mode),
+    for repeat_index in range(repeats):
+        for baseline in baselines:
+            row_settings = matrix_settings_for_baseline(baseline, cache_dtypes, read_modes)
+            for cache_dtype, read_mode in row_settings:
+                rows.append(
+                    Row(
+                        name=row_name(baseline, cache_dtype, read_mode),
+                        baseline=baseline,
+                        cache_dtype=cache_dtype,
+                        read_mode=read_mode,
+                        purpose=row_purpose(baseline, cache_dtype, read_mode),
+                        repeat_index=repeat_index,
+                        repeat_count=repeats,
+                    )
                 )
-            )
     if not rows:
         raise ValueError("No baselines provided")
     return rows
@@ -1231,6 +1524,8 @@ def matrix_settings_for_baseline(
 
 
 def run_id_for(batch_id: str, row: Row) -> str:
+    if row.repeat_count > 1:
+        return f"{batch_id}-r{row.repeat_index + 1:02d}-{row.name}"
     return f"{batch_id}-{row.name}"
 
 

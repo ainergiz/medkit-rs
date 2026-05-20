@@ -50,6 +50,29 @@ def test_cxr_module_imports_and_validates_arguments() -> None:
         cxr.DataLoader(dataset, persistent_workers=True)
 
 
+def test_cxr_dataset_reports_clear_cache_layout_errors(tmp_path: Path) -> None:
+    cxr = _import_or_skip("medkit_rs.cxr")
+
+    missing = tmp_path / "missing-cache"
+    with pytest.raises(FileNotFoundError, match="CXR cache directory does not exist"):
+        cxr.Dataset(missing).validate_cache()
+
+    empty = tmp_path / "empty-cache"
+    empty.mkdir()
+    with pytest.raises(FileNotFoundError, match="CXR cache metadata not found"):
+        cxr.Dataset(empty).validate_cache()
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "cache-metadata.json").write_text(
+        json.dumps({"splits": {"val": {"samples": 1}}}) + "\n"
+    )
+    with pytest.raises(ValueError, match="available splits: val"):
+        cxr.Dataset(cache, split="train").validate_cache()
+
+    assert cxr.Dataset(cache, split="val").validate_cache()["splits"]["val"]["samples"] == 1
+
+
 def test_package_root_exports_wheel_ready_api_only() -> None:
     medkit = _import_or_skip("medkit_rs")
     dataset = _import_or_skip("medkit_rs.dataset")

@@ -40,9 +40,12 @@ def main() -> None:
     datamodule = MedkitCXRDataModule(
         cache_dir=args.cache_dir,
         batch_size=args.batch_size,
+        preset=args.preset,
         pin_memory=args.pin_memory,
-        prefetch=not args.no_prefetch,
+        prefetch=args.prefetch,
         read_workers=args.read_workers,
+        drop_last=args.drop_last,
+        shuffle_block_batches=args.shuffle_block_batches,
     )
     datamodule.setup("fit")
 
@@ -73,18 +76,24 @@ class MedkitCXRDataModule(LightningDataModuleBase):
         cache_dir: Path,
         batch_size: int,
         seed: int = 0,
-        pin_memory: bool = False,
-        prefetch: bool = True,
-        read_workers: int = 1,
+        preset: str = "speed",
+        pin_memory: bool | None = None,
+        prefetch: bool | None = None,
+        read_workers: int | None = None,
+        drop_last: bool = True,
+        shuffle_block_batches: int = 0,
     ):
         require_training_stack()
         super().__init__()
         self.cache_dir = cache_dir
         self.batch_size = batch_size
         self.seed = seed
+        self.preset = preset
         self.pin_memory = pin_memory
         self.prefetch = prefetch
         self.read_workers = read_workers
+        self.drop_last = drop_last
+        self.shuffle_block_batches = shuffle_block_batches
 
     def setup(self, stage: str | None = None) -> None:
         if stage in (None, "fit"):
@@ -109,9 +118,12 @@ class MedkitCXRDataModule(LightningDataModuleBase):
             batch_size=self.batch_size,
             shuffle=shuffle,
             seed=self.seed,
+            preset=self.preset,
             pin_memory=self.pin_memory,
             prefetch=self.prefetch,
             read_workers=self.read_workers,
+            drop_last=self.drop_last if split == "train" else False,
+            shuffle_block_batches=self.shuffle_block_batches if split == "train" else 0,
         )
 
 
@@ -175,13 +187,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--model", default="resnet18")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--preset", choices=("speed", "memory"), default="speed")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--max-epochs", type=int, default=1)
     parser.add_argument("--accelerator", default="auto")
     parser.add_argument("--devices", default="auto")
-    parser.add_argument("--read-workers", type=int, default=1)
-    parser.add_argument("--pin-memory", action="store_true")
-    parser.add_argument("--no-prefetch", action="store_true")
+    parser.add_argument("--read-workers", type=int)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--drop-last", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--shuffle-block-batches", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 

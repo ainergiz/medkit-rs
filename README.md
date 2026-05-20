@@ -73,7 +73,8 @@ uv run --with torch examples/cxr_dropin_pytorch_train.py --cache-dir data/cxr/.m
 For current-source Modal benchmark runs, use the local package build until the
 published PyPI package includes the latest CXR prefetch arguments. The matrix
 launcher has repeatable raw+medkit gate presets that put all rows under one
-batch id and force a single Modal GPU selector.
+batch id, force a single Modal GPU selector, and run three profiled repeats per
+logical row by default. Use `--repeats 1` only for ad hoc debugging.
 
 Dry-run a gate first when Modal is not available or before spending GPU time:
 
@@ -118,21 +119,31 @@ heartbeat hangs observed with the globally installed Python 3.13 client during
 these gate runs.
 
 The current fastest confirmed CXR path is native prefetch with pinned batches,
-stream reads, `prefetch_depth=2`, and `prefetch_read_workers=4`. Audited May 20,
-2026 gates on the public NIH ChestX-ray14 cache produced:
+stream reads, `prefetch_depth=2`, and `prefetch_read_workers=4`. Audited
+three-repeat May 20, 2026 release gates on the public NIH ChestX-ray14 cache
+produced:
 
 | Gate | Raw PyTorch | medkit pinned stream | Result |
 |---|---:|---:|---:|
-| H100 512/b32, float32 | 234.8/s | 379.9/s | medkit 1.62x faster |
-| H100 512/b32, uint8 | 234.8/s | 377.6/s | medkit 1.61x faster |
-| L4 224/b64, float32 | 304.7/s | 360.2/s | medkit 1.18x faster |
+| H100 512/b32, float32 | 265.1/s | 376.0/s | medkit 1.42x faster |
+| H100 512/b32, uint8 | 265.1/s | 378.7/s | medkit 1.43x faster |
+| L4 224/b64, float32 | 310.8/s | 362.4/s | medkit 1.17x faster |
 
 All rows used 6,000 records, `--drop-last-train`, full profile windows, and
-passed batch audit. Stream rows reported near-zero cache-image PSS; H100
-medkit stream also reduced GPU-loop PSS from about 7.44 GB raw to about
-5.72 GB. Gate rows must retain `step-profile.json`,
+passed batch audit. The H100 release batch is
+`cxr-release-h100-512-b32-20260520-codex-r0`; the L4 release batch is
+`cxr-release-l4-224-b64-20260520-codex-r0`. Stream rows and raw rows reported
+near-zero cache-image PSS. Mean GPU-loop PSS was about 5.54 GB for H100 raw,
+5.71-5.73 GB for H100 medkit stream, 5.66 GB for L4 raw, and 5.75 GB for L4
+medkit stream. Gate rows must retain `step-profile.json`,
 `summary-consistency.json`, `run-summary.json`, `environment.json`, and the
 row/batch summaries under `target/reports/cxr-current-tools/<batch-id>/`.
+Each gate also writes `repeat-summary.json`, aggregating train throughput,
+profile end-to-end throughput, loader throughput, data wait, GPU PSS, and
+cache-image PSS across repeats, plus mean-speedup comparisons against the raw
+PyTorch control row. The launcher treats missing profiler,
+provenance, summary-consistency, or smaps/PSS telemetry as a row failure; gate
+presets fail fast after the first invalid row.
 Use `--shuffle-block-batches N` as an opt-in locality experiment for medkit
 rows: it shuffles contiguous blocks of `N` native batches instead of individual
 sample indices, preserving longer stream reads while still changing epoch order.
@@ -172,6 +183,8 @@ train_loader = medkit.cxr.DataLoader(
     shuffle=True,
     drop_last=True,
 )
+
+print(train_loader.report_metadata())
 ```
 
 Batches use stable keys: `image`, `labels`, `mask`, and metadata sidecars such
@@ -181,6 +194,15 @@ stream reads, `prefetch_depth=2`, and `read_workers=4`. `preset="memory"` keeps
 stream reads with a shallow unpinned queue. For shuffled stream training,
 `shuffle_block_batches=N` can preserve local contiguous reads by shuffling
 native-batch blocks instead of individual samples.
+
+The examples under `examples/` use the same product surface:
+`cxr_dropin_pytorch_train.py` for plain PyTorch,
+`cxr_lightning_timm_datamodule.py` for Lightning/timm,
+`cxr_torchxrayvision_wrapper.py` for TorchXRayVision-style batches, and
+`cxr_monai_datalist_adapter.py` for MONAI datalist compatibility. The medkit
+loader uses `num_workers=0` intentionally; Rust-native prefetch threads own the
+background work, so passing PyTorch worker processes is rejected with a clear
+error.
 
 Free-threaded CPython builds such as `3.13t` and `3.14t` are not currently
 supported. The published wheels target normal CPython, and the optimized CXR

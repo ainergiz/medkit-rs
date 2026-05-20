@@ -21,18 +21,19 @@ def main() -> int:
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--split", default="train")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--preset", choices=("speed", "memory"), default="speed")
     parser.add_argument("--max-batches", type=int, default=1)
     parser.add_argument("--weights", default="densenet121-res224-all")
     parser.add_argument("--run-model", action="store_true")
     args = parser.parse_args()
 
-    dataset = medkit.cxr.Dataset(cache_dir=args.cache_dir, split=args.split)
+    dataset = medkit.cxr.Dataset(cache_dir=args.cache_dir, split=args.split, preset=args.preset)
     loader = medkit.cxr.DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=args.split == "train",
-        pin_memory=torch.cuda.is_available(),
-        prefetch=True,
+        pin_memory=torch.cuda.is_available() if args.preset == "speed" else None,
+        drop_last=False,
     )
 
     pathologies = list(dataset.targets)
@@ -58,6 +59,7 @@ def main() -> int:
             "mask_shape": list(batch["mask"].shape),
             "pathologies": pathologies,
             "missing_pathologies": batch["missing_pathologies"],
+            "loader_metadata": loader.report_metadata(),
         }
         if model is not None:
             with torch.no_grad():

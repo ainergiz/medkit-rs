@@ -17,18 +17,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--preset", choices=("speed", "memory"), default="speed")
+    parser.add_argument("--drop-last", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--shuffle-block-batches", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
-    parser.add_argument("--prefetch-depth", type=int, default=1)
-    parser.add_argument("--read-workers", type=int, default=1)
+    parser.add_argument("--prefetch-depth", type=int)
+    parser.add_argument("--read-workers", type=int)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", type=Path, default=Path("cxr-dropin-report.json"))
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    train_loader = make_loader(args, split="train", shuffle=True, pin_memory=device.type == "cuda")
-    val_loader = make_loader(args, split="val", shuffle=False, pin_memory=device.type == "cuda")
+    pin_memory = device.type == "cuda" if args.preset == "speed" else None
+    train_loader = make_loader(args, split="train", shuffle=True, pin_memory=pin_memory)
+    val_loader = make_loader(args, split="val", shuffle=False, pin_memory=pin_memory)
     targets = train_loader.dataset.targets
 
     model = torchvision.models.densenet121(weights=None)
@@ -74,19 +78,21 @@ def main() -> int:
     return 0
 
 
-def make_loader(args: argparse.Namespace, *, split: str, shuffle: bool, pin_memory: bool):
+def make_loader(args: argparse.Namespace, *, split: str, shuffle: bool, pin_memory: bool | None):
     dataset = medkit.cxr.Dataset(
         cache_dir=args.cache_dir,
         split=split,
+        preset=args.preset,
     )
     return medkit.cxr.DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=shuffle,
         pin_memory=pin_memory,
-        prefetch=True,
         prefetch_depth=args.prefetch_depth,
         read_workers=args.read_workers,
+        drop_last=args.drop_last if split == "train" else False,
+        shuffle_block_batches=args.shuffle_block_batches if split == "train" else 0,
     )
 
 

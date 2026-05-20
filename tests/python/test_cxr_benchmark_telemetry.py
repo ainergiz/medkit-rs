@@ -399,10 +399,18 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
     assert h100_args.profile_batches == 128
     assert h100_args.shuffle_block_batches == 0
     assert h100_args.gpu_prefetch_batches == 0
-    assert h100_run_ids == [
-        "repeat-h100-pytorch-raw-float32-mmap",
-        "repeat-h100-medkit-native-prefetch-pinned-float32-stream",
-        "repeat-h100-medkit-native-prefetch-pinned-uint8-stream",
+    assert h100_args.repeats == 3
+    assert h100_args.fail_fast is True
+    assert len(h100_rows) == 9
+    assert h100_run_ids[:3] == [
+        "repeat-h100-r01-pytorch-raw-float32-mmap",
+        "repeat-h100-r01-medkit-native-prefetch-pinned-float32-stream",
+        "repeat-h100-r01-medkit-native-prefetch-pinned-uint8-stream",
+    ]
+    assert h100_run_ids[-3:] == [
+        "repeat-h100-r03-pytorch-raw-float32-mmap",
+        "repeat-h100-r03-medkit-native-prefetch-pinned-float32-stream",
+        "repeat-h100-r03-medkit-native-prefetch-pinned-uint8-stream",
     ]
     assert {
         row.baseline for row in h100_rows
@@ -426,6 +434,8 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
             "8",
             "--gpu-prefetch-batches",
             "2",
+            "--repeats",
+            "1",
         ]
     )
     l4_rows = matrix.rows_for_args(l4_args)
@@ -436,6 +446,7 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
     assert l4_args.profile_batches == 64
     assert l4_args.shuffle_block_batches == 8
     assert l4_args.gpu_prefetch_batches == 2
+    assert l4_args.repeats == 1
     assert [matrix.run_id_for("repeat-l4", row) for row in l4_rows] == [
         "repeat-l4-pytorch-raw-float32-mmap",
         "repeat-l4-medkit-native-prefetch-pinned-float32-stream",
@@ -484,10 +495,10 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
     gpu_row = {
         "status": "ok",
         "samples_per_second": 222.222,
-        "memory": {},
+        "memory": _memory_report(),
         **profile_summary,
     }
-    loader_row = {"status": "ok", "samples_per_second": 111.111, "memory": {}}
+    loader_row = {"status": "ok", "samples_per_second": 111.111, "memory": _memory_report()}
     environment = {
         "run_metadata": {
             "run_id": run_id,
@@ -581,3 +592,93 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
     )
 
     assert any("summary-consistency status" in error for error in errors)
+
+
+def test_matrix_repeat_summary_aggregates_three_repeat_metrics():
+    matrix = load_matrix_module()
+    results = []
+    for repeat_index, samples_per_second in enumerate([350.0, 360.0, 370.0]):
+        baseline = "medkit_native_prefetch_pinned"
+        results.append(
+            {
+                "run_id": f"batch-r0{repeat_index + 1}-medkit-native-prefetch-pinned-float32-stream",
+                "status": "ok",
+                "baseline": baseline,
+                "cache_dtype": "float32",
+                "read_mode": "stream",
+                "repeat_index": repeat_index,
+                "repeat_count": 3,
+                "gpu": {
+                    baseline: {
+                        "samples_per_second": samples_per_second,
+                        "data_wait_percent": 0.25,
+                        "memory": {
+                            **_memory_report(),
+                            "smaps_pss_mb": 5700.0 + repeat_index,
+                            "smaps_pss_cache_images_mb": 0.0,
+                        },
+                    }
+                },
+                "loader": {baseline: {"samples_per_second": 5000.0 + repeat_index}},
+                "profile": {
+                    baseline: {
+                        "summary": {
+                            "profile_end_to_end_samples_per_s": samples_per_second - 1.0
+                        }
+                    }
+                },
+            }
+        )
+        results.append(
+            {
+                "run_id": f"batch-r0{repeat_index + 1}-pytorch-raw-float32-mmap",
+                "status": "ok",
+                "baseline": "pytorch_raw",
+                "cache_dtype": "float32",
+                "read_mode": "mmap",
+                "repeat_index": repeat_index,
+                "repeat_count": 3,
+                "gpu": {
+                    "pytorch_raw": {
+                        "samples_per_second": 180.0,
+                        "data_wait_percent": 1.0,
+                        "memory": _memory_report(),
+                    }
+                },
+                "loader": {"pytorch_raw": {"samples_per_second": 1000.0}},
+                "profile": {
+                    "pytorch_raw": {
+                        "summary": {
+                            "profile_end_to_end_samples_per_s": 179.0
+                        }
+                    }
+                },
+            }
+        )
+
+    summary = matrix.summarize_repeats(results, running=[], pending=[])
+    group = summary["groups"]["medkit_native_prefetch_pinned:float32:stream"]
+    comparison = summary["comparisons"][
+        "medkit_native_prefetch_pinned:float32:stream:vs:pytorch_raw:float32:mmap"
+    ]
+
+    assert summary["status"] == "ok"
+    assert group["status"] == "ok"
+    assert group["expected_repeats"] == 3
+    assert group["ok_repeats"] == 3
+    assert group["metrics"]["train_samples_per_second"]["mean"] == 360.0
+    assert group["metrics"]["profile_end_to_end_samples_per_second"]["count"] == 3
+    assert comparison["train_samples_per_second_speedup"] == 2.0
+
+
+def _memory_report() -> dict[str, object]:
+    return {
+        "psutil_pss_mb": 100.0,
+        "psutil_uss_mb": 90.0,
+        "smaps_pss_mb": 100.0,
+        "smaps_uss_mb": 90.0,
+        "smaps_pss_file_mb": 10.0,
+        "smaps_pss_anon_mb": 80.0,
+        "smaps_pss_cache_images_mb": 0.0,
+        "sources": ["resource.getrusage", "psutil.Process.memory_full_info", "/proc/self/smaps"],
+    }
