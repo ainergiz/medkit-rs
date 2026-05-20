@@ -161,6 +161,16 @@ def main() -> int:
             "direct per-step H2D copy path."
         ),
     )
+    parser.add_argument(
+        "--sync-every-step",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Synchronize CUDA after every train step for deterministic step timing. "
+            "Disable to measure a realistic asynchronous training loop; profiling "
+            "still forces synchronization."
+        ),
+    )
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
     parser.add_argument("--include-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
@@ -267,6 +277,7 @@ def main() -> int:
         "prefetch_read_workers": args.prefetch_read_workers,
         "shuffle_block_batches": args.shuffle_block_batches,
         "gpu_prefetch_batches": args.gpu_prefetch_batches,
+        "sync_every_step": args.sync_every_step,
         "profile_batches": args.profile_batches,
         "read_mode": args.read_mode,
         "include_metadata": args.include_metadata,
@@ -1271,6 +1282,7 @@ def run_all_baselines(
                 warmup_batches=args.warmup_batches,
                 profile_batches=args.profile_batches,
                 gpu_prefetch_batches=args.gpu_prefetch_batches,
+                sync_every_step=args.sync_every_step,
                 loss_pos_weight_values=loss_pos_weight_values,
                 loss_pos_weight_mode=args.loss_pos_weight,
                 seed=args.seed,
@@ -2188,6 +2200,7 @@ def train_and_evaluate(
     warmup_batches: int,
     profile_batches: int,
     gpu_prefetch_batches: int,
+    sync_every_step: bool,
     loss_pos_weight_values: Sequence[float] | None,
     loss_pos_weight_mode: str,
     seed: int,
@@ -2206,6 +2219,7 @@ def train_and_evaluate(
     h2d_timing_mode = (
         H2D_TIMING_CUDA_PREFETCH_STREAM if gpu_prefetch_active else H2D_TIMING_DIRECT_COPY
     )
+    sync_every_step_effective = sync_every_step or profile_batches > 0
     if warmup_batches > 0:
         run_warmup_steps(
             torch=torch,
@@ -2222,6 +2236,7 @@ def train_and_evaluate(
             torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
     losses: list[float] = []
+    deferred_losses: list[Any] = []
     data_wait_seconds = 0.0
     step_seconds = 0.0
     h2d_bytes = 0
@@ -2349,11 +2364,15 @@ def train_and_evaluate(
             optimizer_wall_ms = (time.perf_counter() - optimizer_wall_start) * 1000.0
             if prefetcher is not None:
                 prefetcher.fill()
-            if device.type == "cuda":
+            if device.type == "cuda" and sync_every_step_effective:
                 torch.cuda.synchronize(device)
             step_elapsed = time.perf_counter() - step_start
             step_seconds += step_elapsed
-            losses.append(float(loss.detach().cpu().item()))
+            detached_loss = loss.detach()
+            if device.type == "cuda" and not sync_every_step_effective:
+                deferred_losses.append(detached_loss)
+            else:
+                losses.append(float(detached_loss.cpu().item()))
             samples += batch_samples
             if profile_this_batch:
                 if cuda_profile:
@@ -2391,6 +2410,9 @@ def train_and_evaluate(
                 break
         if max_train_batches > 0 and batches >= max_train_batches:
             break
+    if device.type == "cuda" and not sync_every_step_effective:
+        torch.cuda.synchronize(device)
+        losses.extend(float(loss.cpu().item()) for loss in deferred_losses)
     total_seconds = time.perf_counter() - train_start
     y_true, y_score, y_mask = evaluate_model(
         torch=torch,
@@ -2416,6 +2438,8 @@ def train_and_evaluate(
         "drop_last_train": drop_last_train,
         "gpu_prefetch_batches": gpu_prefetch_batches,
         "gpu_prefetch_batches_active": gpu_prefetch_active,
+        "sync_every_step": sync_every_step,
+        "sync_every_step_effective": sync_every_step_effective,
         "loss_pos_weight": loss_pos_weight_mode,
         "loss_pos_weight_values": (
             [float(value) for value in loss_pos_weight_values]
@@ -3014,6 +3038,7 @@ def build_run_provenance(
         "prefetch_read_workers": run_metadata.get("prefetch_read_workers"),
         "shuffle_block_batches": run_metadata.get("shuffle_block_batches"),
         "gpu_prefetch_batches": run_metadata.get("gpu_prefetch_batches"),
+        "sync_every_step": run_metadata.get("sync_every_step"),
         "loss_pos_weight": run_metadata.get("loss_pos_weight"),
         "read_mode": run_metadata.get("read_mode"),
         "include_metadata": run_metadata.get("include_metadata"),
@@ -3162,6 +3187,7 @@ def run_summary_consistency_errors(
         "prefetch_read_workers",
         "shuffle_block_batches",
         "gpu_prefetch_batches",
+        "sync_every_step",
         "loss_pos_weight",
         "read_mode",
         "include_metadata",

@@ -54,6 +54,7 @@ GATE_PRESETS: dict[str, dict[str, Any]] = {
         "prefetch_read_workers": 4,
         "shuffle_block_batches": 0,
         "gpu_prefetch_batches": 0,
+        "sync_every_step": True,
         "read_modes": "stream",
         "include_metadata": False,
         "modal_gpu": "H100",
@@ -81,6 +82,7 @@ GATE_PRESETS: dict[str, dict[str, Any]] = {
         "prefetch_read_workers": 4,
         "shuffle_block_batches": 0,
         "gpu_prefetch_batches": 0,
+        "sync_every_step": True,
         "read_modes": "stream",
         "include_metadata": False,
         "modal_gpu": "L4",
@@ -108,6 +110,7 @@ GATE_PRESETS: dict[str, dict[str, Any]] = {
         "prefetch_read_workers": 4,
         "shuffle_block_batches": 0,
         "gpu_prefetch_batches": 0,
+        "sync_every_step": True,
         "loss_pos_weight": "balanced",
         "quality_gate": True,
         "quality_min_eval_samples": 900,
@@ -142,6 +145,7 @@ GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
     "prefetch_read_workers": ("--prefetch-read-workers",),
     "shuffle_block_batches": ("--shuffle-block-batches",),
     "gpu_prefetch_batches": ("--gpu-prefetch-batches",),
+    "sync_every_step": ("--sync-every-step", "--no-sync-every-step"),
     "loss_pos_weight": ("--loss-pos-weight",),
     "quality_gate": ("--quality-gate", "--no-quality-gate"),
     "quality_min_eval_samples": ("--quality-min-eval-samples",),
@@ -221,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-read-workers", type=int, default=1)
     parser.add_argument("--shuffle-block-batches", type=int, default=0)
     parser.add_argument("--gpu-prefetch-batches", type=int, default=0)
+    parser.add_argument("--sync-every-step", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--loss-pos-weight", choices=("none", "balanced"), default="none")
     parser.add_argument("--quality-gate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--quality-min-eval-samples", type=int, default=0)
@@ -456,6 +461,7 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         str(args.shuffle_block_batches),
         "--gpu-prefetch-batches",
         str(args.gpu_prefetch_batches),
+        "--sync-every-step" if args.sync_every_step else "--no-sync-every-step",
         "--loss-pos-weight",
         str(args.loss_pos_weight),
         "--quality-gate" if args.quality_gate else "--no-quality-gate",
@@ -1120,6 +1126,7 @@ def validate_summary_provenance_artifacts(
         "prefetch_read_workers",
         "shuffle_block_batches",
         "gpu_prefetch_batches",
+        "sync_every_step",
         "loss_pos_weight",
         "quality_gate",
         "quality_min_eval_samples",
@@ -1164,6 +1171,7 @@ def validate_summary_provenance_artifacts(
             "prefetch_read_workers",
             "shuffle_block_batches",
             "gpu_prefetch_batches",
+            "sync_every_step",
             "loss_pos_weight",
             "quality_gate",
             "quality_min_eval_samples",
