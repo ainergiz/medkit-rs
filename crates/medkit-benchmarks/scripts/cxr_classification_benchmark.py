@@ -1317,8 +1317,20 @@ def run_all_baselines(
     return reports
 
 
-def with_report_metadata(loader: Any, metadata: dict[str, Any]) -> Any:
-    loader.report_metadata = lambda metadata=metadata: dict(metadata)
+def with_report_metadata(
+    loader: Any,
+    metadata: dict[str, Any],
+    *,
+    dataset: Any | None = None,
+) -> Any:
+    if dataset is None:
+        loader.report_metadata = lambda metadata=metadata: dict(metadata)
+    else:
+        loader.report_metadata = (
+            lambda metadata=metadata, dataset=dataset: metadata_from_dataset_report(
+                dataset, metadata
+            )
+        )
     return loader
 
 
@@ -1563,7 +1575,7 @@ def make_loader_factory(
                     "native_prefetch": False,
                 },
             )
-            return with_report_metadata(loader, metadata)
+            return with_report_metadata(loader, metadata, dataset=dataset)
 
         return make_native_loader
     if baseline in {"medkit_native_prefetch", "medkit_native_prefetch_pinned"}:
@@ -1611,7 +1623,7 @@ def make_loader_factory(
                     "native_prefetch_threads": 1,
                 },
             )
-            return with_report_metadata(loader, metadata)
+            return with_report_metadata(loader, metadata, dataset=dataset)
 
         return make_native_prefetch_loader
     if baseline == "webdataset":
@@ -2188,7 +2200,16 @@ def benchmark_loader(loader: Any, *, max_batches: int, baseline: str) -> dict[st
         "batch_checksum": checksum,
     }
     if hasattr(loader, "report_metadata"):
-        report["pipeline"] = loader.report_metadata()
+        pipeline = loader.report_metadata()
+        report["pipeline"] = pipeline
+        report.update(
+            native_prefetch_timing_fields(
+                pipeline,
+                batches=batch_count,
+                elapsed_ms=elapsed * 1000.0,
+                prefix="loader",
+            )
+        )
     report["memory"] = memory_snapshot(
         pipeline=report.get("pipeline"),
         max_batch_tensor_bytes=max_batch_tensor_bytes,
@@ -2502,12 +2523,70 @@ def train_and_evaluate(
     if profile_report.get("status") == "ok":
         train_report.update(profile_report["summary"])
     if hasattr(train_loader, "report_metadata"):
-        train_report["pipeline"] = train_loader.report_metadata()
+        pipeline = train_loader.report_metadata()
+        train_report["pipeline"] = pipeline
+        train_report.update(
+            native_prefetch_timing_fields(
+                pipeline,
+                batches=batches,
+                elapsed_ms=train_report["train_ms"],
+                prefix="train",
+            )
+        )
     train_report["memory"] = memory_snapshot(
         pipeline=train_report.get("pipeline"),
         max_batch_tensor_bytes=max_batch_tensor_bytes,
     )
     return train_report, quality, thresholds, profile_report
+
+
+def native_prefetch_timing_fields(
+    pipeline: dict[str, Any] | None,
+    *,
+    batches: int,
+    elapsed_ms: float,
+    prefix: str,
+) -> dict[str, Any]:
+    if not isinstance(pipeline, dict):
+        return {}
+    stats = pipeline.get("native_prefetch_stats")
+    if not isinstance(stats, dict) or not stats:
+        return {}
+    stats_batches = _stats_float(stats, "batches")
+    indexed_batches = _stats_float(stats, "indexed_batches")
+    indexed_runs = _stats_float(stats, "indexed_runs")
+    read_ms = _stats_float(stats, "read_micros") / 1000.0
+    scatter_ms = _stats_float(stats, "scatter_micros") / 1000.0
+    read_scatter_ms = read_ms + scatter_ms
+    denominator = indexed_batches or stats_batches or float(batches)
+    output: dict[str, Any] = {
+        f"{prefix}_native_prefetch_batches": stats_batches,
+        f"{prefix}_native_prefetch_indexed_batches": indexed_batches,
+        f"{prefix}_native_prefetch_indexed_runs": indexed_runs,
+        f"{prefix}_native_prefetch_read_ms": read_ms,
+        f"{prefix}_native_prefetch_scatter_ms": scatter_ms,
+        f"{prefix}_native_prefetch_read_scatter_ms": read_scatter_ms,
+    }
+    if denominator > 0.0:
+        output[f"{prefix}_native_prefetch_runs_per_batch"] = indexed_runs / denominator
+        output[f"{prefix}_native_prefetch_read_ms_per_batch"] = read_ms / denominator
+        output[f"{prefix}_native_prefetch_scatter_ms_per_batch"] = scatter_ms / denominator
+        output[f"{prefix}_native_prefetch_read_scatter_ms_per_batch"] = (
+            read_scatter_ms / denominator
+        )
+    if elapsed_ms > 0.0:
+        output[f"{prefix}_native_prefetch_read_scatter_percent"] = (
+            100.0 * read_scatter_ms / elapsed_ms
+        )
+    return output
+
+
+def _stats_float(stats: dict[str, Any], field: str) -> float:
+    value = stats.get(field, 0.0)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def batch_sample_count(batch: dict[str, Any]) -> int:

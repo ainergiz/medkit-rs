@@ -406,6 +406,18 @@ class FakePrefetcher:
     def close(self) -> None:
         self.closed = True
 
+    def stats(self) -> dict[str, int]:
+        return {
+            "batches": 2,
+            "indexed_batches": 2,
+            "indexed_runs": 3,
+            "read_bytes": 1024,
+            "scatter_bytes": 2048,
+            "read_micros": 1200,
+            "scatter_micros": 800,
+            "read_workers": 2,
+        }
+
 
 def install_fake_native(monkeypatch: pytest.MonkeyPatch, ds: Any) -> None:
     native = types.SimpleNamespace(
@@ -595,6 +607,16 @@ def test_cxr_prefetch_iterable_batches_releases_and_worker_guard(
     assert prefetcher is not None
     assert prefetcher.released == [0, 0]
     assert prefetcher.closed is True
+    assert dataset.report_metadata()["native_prefetch_stats"] == {
+        "batches": 2,
+        "indexed_batches": 2,
+        "indexed_runs": 3,
+        "read_bytes": 1024,
+        "scatter_bytes": 2048,
+        "read_micros": 1200,
+        "scatter_micros": 800,
+        "read_workers": 2,
+    }
     assert dataset.__getstate__()["_handle"] is None
     assert FakeCxrCacheHandle.last_prefetch_kwargs is not None
     assert FakeCxrCacheHandle.last_prefetch_kwargs["include_metadata"] is True

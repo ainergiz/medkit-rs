@@ -502,6 +502,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         self._records = 0
         self._targets: list[str] = []
         self._image_shape = (0, 0, 0, 0)
+        self._last_prefetch_stats: dict[str, Any] = {}
         self._ensure_open()
 
     def __iter__(self):
@@ -534,6 +535,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
                 leased_slot, batch = ready
                 yield batch
         finally:
+            self._capture_prefetch_stats(prefetcher)
             if leased_slot is not None:
                 prefetcher.release(leased_slot)
             prefetcher.close()
@@ -554,7 +556,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
 
     def report_metadata(self) -> dict[str, Any]:
         iter_length = self._iter_length()
-        return {
+        report = {
             "dataset": "medkit_rs.dataset.MedkitCxrNativePrefetchDataset",
             "cache_dir": str(self.cache_dir),
             "split": self.split,
@@ -578,6 +580,20 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
             "targets": self.targets,
             "image_shape": list(self.image_shape),
         }
+        if self._last_prefetch_stats:
+            report["native_prefetch_stats"] = dict(self._last_prefetch_stats)
+        return report
+
+    def _capture_prefetch_stats(self, prefetcher: Any) -> None:
+        stats_fn = getattr(prefetcher, "stats", None)
+        if not callable(stats_fn):
+            return
+        try:
+            stats = stats_fn()
+        except Exception:
+            return
+        if isinstance(stats, dict):
+            self._last_prefetch_stats = dict(stats)
 
     def __getstate__(self) -> dict[str, Any]:
         state = dict(self.__dict__)

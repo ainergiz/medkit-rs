@@ -744,6 +744,26 @@ def repeat_metric_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "data_wait_percent": summarize_metric_values(
             extract_metric(result, "data_wait_percent") for result in results
         ),
+        "train_native_prefetch_read_ms_per_batch": summarize_metric_values(
+            extract_metric(result, "train_native_prefetch_read_ms_per_batch")
+            for result in results
+        ),
+        "train_native_prefetch_scatter_ms_per_batch": summarize_metric_values(
+            extract_metric(result, "train_native_prefetch_scatter_ms_per_batch")
+            for result in results
+        ),
+        "train_native_prefetch_read_scatter_ms_per_batch": summarize_metric_values(
+            extract_metric(result, "train_native_prefetch_read_scatter_ms_per_batch")
+            for result in results
+        ),
+        "train_native_prefetch_read_scatter_percent": summarize_metric_values(
+            extract_metric(result, "train_native_prefetch_read_scatter_percent")
+            for result in results
+        ),
+        "train_native_prefetch_runs_per_batch": summarize_metric_values(
+            extract_metric(result, "train_native_prefetch_runs_per_batch")
+            for result in results
+        ),
         "gpu_pss_mb": summarize_metric_values(extract_metric(result, "gpu_pss_mb") for result in results),
         "cache_image_pss_mb": summarize_metric_values(
             extract_metric(result, "cache_image_pss_mb") for result in results
@@ -809,6 +829,21 @@ def extract_metric(result: dict[str, Any], metric: str) -> float | None:
         ),
         "loader_samples_per_second": loader_row.get("samples_per_second"),
         "data_wait_percent": gpu_row.get("data_wait_percent"),
+        "train_native_prefetch_read_ms_per_batch": gpu_row.get(
+            "train_native_prefetch_read_ms_per_batch"
+        ),
+        "train_native_prefetch_scatter_ms_per_batch": gpu_row.get(
+            "train_native_prefetch_scatter_ms_per_batch"
+        ),
+        "train_native_prefetch_read_scatter_ms_per_batch": gpu_row.get(
+            "train_native_prefetch_read_scatter_ms_per_batch"
+        ),
+        "train_native_prefetch_read_scatter_percent": gpu_row.get(
+            "train_native_prefetch_read_scatter_percent"
+        ),
+        "train_native_prefetch_runs_per_batch": gpu_row.get(
+            "train_native_prefetch_runs_per_batch"
+        ),
         "gpu_pss_mb": memory.get("smaps_pss_mb"),
         "cache_image_pss_mb": memory.get("smaps_pss_cache_images_mb"),
     }

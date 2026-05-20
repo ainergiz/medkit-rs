@@ -613,6 +613,13 @@ def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_pa
             captured.update(kwargs)
             self.kwargs = kwargs
             self.shuffle_block_batches = kwargs["shuffle_block_batches"]
+            self.native_prefetch_stats = {
+                "batches": 2,
+                "indexed_batches": 2,
+                "indexed_runs": 5,
+                "read_micros": 1200,
+                "scatter_micros": 800,
+            }
 
         def report_metadata(self):
             return {
@@ -622,6 +629,7 @@ def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_pa
                 "shuffle_block_batches": self.kwargs["shuffle_block_batches"],
                 "prefetch_depth": self.kwargs["prefetch_depth"],
                 "prefetch_read_workers": self.kwargs["read_workers"],
+                "native_prefetch_stats": dict(self.native_prefetch_stats),
             }
 
     fake_torch = types.SimpleNamespace(
@@ -667,6 +675,34 @@ def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_pa
     assert loader.report_metadata()["shuffle_block_batches"] == 8
     assert loader.report_metadata()["worker_mode"] == "fake_actual_dataset_report"
     assert loader.report_metadata()["prefetch_read_workers"] == 4
+    assert loader.report_metadata()["native_prefetch_stats"]["indexed_runs"] == 5
+    loader.dataset.native_prefetch_stats["indexed_runs"] = 7
+    assert loader.report_metadata()["native_prefetch_stats"]["indexed_runs"] == 7
+
+
+def test_native_prefetch_timing_fields_summarize_pipeline_stats():
+    benchmark = load_benchmark_module()
+
+    fields = benchmark.native_prefetch_timing_fields(
+        {
+            "native_prefetch_stats": {
+                "batches": 4,
+                "indexed_batches": 4,
+                "indexed_runs": 12,
+                "read_micros": 8000,
+                "scatter_micros": 4000,
+            }
+        },
+        batches=4,
+        elapsed_ms=120.0,
+        prefix="train",
+    )
+
+    assert fields["train_native_prefetch_runs_per_batch"] == 3.0
+    assert fields["train_native_prefetch_read_ms_per_batch"] == 2.0
+    assert fields["train_native_prefetch_scatter_ms_per_batch"] == 1.0
+    assert fields["train_native_prefetch_read_scatter_ms_per_batch"] == 3.0
+    assert fields["train_native_prefetch_read_scatter_percent"] == 10.0
 
 
 def test_matrix_pipeline_validation_rejects_policy_drift():
@@ -859,6 +895,11 @@ def test_matrix_repeat_summary_aggregates_three_repeat_metrics():
                     baseline: {
                         "samples_per_second": samples_per_second,
                         "data_wait_percent": 0.25,
+                        "train_native_prefetch_read_ms_per_batch": 1.0 + repeat_index,
+                        "train_native_prefetch_scatter_ms_per_batch": 0.5,
+                        "train_native_prefetch_read_scatter_ms_per_batch": 1.5 + repeat_index,
+                        "train_native_prefetch_read_scatter_percent": 2.0 + repeat_index,
+                        "train_native_prefetch_runs_per_batch": 3.0,
                         "memory": {
                             **_memory_report(),
                             "smaps_pss_mb": 5700.0 + repeat_index,
@@ -914,6 +955,8 @@ def test_matrix_repeat_summary_aggregates_three_repeat_metrics():
     assert group["expected_repeats"] == 3
     assert group["ok_repeats"] == 3
     assert group["metrics"]["train_samples_per_second"]["mean"] == 360.0
+    assert group["metrics"]["train_native_prefetch_read_ms_per_batch"]["mean"] == 2.0
+    assert group["metrics"]["train_native_prefetch_runs_per_batch"]["mean"] == 3.0
     assert group["metrics"]["profile_end_to_end_samples_per_second"]["count"] == 3
     assert comparison["train_samples_per_second_speedup"] == 2.0
 
