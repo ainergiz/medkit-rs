@@ -23,6 +23,13 @@ MATRIX_PATH = (
     / "scripts"
     / "modal_cxr_parallel_matrix.py"
 )
+MODAL_CLASSIFICATION_PATH = (
+    REPO_ROOT
+    / "crates"
+    / "medkit-benchmarks"
+    / "scripts"
+    / "modal_cxr_classification.py"
+)
 
 
 def load_benchmark_module():
@@ -574,6 +581,14 @@ def test_matrix_modal_cli_command_can_be_overridden(monkeypatch):
     command = matrix.build_command(args, run_id=matrix.run_id_for("repeat-l4", row), row=row)
 
     assert command[:5] == ["uvx", "--python", "3.11", "modal", "run"]
+
+
+def test_modal_cxr_wrapper_exposes_sync_policy():
+    text = MODAL_CLASSIFICATION_PATH.read_text()
+
+    assert "sync_every_step: bool = True" in text
+    assert '"--sync-every-step" if sync_every_step else "--no-sync-every-step"' in text
+    assert "sync_every_step=sync_every_step" in text
 
 
 def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_path):
