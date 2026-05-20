@@ -87,6 +87,39 @@ GATE_PRESETS: dict[str, dict[str, Any]] = {
         "repeats": 3,
         "fail_fast": True,
     },
+    "l4-quality-224-b64": {
+        "baselines": RAW_MEDKIT_BASELINES,
+        "image_size": 224,
+        "cache_dtypes": "float32",
+        "batch_size": 64,
+        "workers": 8,
+        "max_samples": 6000,
+        "max_train": 4096,
+        "max_val": 1024,
+        "max_test": 1024,
+        "epochs": 2,
+        "loader_batches": 16,
+        "warmup_batches": 2,
+        "profile_batches": 0,
+        "drop_last_train": True,
+        "max_train_batches": 0,
+        "max_eval_batches": 0,
+        "prefetch_depth": 2,
+        "prefetch_read_workers": 4,
+        "shuffle_block_batches": 0,
+        "gpu_prefetch_batches": 0,
+        "loss_pos_weight": "balanced",
+        "quality_gate": True,
+        "quality_min_eval_samples": 900,
+        "quality_min_metric_targets": 3,
+        "quality_min_macro_auroc": 0.0,
+        "quality_min_macro_auprc": 0.0,
+        "read_modes": "stream",
+        "include_metadata": False,
+        "modal_gpu": "L4",
+        "repeats": 1,
+        "fail_fast": True,
+    },
 }
 GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
     "baselines": ("--baselines",),
@@ -109,6 +142,12 @@ GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
     "prefetch_read_workers": ("--prefetch-read-workers",),
     "shuffle_block_batches": ("--shuffle-block-batches",),
     "gpu_prefetch_batches": ("--gpu-prefetch-batches",),
+    "loss_pos_weight": ("--loss-pos-weight",),
+    "quality_gate": ("--quality-gate", "--no-quality-gate"),
+    "quality_min_eval_samples": ("--quality-min-eval-samples",),
+    "quality_min_metric_targets": ("--quality-min-metric-targets",),
+    "quality_min_macro_auroc": ("--quality-min-macro-auroc",),
+    "quality_min_macro_auprc": ("--quality-min-macro-auprc",),
     "read_modes": ("--read-modes", "--read-mode"),
     "include_metadata": ("--include-metadata", "--no-include-metadata"),
     "modal_gpu": ("--modal-gpu",),
@@ -182,6 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-read-workers", type=int, default=1)
     parser.add_argument("--shuffle-block-batches", type=int, default=0)
     parser.add_argument("--gpu-prefetch-batches", type=int, default=0)
+    parser.add_argument("--loss-pos-weight", choices=("none", "balanced"), default="none")
+    parser.add_argument("--quality-gate", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--quality-min-eval-samples", type=int, default=0)
+    parser.add_argument("--quality-min-metric-targets", type=int, default=0)
+    parser.add_argument("--quality-min-macro-auroc", type=float, default=0.0)
+    parser.add_argument("--quality-min-macro-auprc", type=float, default=0.0)
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
     parser.add_argument(
         "--read-modes",
@@ -411,6 +456,17 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         str(args.shuffle_block_batches),
         "--gpu-prefetch-batches",
         str(args.gpu_prefetch_batches),
+        "--loss-pos-weight",
+        str(args.loss_pos_weight),
+        "--quality-gate" if args.quality_gate else "--no-quality-gate",
+        "--quality-min-eval-samples",
+        str(args.quality_min_eval_samples),
+        "--quality-min-metric-targets",
+        str(args.quality_min_metric_targets),
+        "--quality-min-macro-auroc",
+        str(args.quality_min_macro_auroc),
+        "--quality-min-macro-auprc",
+        str(args.quality_min_macro_auprc),
         "--read-mode",
         row.read_mode,
         "--include-metadata" if args.include_metadata else "--no-include-metadata",
@@ -474,6 +530,7 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
     gpu = load_json_if_exists(row_dir / "gpu-throughput.json")
     profile = load_json_if_exists(row_dir / "step-profile.json")
     quality = load_json_if_exists(row_dir / "model-quality.json")
+    quality_gate = load_json_if_exists(row_dir / "quality-gate.json")
     environment = load_json_if_exists(row_dir / "environment.json")
     summary_consistency = load_json_if_exists(row_dir / "summary-consistency.json")
     elapsed = time.perf_counter() - active.started_at
@@ -486,6 +543,7 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
         gpu=gpu,
         profile=profile,
         quality=quality,
+        quality_gate=quality_gate,
         environment=environment,
         summary_consistency=summary_consistency,
     )
@@ -508,6 +566,7 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
         "gpu": gpu,
         "profile": profile,
         "quality": quality,
+        "quality_gate": quality_gate,
         "environment": environment,
         "summary_consistency": summary_consistency,
         "modal_status": modal_result.get("status") if modal_result else None,
@@ -787,10 +846,13 @@ def validate_row_artifacts(
     quality: dict[str, Any],
     environment: dict[str, Any],
     summary_consistency: dict[str, Any] | None = None,
+    quality_gate: dict[str, Any] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     baseline = active.row.baseline
+    quality_gate = quality_gate or {}
     summary_consistency = summary_consistency or {}
+    metadata = environment.get("run_metadata") or {}
 
     if returncode != 0:
         errors.append(f"modal command returned {returncode}")
@@ -804,6 +866,8 @@ def validate_row_artifacts(
         errors.append("missing gpu-throughput.json")
     if not environment:
         errors.append("missing environment.json")
+    if metadata and "quality_gate" in metadata and not quality_gate:
+        errors.append("missing quality-gate.json")
     if not summary_consistency:
         errors.append("missing summary-consistency.json")
     if modal_result and modal_result.get("status") != "ok":
@@ -847,6 +911,11 @@ def validate_row_artifacts(
         gpu_row = {}
     if quality and not isinstance(quality_row, dict):
         errors.append(f"model-quality missing baseline {baseline!r}")
+    if metadata.get("quality_gate") and quality_gate.get("status") != "ok":
+        errors.append(
+            f"quality-gate status is {quality_gate.get('status')!r}: "
+            + "; ".join(str(error) for error in quality_gate.get("errors", []))
+        )
 
     if loader_row.get("status") and loader_row.get("status") != "ok":
         errors.append(f"loader status is {loader_row.get('status')!r}")
@@ -867,7 +936,6 @@ def validate_row_artifacts(
         tolerance=1e-3,
     )
 
-    metadata = environment.get("run_metadata") or {}
     validate_profile_artifacts(
         errors=errors,
         context="profile",
@@ -1018,6 +1086,12 @@ def validate_summary_provenance_artifacts(
         "prefetch_read_workers",
         "shuffle_block_batches",
         "gpu_prefetch_batches",
+        "loss_pos_weight",
+        "quality_gate",
+        "quality_min_eval_samples",
+        "quality_min_metric_targets",
+        "quality_min_macro_auroc",
+        "quality_min_macro_auprc",
         "read_mode",
         "include_metadata",
         "profile_batches",
@@ -1056,6 +1130,12 @@ def validate_summary_provenance_artifacts(
             "prefetch_read_workers",
             "shuffle_block_batches",
             "gpu_prefetch_batches",
+            "loss_pos_weight",
+            "quality_gate",
+            "quality_min_eval_samples",
+            "quality_min_metric_targets",
+            "quality_min_macro_auroc",
+            "quality_min_macro_auprc",
             "profile_batches",
             "seed",
         ):

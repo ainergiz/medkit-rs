@@ -168,6 +168,22 @@ def main() -> int:
         default="pytorch_raw,monai_raw,medkit_cached_mmap,medkit_pinned_prefetch",
     )
     parser.add_argument("--uncertain", default="ignore")
+    parser.add_argument(
+        "--loss-pos-weight",
+        choices=("none", "balanced"),
+        default="none",
+        help="Use train-split positive class weights in BCE when set to balanced.",
+    )
+    parser.add_argument(
+        "--quality-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fail the run if quality coverage/metric requirements are not met.",
+    )
+    parser.add_argument("--quality-min-eval-samples", type=int, default=0)
+    parser.add_argument("--quality-min-metric-targets", type=int, default=0)
+    parser.add_argument("--quality-min-macro-auroc", type=float, default=0.0)
+    parser.add_argument("--quality-min-macro-auprc", type=float, default=0.0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--force-rematerialize", action="store_true")
@@ -227,6 +243,12 @@ def main() -> int:
         "targets": targets,
         "uncertain_policy": args.uncertain,
         "missing_policy": "mask_missing",
+        "loss_pos_weight": args.loss_pos_weight,
+        "quality_gate": args.quality_gate,
+        "quality_min_eval_samples": args.quality_min_eval_samples,
+        "quality_min_metric_targets": args.quality_min_metric_targets,
+        "quality_min_macro_auroc": args.quality_min_macro_auroc,
+        "quality_min_macro_auprc": args.quality_min_macro_auprc,
         "image_size": args.image_size,
         "cache_image_size": cache_size,
         "cache_dtype": args.cache_dtype,
@@ -297,8 +319,11 @@ def main() -> int:
     write_json(report_dir / "manifest-summary.json", manifest_summary)
 
     validation = validate_records(records, targets)
+    enforce_dataset_validation(validation)
     write_validation(report_dir / "validation.md", validation, run_metadata)
     write_json(report_dir / "split-audit.json", split_report | validation["split_audit"])
+    label_balance = label_balance_report(records, targets)
+    write_json(report_dir / "label-balance.json", label_balance)
 
     cache_start = time.perf_counter()
     cache_metadata_path = cache_dir / "cache-metadata.json"
@@ -367,6 +392,12 @@ def main() -> int:
         write_json(report_dir / "step-profile.json", reports["profile"])
     write_json(report_dir / "model-quality.json", reports["quality"])
     write_json(report_dir / "threshold-report.json", reports["thresholds"])
+    quality_gate = quality_gate_report(
+        quality=reports["quality"],
+        validation=validation,
+        run_metadata=run_metadata,
+    )
+    write_json(report_dir / "quality-gate.json", quality_gate)
     memory = memory_summary(reports)
     write_json(report_dir / "memory-summary.json", memory)
     write_json(report_dir / "subgroup-report.json", subgroup_report(records, reports["quality"]))
@@ -402,6 +433,7 @@ def main() -> int:
             for name, report in reports["quality"].items()
             if report.get("status") == "ok"
         },
+        "quality_gate": quality_gate,
         "profile": {
             name: report.get("summary")
             for name, report in reports["profile"].items()
@@ -425,6 +457,10 @@ def main() -> int:
         raise RuntimeError(
             "Run summary/provenance consistency failed: "
             + "; ".join(consistency["errors"])
+        )
+    if quality_gate["status"] == "failed":
+        raise RuntimeError(
+            "Quality gate failed: " + "; ".join(quality_gate.get("errors", []))
         )
     if args.out:
         write_json(args.out, summary)
@@ -652,6 +688,10 @@ def write_split_file(path: Path, records: Sequence[SampleRecord]) -> dict[str, A
         "counts": {name: len(values) for name, values in splits.items()},
         "patient_counts": {name: len(values) for name, values in patients.items()},
         "splits": splits,
+        "split_checksum": stable_hash(splits),
+        "patient_split_checksum": stable_hash(
+            {name: sorted(values) for name, values in patients.items()}
+        ),
     }
     write_json(path, report)
     return report
@@ -736,6 +776,75 @@ def validate_records(records: Sequence[SampleRecord], targets: Sequence[str]) ->
             ),
         },
     }
+
+
+def enforce_dataset_validation(validation: dict[str, Any]) -> None:
+    errors: list[str] = []
+    if validation.get("unreadable_images"):
+        errors.append(f"unreadable images: {len(validation['unreadable_images'])}")
+    if validation.get("missing_labels"):
+        errors.append(f"missing labels: {len(validation['missing_labels'])}")
+    split_audit = validation.get("split_audit") or {}
+    for field in (
+        "patient_overlap_count",
+        "study_overlap_count",
+        "duplicate_hash_overlap_count",
+    ):
+        count = int(split_audit.get(field) or 0)
+        if count:
+            errors.append(f"{field}: {count}")
+    if errors:
+        raise RuntimeError("CXR validation failed: " + "; ".join(errors))
+
+
+def label_balance_report(
+    records: Sequence[SampleRecord],
+    targets: Sequence[str],
+) -> dict[str, Any]:
+    by_split: dict[str, dict[str, Any]] = {}
+    for split in ("train", "val", "test"):
+        split_records = [record for record in records if record.split == split]
+        by_split[split] = {
+            "samples": len(split_records),
+            "targets": label_counts_for_records(split_records, targets),
+        }
+    return {
+        "status": "ok",
+        "targets": list(targets),
+        "splits": by_split,
+    }
+
+
+def label_counts_for_records(
+    records: Sequence[SampleRecord],
+    targets: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    counts: dict[str, dict[str, Any]] = {}
+    for target in targets:
+        positive = 0
+        negative = 0
+        missing = 0
+        uncertain = 0
+        for record in records:
+            value = record.labels.get(target)
+            if value == 1:
+                positive += 1
+            elif value == 0:
+                negative += 1
+            elif value == -1:
+                uncertain += 1
+            else:
+                missing += 1
+        valid = positive + negative
+        counts[target] = {
+            "positive": positive,
+            "negative": negative,
+            "uncertain": uncertain,
+            "missing": missing,
+            "valid": valid,
+            "prevalence": positive / valid if valid else None,
+        }
+    return counts
 
 
 def overlap_report(values_by_split: dict[str, set[str]]) -> dict[str, list[str]]:
@@ -1101,6 +1210,11 @@ def run_all_baselines(
     image_size: int,
     device: Any,
 ) -> dict[str, dict[str, Any]]:
+    loss_pos_weight_values = (
+        class_pos_weight_values(records, targets)
+        if args.loss_pos_weight == "balanced"
+        else None
+    )
     reports: dict[str, dict[str, Any]] = {
         "loader": {},
         "gpu": {},
@@ -1157,6 +1271,8 @@ def run_all_baselines(
                 warmup_batches=args.warmup_batches,
                 profile_batches=args.profile_batches,
                 gpu_prefetch_batches=args.gpu_prefetch_batches,
+                loss_pos_weight_values=loss_pos_weight_values,
+                loss_pos_weight_mode=args.loss_pos_weight,
                 seed=args.seed,
             )
             reports["gpu"][baseline] = train_report
@@ -2049,6 +2165,8 @@ def train_and_evaluate(
     warmup_batches: int,
     profile_batches: int,
     gpu_prefetch_batches: int,
+    loss_pos_weight_values: Sequence[float] | None,
+    loss_pos_weight_mode: str,
     seed: int,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     set_torch_seed(torch, seed)
@@ -2056,6 +2174,11 @@ def train_and_evaluate(
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4, weight_decay=1.0e-4)
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
     autocast_enabled = device.type == "cuda"
+    pos_weight = (
+        torch.tensor(list(loss_pos_weight_values), dtype=torch.float32, device=device)
+        if loss_pos_weight_values is not None
+        else None
+    )
     gpu_prefetch_active = device.type == "cuda" and gpu_prefetch_batches > 0
     h2d_timing_mode = (
         H2D_TIMING_CUDA_PREFETCH_STREAM if gpu_prefetch_active else H2D_TIMING_DIRECT_COPY
@@ -2070,6 +2193,7 @@ def train_and_evaluate(
             device=device,
             batches=warmup_batches,
             autocast_enabled=autocast_enabled,
+            pos_weight=pos_weight,
         )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -2175,6 +2299,7 @@ def train_and_evaluate(
                     logits,
                     labels,
                     reduction="none",
+                    pos_weight=pos_weight,
                 )
                 loss = (raw_loss * mask).sum() / mask.sum().clamp_min(1.0)
             if cuda_profile:
@@ -2268,6 +2393,12 @@ def train_and_evaluate(
         "drop_last_train": drop_last_train,
         "gpu_prefetch_batches": gpu_prefetch_batches,
         "gpu_prefetch_batches_active": gpu_prefetch_active,
+        "loss_pos_weight": loss_pos_weight_mode,
+        "loss_pos_weight_values": (
+            [float(value) for value in loss_pos_weight_values]
+            if loss_pos_weight_values is not None
+            else None
+        ),
         "h2d_timing_mode": h2d_timing_mode,
         "skipped_incomplete_batches": skipped_incomplete_batches,
         "skipped_incomplete_samples": skipped_incomplete_samples,
@@ -2314,6 +2445,25 @@ def should_skip_incomplete_train_batch(
     drop_last_train: bool,
 ) -> bool:
     return drop_last_train and batch_size > 0 and batch_samples != batch_size
+
+
+def class_pos_weight_values(
+    records: Sequence[SampleRecord],
+    targets: Sequence[str],
+) -> list[float]:
+    train_records = [record for record in records if record.split == "train"]
+    weights: list[float] = []
+    for target in targets:
+        positive = 0
+        negative = 0
+        for record in train_records:
+            value = record.labels.get(target)
+            if value == 1:
+                positive += 1
+            elif value == 0:
+                negative += 1
+        weights.append(float(negative / positive) if positive > 0 else 1.0)
+    return weights
 
 
 class CudaBatchPrefetcher:
@@ -2503,6 +2653,7 @@ def run_warmup_steps(
     device: Any,
     batches: int,
     autocast_enabled: bool,
+    pos_weight: Any | None = None,
 ) -> None:
     model.train()
     for batch_index, batch in enumerate(loader):
@@ -2516,6 +2667,7 @@ def run_warmup_steps(
                 logits,
                 labels,
                 reduction="none",
+                pos_weight=pos_weight,
             )
             loss = (raw_loss * mask).sum() / mask.sum().clamp_min(1.0)
         scaler.scale(loss).backward()
@@ -2627,7 +2779,103 @@ def metric_report(y_true: Any, y_score: Any, y_mask: Any, targets: Sequence[str]
         metrics["targets"][target] = target_report
     metrics["macro_auroc"] = sum(roc_values) / len(roc_values) if roc_values else None
     metrics["macro_auprc"] = sum(pr_values) / len(pr_values) if pr_values else None
+    metrics["metric_target_count"] = len(roc_values)
     return metrics
+
+
+def quality_gate_report(
+    *,
+    quality: dict[str, dict[str, Any]],
+    validation: dict[str, Any],
+    run_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    enabled = bool(run_metadata.get("quality_gate"))
+    min_eval_samples = int(run_metadata.get("quality_min_eval_samples") or 0)
+    min_metric_targets = int(run_metadata.get("quality_min_metric_targets") or 0)
+    min_macro_auroc = float(run_metadata.get("quality_min_macro_auroc") or 0.0)
+    min_macro_auprc = float(run_metadata.get("quality_min_macro_auprc") or 0.0)
+    split_audit = validation.get("split_audit") or {}
+    split_checks = {
+        "patient_overlap_count": int(split_audit.get("patient_overlap_count") or 0),
+        "study_overlap_count": int(split_audit.get("study_overlap_count") or 0),
+        "duplicate_hash_overlap_count": int(
+            split_audit.get("duplicate_hash_overlap_count") or 0
+        ),
+    }
+    for field, count in split_checks.items():
+        if count:
+            errors.append(f"{field} must be zero, got {count}")
+
+    baseline_checks: dict[str, Any] = {}
+    for baseline, report in quality.items():
+        if report.get("status") != "ok":
+            errors.append(f"{baseline} quality status is {report.get('status')!r}")
+            baseline_checks[baseline] = {"status": report.get("status"), "reason": report.get("reason")}
+            continue
+        samples = int(report.get("samples") or 0)
+        metric_target_count = int(report.get("metric_target_count") or 0)
+        macro_auroc = numeric_report_value(report.get("macro_auroc"))
+        macro_auprc = numeric_report_value(report.get("macro_auprc"))
+        check = {
+            "samples": samples,
+            "metric_target_count": metric_target_count,
+            "macro_auroc": macro_auroc,
+            "macro_auprc": macro_auprc,
+        }
+        baseline_checks[baseline] = check
+        if enabled or min_eval_samples > 0:
+            if samples < min_eval_samples:
+                errors.append(
+                    f"{baseline} eval samples {samples} < required {min_eval_samples}"
+                )
+        if enabled or min_metric_targets > 0:
+            if metric_target_count < min_metric_targets:
+                errors.append(
+                    f"{baseline} metric targets {metric_target_count} < required {min_metric_targets}"
+                )
+        if min_macro_auroc > 0.0:
+            if macro_auroc is None or macro_auroc < min_macro_auroc:
+                errors.append(
+                    f"{baseline} macro AUROC {macro_auroc} < required {min_macro_auroc}"
+                )
+        if min_macro_auprc > 0.0:
+            if macro_auprc is None or macro_auprc < min_macro_auprc:
+                errors.append(
+                    f"{baseline} macro AUPRC {macro_auprc} < required {min_macro_auprc}"
+                )
+        if not enabled and min_eval_samples <= 0 and min_metric_targets <= 0:
+            warnings.append(
+                f"{baseline} quality metrics recorded without enforcing coverage thresholds"
+            )
+
+    return {
+        "status": "failed" if errors else "ok" if enabled else "recorded",
+        "enabled": enabled,
+        "errors": errors,
+        "warnings": warnings,
+        "requirements": {
+            "min_eval_samples": min_eval_samples,
+            "min_metric_targets": min_metric_targets,
+            "min_macro_auroc": min_macro_auroc,
+            "min_macro_auprc": min_macro_auprc,
+        },
+        "split_safety": split_checks,
+        "baselines": baseline_checks,
+    }
+
+
+def numeric_report_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
 
 
 def threshold_report(y_true: Any, y_score: Any, y_mask: Any, targets: Sequence[str]) -> dict[str, Any]:
@@ -2743,8 +2991,14 @@ def build_run_provenance(
         "prefetch_read_workers": run_metadata.get("prefetch_read_workers"),
         "shuffle_block_batches": run_metadata.get("shuffle_block_batches"),
         "gpu_prefetch_batches": run_metadata.get("gpu_prefetch_batches"),
+        "loss_pos_weight": run_metadata.get("loss_pos_weight"),
         "read_mode": run_metadata.get("read_mode"),
         "include_metadata": run_metadata.get("include_metadata"),
+        "quality_gate": run_metadata.get("quality_gate"),
+        "quality_min_eval_samples": run_metadata.get("quality_min_eval_samples"),
+        "quality_min_metric_targets": run_metadata.get("quality_min_metric_targets"),
+        "quality_min_macro_auroc": run_metadata.get("quality_min_macro_auroc"),
+        "quality_min_macro_auprc": run_metadata.get("quality_min_macro_auprc"),
         "profile_batches": run_metadata.get("profile_batches"),
         "loader_batches": run_metadata.get("loader_batches"),
         "warmup_batches": run_metadata.get("warmup_batches"),
@@ -2885,8 +3139,14 @@ def run_summary_consistency_errors(
         "prefetch_read_workers",
         "shuffle_block_batches",
         "gpu_prefetch_batches",
+        "loss_pos_weight",
         "read_mode",
         "include_metadata",
+        "quality_gate",
+        "quality_min_eval_samples",
+        "quality_min_metric_targets",
+        "quality_min_macro_auroc",
+        "quality_min_macro_auprc",
         "profile_batches",
         "loader_batches",
         "warmup_batches",
@@ -2940,6 +3200,9 @@ def run_summary_consistency_errors(
         expected_quality,
     )
     expect_equal(errors, "summary.memory", summary.get("memory"), memory_summary(reports))
+    expected_quality_gate = summary.get("quality_gate")
+    if not isinstance(expected_quality_gate, dict):
+        errors.append("summary.quality_gate missing")
 
     requested_profile_batches = int(run_metadata.get("profile_batches") or 0)
     expected_profile = {

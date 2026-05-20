@@ -232,6 +232,86 @@ def test_patient_safe_split_assignment_preserves_manifest_schema(tmp_path):
     ) is None
 
 
+def test_split_report_records_reproducibility_checksums(tmp_path):
+    benchmark = load_benchmark_module()
+    records = [
+        benchmark.SampleRecord(
+            sample_id=f"sample-{index}",
+            patient_id=f"patient-{index}",
+            study_id=f"study-{index}",
+            image_id=f"image-{index}",
+            image_path=f"/tmp/image-{index}.png",
+            filename=f"{index:08d}_000.png",
+            source_split="hf_train_stream",
+            width=320,
+            height=320,
+            labels={"Pneumonia": index % 2},
+            split="train" if index < 2 else "val",
+            sha256=f"sha-{index}",
+        )
+        for index in range(3)
+    ]
+
+    report = benchmark.write_split_file(tmp_path / "splits.json", records)
+
+    assert report["split_checksum"]
+    assert report["patient_split_checksum"]
+    assert report["counts"] == {"train": 2, "val": 1, "test": 0}
+
+
+def test_quality_gate_and_balanced_loss_helpers_reject_weak_quality():
+    benchmark = load_benchmark_module()
+    records = [
+        benchmark.SampleRecord(
+            sample_id=f"sample-{index}",
+            patient_id=f"patient-{index}",
+            study_id=f"study-{index}",
+            image_id=f"image-{index}",
+            image_path=f"/tmp/image-{index}.png",
+            filename=f"{index:08d}_000.png",
+            source_split="hf_train_stream",
+            width=320,
+            height=320,
+            labels={"Pneumonia": 1 if index == 0 else 0},
+            split="train",
+            sha256=f"sha-{index}",
+        )
+        for index in range(4)
+    ]
+
+    assert benchmark.class_pos_weight_values(records, ["Pneumonia"]) == [3.0]
+
+    report = benchmark.quality_gate_report(
+        quality={
+            "pytorch_raw": {
+                "status": "ok",
+                "samples": 16,
+                "metric_target_count": 0,
+                "macro_auroc": None,
+                "macro_auprc": None,
+            }
+        },
+        validation={
+            "split_audit": {
+                "patient_overlap_count": 0,
+                "study_overlap_count": 0,
+                "duplicate_hash_overlap_count": 0,
+            }
+        },
+        run_metadata={
+            "quality_gate": True,
+            "quality_min_eval_samples": 32,
+            "quality_min_metric_targets": 1,
+            "quality_min_macro_auroc": 0.5,
+            "quality_min_macro_auprc": 0.1,
+        },
+    )
+
+    assert report["status"] == "failed"
+    assert any("eval samples" in error for error in report["errors"])
+    assert any("metric targets" in error for error in report["errors"])
+
+
 def test_profile_report_disabled_without_requested_batches():
     benchmark = load_benchmark_module()
 
@@ -263,6 +343,12 @@ def test_run_summary_consistency_accepts_matching_provenance_and_rejects_drift()
         "prefetch_read_workers": 4,
         "shuffle_block_batches": 0,
         "gpu_prefetch_batches": 0,
+        "loss_pos_weight": "none",
+        "quality_gate": False,
+        "quality_min_eval_samples": 0,
+        "quality_min_metric_targets": 0,
+        "quality_min_macro_auroc": 0.0,
+        "quality_min_macro_auprc": 0.0,
         "read_mode": "mmap",
         "include_metadata": False,
         "profile_batches": 2,
@@ -353,6 +439,7 @@ def test_run_summary_consistency_accepts_matching_provenance_and_rejects_drift()
         "loader_samples_per_second": {"pytorch_raw": 123.457},
         "train_samples_per_second": {"pytorch_raw": 234.568},
         "quality_macro_auroc": {"pytorch_raw": 0.91234},
+        "quality_gate": {"status": "recorded", "enabled": False, "errors": []},
         "profile": {"pytorch_raw": profile_summary},
         "memory": benchmark.memory_summary(reports),
         "provenance": provenance,
@@ -452,6 +539,27 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
         "repeat-l4-medkit-native-prefetch-pinned-float32-stream",
     ]
 
+    quality_args = matrix.parse_args(
+        ["--gate", "l4-quality-224-b64", "--batch-id", "quality-l4"]
+    )
+    quality_rows = matrix.rows_for_args(quality_args)
+
+    assert quality_args.modal_gpu == "L4"
+    assert quality_args.epochs == 2
+    assert quality_args.max_eval_batches == 0
+    assert quality_args.loss_pos_weight == "balanced"
+    assert quality_args.quality_gate is True
+    assert quality_args.quality_min_eval_samples == 900
+    assert quality_args.quality_min_metric_targets == 3
+    quality_command = matrix.build_command(
+        quality_args,
+        run_id=matrix.run_id_for("quality-l4", quality_rows[0]),
+        row=quality_rows[0],
+    )
+    assert "--quality-gate" in quality_command
+    assert "--loss-pos-weight" in quality_command
+    assert "balanced" in quality_command
+
 
 def test_matrix_modal_cli_command_can_be_overridden(monkeypatch):
     matrix = load_matrix_module()
@@ -513,6 +621,12 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
             "prefetch_read_workers": 4,
             "shuffle_block_batches": 0,
             "gpu_prefetch_batches": 0,
+            "loss_pos_weight": "none",
+            "quality_gate": False,
+            "quality_min_eval_samples": 0,
+            "quality_min_metric_targets": 0,
+            "quality_min_macro_auroc": 0.0,
+            "quality_min_macro_auprc": 0.0,
             "seed": 17,
         }
     }
@@ -536,6 +650,12 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
             "prefetch_read_workers": 4,
             "shuffle_block_batches": 0,
             "gpu_prefetch_batches": 0,
+            "loss_pos_weight": "none",
+            "quality_gate": False,
+            "quality_min_eval_samples": 0,
+            "quality_min_metric_targets": 0,
+            "quality_min_macro_auroc": 0.0,
+            "quality_min_macro_auprc": 0.0,
             "read_mode": "mmap",
             "include_metadata": False,
             "profile_batches": 20,
@@ -571,6 +691,7 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
         gpu={baseline: gpu_row},
         profile=profile,
         quality={baseline: {"status": "ok"}},
+        quality_gate={"status": "recorded", "enabled": False, "errors": []},
         environment=environment,
         summary_consistency=summary_consistency,
     )
@@ -587,6 +708,7 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
         gpu={baseline: gpu_row},
         profile=profile,
         quality={baseline: {"status": "ok"}},
+        quality_gate={"status": "failed", "enabled": True, "errors": ["drift"]},
         environment=environment,
         summary_consistency=bad_consistency,
     )

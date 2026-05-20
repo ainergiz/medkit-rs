@@ -152,6 +152,22 @@ CPU pinned batches copied ahead on a dedicated CUDA stream while the model step
 runs. The gate presets leave this at `0` until repeat evidence justifies
 promoting it.
 
+Run the L4 quality gate when the question is training behavior rather than
+loader speed:
+
+```bash
+MEDKIT_MODAL_USE_PYPI=0 \
+MEDKIT_MODAL_CLI="uvx --python 3.11 modal" \
+python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
+  --gate l4-quality-224-b64 \
+  --batch-id cxr-quality-l4-224-b64-$(date -u +%Y%m%d-%H%M)
+```
+
+The quality gate uses full validation evaluation, balanced positive-class BCE,
+patient/study/hash leakage checks, reproducible split checksums, and writes
+`model-quality.json`, `threshold-report.json`, `quality-gate.json`,
+`label-balance.json`, and `split-audit.json`.
+
 ## DICOM Decoder Policy
 
 The default DICOM pixel backend is `medkit-native`. It keeps normal builds
