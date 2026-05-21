@@ -566,7 +566,9 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
     assert quality_args.loss_pos_weight == "balanced"
     assert quality_args.quality_gate is True
     assert quality_args.quality_min_eval_samples == 900
-    assert quality_args.quality_min_metric_targets == 3
+    assert quality_args.quality_min_metric_targets == 5
+    assert quality_args.quality_min_macro_auroc == 0.55
+    assert quality_args.quality_min_macro_auprc == 0.10
     quality_command = matrix.build_command(
         quality_args,
         run_id=matrix.run_id_for("quality-l4", quality_rows[0]),
