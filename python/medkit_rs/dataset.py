@@ -345,7 +345,12 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         index = start
         buffer = handle.allocate_cxr_batch(self.batch_size, pin_memory=self.pin_memory)
         if self.shuffle:
-            order = self._sample_order(sample_length)
+            order_length = (
+                iter_length
+                if self.drop_last and self.shuffle_block_batches > 0
+                else sample_length
+            )
+            order = self._sample_order(order_length)
             while index < iter_length:
                 indices = order[index : index + self.batch_size]
                 yield handle.fill_cxr_indices_buffer(
@@ -603,7 +608,10 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
     def _batch_indices(self) -> list[list[int]]:
         length = len(self)
         iter_length = self._iter_length()
-        order = self._sample_order(length)
+        order_length = (
+            iter_length if self.drop_last and self.shuffle_block_batches > 0 else length
+        )
+        order = self._sample_order(order_length)
         return [
             order[index : index + self.batch_size]
             for index in range(0, iter_length, self.batch_size)

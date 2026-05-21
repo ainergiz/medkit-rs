@@ -594,6 +594,19 @@ def test_cxr_prefetch_iterable_batches_releases_and_worker_guard(
         tmp_path, length=3, batch_size=2, drop_last=True
     )
     assert drop_last._batch_indices() == [[0, 1]]
+    FakeCxrCacheHandle.records = 5
+    block_drop_last = ds.MedkitCxrNativePrefetchDataset(
+        tmp_path,
+        length=5,
+        batch_size=2,
+        shuffle=True,
+        seed=7,
+        drop_last=True,
+        shuffle_block_batches=1,
+    )
+    block_batches = block_drop_last._batch_indices()
+    assert block_batches in ([[0, 1], [2, 3]], [[2, 3], [0, 1]])
+    FakeCxrCacheHandle.records = 4
     drop_last_report = drop_last.report_metadata()
     assert drop_last_report["drop_last"] is True
     assert drop_last_report["prefetch"] is True

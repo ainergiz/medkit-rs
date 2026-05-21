@@ -659,6 +659,7 @@ def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_pa
         shuffle_block_batches=8,
         read_mode="stream",
         include_metadata=True,
+        drop_last_train=True,
         seed=17,
     )
 
@@ -672,6 +673,7 @@ def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_pa
     assert captured["prefetch_depth"] == 2
     assert captured["read_workers"] == 4
     assert captured["include_metadata"] is True
+    assert captured["drop_last"] is True
     assert loader.report_metadata()["shuffle_block_batches"] == 8
     assert loader.report_metadata()["worker_mode"] == "fake_actual_dataset_report"
     assert loader.report_metadata()["prefetch_read_workers"] == 4

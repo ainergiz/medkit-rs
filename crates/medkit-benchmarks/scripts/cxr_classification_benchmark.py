@@ -1260,6 +1260,7 @@ def run_all_baselines(
                 shuffle_block_batches=args.shuffle_block_batches,
                 read_mode=args.read_mode,
                 include_metadata=args.include_metadata,
+                drop_last_train=args.drop_last_train,
                 seed=args.seed,
             )
         except Exception as error:
@@ -1369,11 +1370,16 @@ def make_loader_factory(
     shuffle_block_batches: int,
     read_mode: str,
     include_metadata: bool,
+    drop_last_train: bool,
     seed: int,
 ) -> Any:
     torch = import_torch()
     numpy = import_numpy()
     mean, std = cache_normalization(cache_dir)
+
+    def drop_last_for_split(split: str) -> bool:
+        return bool(drop_last_train and split == "train")
+
     if baseline == "pytorch_raw":
         dataset_by_split = {
             split: RawCxrDataset(
@@ -1393,6 +1399,7 @@ def make_loader_factory(
             num_workers=workers,
             pin_memory=False,
             persistent_workers=workers > 0,
+            drop_last=drop_last_for_split(split),
         )
     if baseline == "monai_raw":
         monai = import_monai()
@@ -1420,6 +1427,7 @@ def make_loader_factory(
             num_workers=workers,
             pin_memory=False,
             persistent_workers=workers > 0,
+            drop_last=drop_last_for_split(split),
         )
     if baseline == "torchxrayvision":
         xrv = import_torchxrayvision()
@@ -1446,6 +1454,7 @@ def make_loader_factory(
             num_workers=workers,
             pin_memory=False,
             persistent_workers=workers > 0,
+            drop_last=drop_last_for_split(split),
         )
     if baseline in {"medkit_cached_mmap", "medkit_pinned_prefetch", "medkit_cached_resident"}:
         resident = baseline == "medkit_cached_resident"
@@ -1469,6 +1478,7 @@ def make_loader_factory(
                 num_workers=0 if resident else workers,
                 pin_memory=pin_memory,
                 persistent_workers=(not resident and workers > 0),
+                drop_last=drop_last_for_split(split),
             )
             return with_report_metadata(
                 loader,
@@ -1497,6 +1507,7 @@ def make_loader_factory(
                 read_mode=read_mode,
                 include_metadata=include_metadata,
                 shuffle_block_batches=shuffle_block_batches,
+                drop_last=drop_last_for_split(split),
             )
             loader = medkit_rs.cxr.DataLoader(
                 dataset,
@@ -1510,6 +1521,7 @@ def make_loader_factory(
                 read_mode=read_mode,
                 include_metadata=include_metadata,
                 shuffle_block_batches=shuffle_block_batches,
+                drop_last=drop_last_for_split(split),
             )
             return with_report_metadata(
                 loader,
@@ -1550,6 +1562,7 @@ def make_loader_factory(
                 read_mode=read_mode,
                 include_metadata=include_metadata,
                 shuffle_block_batches=shuffle_block_batches,
+                drop_last=drop_last_for_split(split),
             )
             loader = torch.utils.data.DataLoader(
                 dataset,
@@ -1595,6 +1608,7 @@ def make_loader_factory(
                 read_mode=read_mode,
                 include_metadata=include_metadata,
                 shuffle_block_batches=shuffle_block_batches,
+                drop_last=drop_last_for_split(split),
             )
             loader = torch.utils.data.DataLoader(
                 dataset,
@@ -1644,6 +1658,7 @@ def make_loader_factory(
                 num_workers=workers,
                 pin_memory=False,
                 persistent_workers=workers > 0,
+                drop_last=drop_last_for_split(split),
             )
 
         return make_webdataset_loader
