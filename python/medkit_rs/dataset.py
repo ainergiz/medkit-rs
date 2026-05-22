@@ -7,7 +7,7 @@ import ctypes
 import sys
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -307,6 +307,7 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         include_metadata: bool = False,
         drop_last: bool = False,
         shuffle_block_batches: int = 0,
+        batch_indices_by_iteration: Sequence[Sequence[Sequence[int]]] | None = None,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
@@ -324,6 +325,10 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         self.include_metadata = include_metadata
         self.drop_last = drop_last
         self.shuffle_block_batches = shuffle_block_batches
+        self.batch_indices_by_iteration = _normalize_cxr_batch_indices_by_iteration(
+            batch_indices_by_iteration
+        )
+        self._batch_indices_iteration = 0
         self._handle = None
         self._records = 0
         self._targets: list[str] = []
@@ -340,10 +345,22 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
             start = 0
             step = self.batch_size
         else:
+            if self.batch_indices_by_iteration is not None:
+                raise RuntimeError(
+                    "fixed CXR batch schedules require num_workers=0 because the "
+                    "schedule is already partitioned into global batches"
+                )
             start = worker.id * self.batch_size
             step = worker.num_workers * self.batch_size
         index = start
         buffer = handle.allocate_cxr_batch(self.batch_size, pin_memory=self.pin_memory)
+        if self.batch_indices_by_iteration is not None:
+            batches = self._scheduled_batch_indices()
+            for indices in batches:
+                yield handle.fill_cxr_indices_buffer(
+                    buffer, list(indices), include_metadata=self.include_metadata
+                )
+            return
         if self.shuffle:
             order_length = (
                 iter_length
@@ -389,6 +406,7 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
 
     def report_metadata(self) -> dict[str, Any]:
         iter_length = self._iter_length()
+        scheduled_samples = self._scheduled_sample_count()
         return {
             "dataset": "medkit_rs.dataset.MedkitCxrNativeBatchIterableDataset",
             "cache_dir": str(self.cache_dir),
@@ -404,12 +422,24 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
             "include_metadata": self.include_metadata,
             "drop_last": self.drop_last,
             "shuffle_block_batches": self.shuffle_block_batches,
+            "batch_schedule": (
+                "fixed_by_iteration" if self.batch_indices_by_iteration is not None else "generated"
+            ),
+            "batch_schedule_iterations": (
+                len(self.batch_indices_by_iteration)
+                if self.batch_indices_by_iteration is not None
+                else 0
+            ),
             "worker_mode": "single_process",
             "num_workers": 0,
             "num_samples": len(self),
-            "yielded_samples": iter_length,
-            "dropped_samples": len(self) - iter_length,
-            "num_batches": self._num_batches(),
+            "yielded_samples": scheduled_samples if scheduled_samples is not None else iter_length,
+            "dropped_samples": (
+                len(self) - scheduled_samples
+                if scheduled_samples is not None
+                else len(self) - iter_length
+            ),
+            "num_batches": self._scheduled_batch_count() or self._num_batches(),
             "targets": self.targets,
             "image_shape": list(self.image_shape),
         }
@@ -441,6 +471,40 @@ class MedkitCxrNativeBatchIterableDataset(_IterableDatasetBase):
         blocks = [order[start : start + block_size] for start in range(0, length, block_size)]
         rng.shuffle(blocks)
         return [index for block in blocks for index in block]
+
+    def _scheduled_batch_indices(self) -> list[list[int]]:
+        if self.batch_indices_by_iteration is None:
+            raise RuntimeError("fixed CXR batch schedule is not configured")
+        index = self._batch_indices_iteration
+        if index >= len(self.batch_indices_by_iteration):
+            raise RuntimeError(
+                "fixed CXR batch schedule exhausted: "
+                f"requested iterator {index}, available {len(self.batch_indices_by_iteration)}"
+            )
+        self._batch_indices_iteration += 1
+        batches = [list(batch) for batch in self.batch_indices_by_iteration[index]]
+        self._validate_scheduled_batches(batches)
+        return batches
+
+    def _validate_scheduled_batches(self, batches: list[list[int]]) -> None:
+        length = len(self)
+        for batch in batches:
+            if len(batch) > self.batch_size:
+                raise ValueError("fixed CXR batch schedule contains a batch larger than batch_size")
+            if any(index >= length for index in batch):
+                raise ValueError("fixed CXR batch schedule contains an index outside the split")
+
+    def _scheduled_batch_count(self) -> int | None:
+        if not self.batch_indices_by_iteration:
+            return None
+        index = min(self._batch_indices_iteration, len(self.batch_indices_by_iteration) - 1)
+        return len(self.batch_indices_by_iteration[index])
+
+    def _scheduled_sample_count(self) -> int | None:
+        if not self.batch_indices_by_iteration:
+            return None
+        index = min(self._batch_indices_iteration, len(self.batch_indices_by_iteration) - 1)
+        return sum(len(batch) for batch in self.batch_indices_by_iteration[index])
 
     def _ensure_open(self):
         if self._handle is not None:
@@ -480,6 +544,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         include_metadata: bool = False,
         drop_last: bool = False,
         shuffle_block_batches: int = 0,
+        batch_indices_by_iteration: Sequence[Sequence[Sequence[int]]] | None = None,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
@@ -503,6 +568,10 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         self.include_metadata = include_metadata
         self.drop_last = drop_last
         self.shuffle_block_batches = shuffle_block_batches
+        self.batch_indices_by_iteration = _normalize_cxr_batch_indices_by_iteration(
+            batch_indices_by_iteration
+        )
+        self._batch_indices_iteration = 0
         self._handle = None
         self._records = 0
         self._targets: list[str] = []
@@ -561,6 +630,7 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
 
     def report_metadata(self) -> dict[str, Any]:
         iter_length = self._iter_length()
+        scheduled_samples = self._scheduled_sample_count()
         report = {
             "dataset": "medkit_rs.dataset.MedkitCxrNativePrefetchDataset",
             "cache_dir": str(self.cache_dir),
@@ -576,12 +646,24 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
             "include_metadata": self.include_metadata,
             "drop_last": self.drop_last,
             "shuffle_block_batches": self.shuffle_block_batches,
+            "batch_schedule": (
+                "fixed_by_iteration" if self.batch_indices_by_iteration is not None else "generated"
+            ),
+            "batch_schedule_iterations": (
+                len(self.batch_indices_by_iteration)
+                if self.batch_indices_by_iteration is not None
+                else 0
+            ),
             "worker_mode": "rust_thread_prefetch",
             "num_workers": 0,
             "num_samples": len(self),
-            "yielded_samples": iter_length,
-            "dropped_samples": len(self) - iter_length,
-            "num_batches": self._num_batches(),
+            "yielded_samples": scheduled_samples if scheduled_samples is not None else iter_length,
+            "dropped_samples": (
+                len(self) - scheduled_samples
+                if scheduled_samples is not None
+                else len(self) - iter_length
+            ),
+            "num_batches": self._scheduled_batch_count() or self._num_batches(),
             "targets": self.targets,
             "image_shape": list(self.image_shape),
         }
@@ -606,6 +688,8 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         return state
 
     def _batch_indices(self) -> list[list[int]]:
+        if self.batch_indices_by_iteration is not None:
+            return self._scheduled_batch_indices()
         length = len(self)
         iter_length = self._iter_length()
         order_length = (
@@ -641,6 +725,40 @@ class MedkitCxrNativePrefetchDataset(_IterableDatasetBase):
         blocks = [order[start : start + block_size] for start in range(0, length, block_size)]
         rng.shuffle(blocks)
         return [index for block in blocks for index in block]
+
+    def _scheduled_batch_indices(self) -> list[list[int]]:
+        if self.batch_indices_by_iteration is None:
+            raise RuntimeError("fixed CXR batch schedule is not configured")
+        index = self._batch_indices_iteration
+        if index >= len(self.batch_indices_by_iteration):
+            raise RuntimeError(
+                "fixed CXR batch schedule exhausted: "
+                f"requested iterator {index}, available {len(self.batch_indices_by_iteration)}"
+            )
+        self._batch_indices_iteration += 1
+        batches = [list(batch) for batch in self.batch_indices_by_iteration[index]]
+        self._validate_scheduled_batches(batches)
+        return batches
+
+    def _validate_scheduled_batches(self, batches: list[list[int]]) -> None:
+        length = len(self)
+        for batch in batches:
+            if len(batch) > self.batch_size:
+                raise ValueError("fixed CXR batch schedule contains a batch larger than batch_size")
+            if any(index >= length for index in batch):
+                raise ValueError("fixed CXR batch schedule contains an index outside the split")
+
+    def _scheduled_batch_count(self) -> int | None:
+        if not self.batch_indices_by_iteration:
+            return None
+        index = min(self._batch_indices_iteration, len(self.batch_indices_by_iteration) - 1)
+        return len(self.batch_indices_by_iteration[index])
+
+    def _scheduled_sample_count(self) -> int | None:
+        if not self.batch_indices_by_iteration:
+            return None
+        index = min(self._batch_indices_iteration, len(self.batch_indices_by_iteration) - 1)
+        return sum(len(batch) for batch in self.batch_indices_by_iteration[index])
 
     def _ensure_open(self):
         if self._handle is not None:
@@ -904,6 +1022,23 @@ def _validate_cxr_read_mode(value: str) -> str:
     if value not in {"mmap", "stream"}:
         raise ValueError("read_mode must be 'mmap' or 'stream'")
     return value
+
+
+def _normalize_cxr_batch_indices_by_iteration(
+    value: Sequence[Sequence[Sequence[int]]] | None,
+) -> list[list[list[int]]] | None:
+    if value is None:
+        return None
+    normalized: list[list[list[int]]] = []
+    for iteration in value:
+        batches: list[list[int]] = []
+        for batch in iteration:
+            indices = [int(index) for index in batch]
+            if any(index < 0 for index in indices):
+                raise ValueError("batch_indices_by_iteration cannot contain negative indices")
+            batches.append(indices)
+        normalized.append(batches)
+    return normalized
 
 
 def _torch():

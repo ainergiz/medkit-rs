@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -122,22 +123,30 @@ def run_cxr_benchmark(
     gpu_prefetch_batches: int = 0,
     gpu_prefetch_reuse_buffers: bool = False,
     sync_every_step: bool = True,
+    channels_last: bool = False,
+    torch_compile: bool = False,
+    torch_compile_mode: str = "default",
     loss_pos_weight: str = "none",
     quality_gate: bool = False,
     quality_min_eval_samples: int = 0,
     quality_min_metric_targets: int = 0,
     quality_min_macro_auroc: float = 0.0,
     quality_min_macro_auprc: float = 0.0,
+    train_order_evidence: bool | None = None,
+    paired_train_order: bool | None = None,
     include_metadata: bool = False,
     max_train_batches: int = 0,
     max_eval_batches: int = 0,
     baselines: str = "pytorch_raw,monai_raw,medkit_cached_mmap,medkit_pinned_prefetch",
+    manifest: str = "",
     splits: str = "",
+    prepare_only: bool = False,
     smoke: bool = False,
     force_rematerialize: bool = False,
     force_cache: bool = False,
 ) -> dict[str, Any]:
     os.chdir(APP_ROOT)
+    volume.reload()
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     REMOTE_REPORT_ROOT.mkdir(parents=True, exist_ok=True)
     command = [
@@ -188,6 +197,10 @@ def run_cxr_benchmark(
         if gpu_prefetch_reuse_buffers
         else "--no-gpu-prefetch-reuse-buffers",
         "--sync-every-step" if sync_every_step else "--no-sync-every-step",
+        "--channels-last" if channels_last else "--no-channels-last",
+        "--torch-compile" if torch_compile else "--no-torch-compile",
+        "--torch-compile-mode",
+        torch_compile_mode,
         "--loss-pos-weight",
         loss_pos_weight,
         "--quality-gate" if quality_gate else "--no-quality-gate",
@@ -199,6 +212,12 @@ def run_cxr_benchmark(
         str(quality_min_macro_auroc),
         "--quality-min-macro-auprc",
         str(quality_min_macro_auprc),
+        "--train-order-evidence"
+        if (quality_gate if train_order_evidence is None else train_order_evidence)
+        else "--no-train-order-evidence",
+        "--paired-train-order"
+        if (quality_gate if paired_train_order is None else paired_train_order)
+        else "--no-paired-train-order",
         "--include-metadata" if include_metadata else "--no-include-metadata",
         "--baselines",
         baselines,
@@ -207,6 +226,8 @@ def run_cxr_benchmark(
     ]
     if splits:
         command.extend(["--splits", splits])
+    if manifest:
+        command.extend(["--manifest", manifest])
     if max_train_batches:
         command.extend(["--max-train-batches", str(max_train_batches)])
     if max_eval_batches:
@@ -217,6 +238,8 @@ def run_cxr_benchmark(
         command.append("--force-rematerialize")
     if force_cache:
         command.append("--force-cache")
+    if prepare_only:
+        command.append("--prepare-only")
 
     env = os.environ.copy()
     env["MEDKIT_BENCHMARK_USE_LOCAL_SOURCE"] = "0" if USE_PUBLISHED_MEDKIT else "1"
@@ -276,17 +299,24 @@ def main(
     gpu_prefetch_batches: int = 0,
     gpu_prefetch_reuse_buffers: bool = False,
     sync_every_step: bool = True,
+    channels_last: bool = False,
+    torch_compile: bool = False,
+    torch_compile_mode: str = "default",
     loss_pos_weight: str = "none",
     quality_gate: bool = False,
     quality_min_eval_samples: int = 0,
     quality_min_metric_targets: int = 0,
     quality_min_macro_auroc: float = 0.0,
     quality_min_macro_auprc: float = 0.0,
+    train_order_evidence: bool | None = None,
+    paired_train_order: bool | None = None,
     include_metadata: bool = False,
     max_train_batches: int = 0,
     max_eval_batches: int = 0,
     baselines: str = "pytorch_raw,monai_raw,medkit_cached_mmap,medkit_pinned_prefetch",
+    manifest: str = "",
     splits: str = "",
+    prepare_only: bool = False,
     smoke: bool = False,
     force_rematerialize: bool = False,
     force_cache: bool = False,
@@ -317,17 +347,24 @@ def main(
         gpu_prefetch_batches=gpu_prefetch_batches,
         gpu_prefetch_reuse_buffers=gpu_prefetch_reuse_buffers,
         sync_every_step=sync_every_step,
+        channels_last=channels_last,
+        torch_compile=torch_compile,
+        torch_compile_mode=torch_compile_mode,
         loss_pos_weight=loss_pos_weight,
         quality_gate=quality_gate,
         quality_min_eval_samples=quality_min_eval_samples,
         quality_min_metric_targets=quality_min_metric_targets,
         quality_min_macro_auroc=quality_min_macro_auroc,
         quality_min_macro_auprc=quality_min_macro_auprc,
+        train_order_evidence=train_order_evidence,
+        paired_train_order=paired_train_order,
         include_metadata=include_metadata,
         max_train_batches=max_train_batches,
         max_eval_batches=max_eval_batches,
         baselines=baselines,
+        manifest=manifest,
         splits=splits,
+        prepare_only=prepare_only,
         smoke=smoke,
         force_rematerialize=force_rematerialize,
         force_cache=force_cache,
@@ -337,7 +374,9 @@ def main(
     for name, value in result.get("artifacts", {}).items():
         suffix = Path(name).suffix
         path = local_report_dir / name
-        if suffix == ".json":
+        if isinstance(value, dict) and value.get("encoding") == "base64":
+            path.write_bytes(base64.b64decode(str(value.get("data", "")).encode("ascii")))
+        elif suffix == ".json":
             path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
         else:
             path.write_text(str(value))
@@ -359,6 +398,13 @@ def collect_report_artifacts(report_dir: Path) -> dict[str, Any]:
                 artifacts[path.name] = json.loads(path.read_text())
             except Exception as error:
                 artifacts[path.name] = {"error": str(error), "raw": path.read_text()}
+        elif path.name.endswith(".jsonl.gz"):
+            artifacts[path.name] = {
+                "encoding": "base64",
+                "data": base64.b64encode(path.read_bytes()).decode("ascii"),
+            }
+        elif path.suffix == ".jsonl":
+            artifacts[path.name] = path.read_text()
         elif path.suffix in {".md", ".txt"}:
             artifacts[path.name] = path.read_text()
     return artifacts

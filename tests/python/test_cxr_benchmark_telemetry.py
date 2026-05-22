@@ -146,19 +146,35 @@ def test_profile_summary_reconciles_samples_and_step_time():
             "samples": 32,
             "data_wait_ms": 1.0,
             "h2d_ms": 0.5,
+            "batch_prepare_ms": 0.6,
+            "batch_prepare_wall_ms": 0.7,
+            "zero_grad_wall_ms": 0.1,
             "forward_ms": 2.0,
             "backward_ms": 3.0,
             "optimizer_ms": 0.75,
+            "prefetch_maintenance_wall_ms": 0.2,
             "total_step_ms": 10.0,
+            "accounted_step_ms": 6.65,
+            "residual_step_ms": 3.35,
+            "residual_step_ms_signed": 3.35,
+            "residual_step_percent": 33.5,
         },
         {
             "samples": 32,
             "data_wait_ms": 2.0,
             "h2d_ms": 0.75,
+            "batch_prepare_ms": 0.9,
+            "batch_prepare_wall_ms": 1.0,
+            "zero_grad_wall_ms": 0.2,
             "forward_ms": 3.0,
             "backward_ms": 4.0,
             "optimizer_ms": 1.0,
+            "prefetch_maintenance_wall_ms": 0.3,
             "total_step_ms": 15.0,
+            "accounted_step_ms": 9.4,
+            "residual_step_ms": 5.6,
+            "residual_step_ms_signed": 5.6,
+            "residual_step_percent": 5.6 * 100.0 / 15.0,
         },
     ]
 
@@ -172,6 +188,330 @@ def test_profile_summary_reconciles_samples_and_step_time():
     assert summary["profile_end_to_end_ms"] == 28.0
     assert summary["profile_end_to_end_samples_per_s"] == 1000.0 * 64 / 28.0
     assert summary["profile_data_wait_ms_mean"] == 1.5
+    assert summary["profile_batch_prepare_ms_mean"] == 0.75
+    assert summary["profile_batch_prepare_wall_ms_p50"] == 0.7
+    assert summary["profile_prefetch_maintenance_wall_ms_mean"] == 0.25
+    assert summary["profile_residual_step_ms_p95"] == 5.6
+    assert summary["profile_phase_budget_ms_per_batch"]["batch_prepare_ms"] == 0.75
+    assert summary["profile_phase_budget_ms_per_batch"]["residual_step_ms_signed"] == 4.475
+    assert summary["profile_step_accounted_percent"] == (6.65 + 9.4) * 100.0 / 25.0
+    assert summary["profile_residual_step_signed_percent"] == (3.35 + 5.6) * 100.0 / 25.0
+    assert summary["profile_step_reconciled_percent"] == 100.0
+
+
+def test_training_ground_truth_report_compares_raw_and_medkit():
+    benchmark = load_benchmark_module()
+    reports = {
+        "loader": {
+            "pytorch_raw": {
+                "status": "ok",
+                "samples_per_second": 1000.0,
+                "memory": _memory_report(),
+            },
+            "medkit_native_prefetch_pinned": {
+                "status": "ok",
+                "samples_per_second": 2000.0,
+                "memory": {**_memory_report(), "smaps_pss_mb": 120.0},
+            },
+        },
+        "gpu": {
+            "pytorch_raw": {
+                "status": "ok",
+                "samples_per_second": 250.0,
+                "data_wait_percent": 2.0,
+                "samples": 128,
+                "batches": 2,
+                "memory": _memory_report(),
+            },
+            "medkit_native_prefetch_pinned": {
+                "status": "ok",
+                "samples_per_second": 375.0,
+                "data_wait_percent": 0.25,
+                "samples": 128,
+                "batches": 2,
+                "train_native_prefetch_read_ms_per_batch": 1.5,
+                "memory": {**_memory_report(), "smaps_pss_mb": 125.0},
+            },
+        },
+        "profile": {
+            "pytorch_raw": {
+                "status": "ok",
+                "records": [{"timing_scope": "mixed_cuda_events_and_wall"}],
+                "summary": {
+                    "profile_end_to_end_samples_per_s": 240.0,
+                    "profile_phase_budget_ms_per_batch": {
+                        "batch_prepare_ms": 20.0,
+                        "backward_ms": 50.0,
+                    },
+                    "profile_phase_budget_end_to_end_percent": {
+                        "batch_prepare_ms": 20.0,
+                        "backward_ms": 50.0,
+                    },
+                },
+            },
+            "medkit_native_prefetch_pinned": {
+                "status": "ok",
+                "records": [{"timing_scope": "mixed_cuda_events_and_wall"}],
+                "summary": {
+                    "profile_end_to_end_samples_per_s": 360.0,
+                    "profile_phase_budget_ms_per_batch": {
+                        "batch_prepare_ms": 2.0,
+                        "backward_ms": 50.0,
+                    },
+                    "profile_phase_budget_end_to_end_percent": {
+                        "batch_prepare_ms": 2.0,
+                        "backward_ms": 50.0,
+                    },
+                },
+            },
+        },
+        "quality": {
+            "pytorch_raw": {"status": "ok", "macro_auroc": 0.60, "macro_auprc": 0.10},
+            "medkit_native_prefetch_pinned": {
+                "status": "ok",
+                "macro_auroc": 0.62,
+                "macro_auprc": 0.11,
+            },
+        },
+    }
+
+    report = benchmark.training_ground_truth_report(reports)
+    medkit = report["baselines"]["medkit_native_prefetch_pinned"]
+    comparison = report["comparisons"]["medkit_native_prefetch_pinned:vs:pytorch_raw"]
+
+    assert medkit["profile"]["largest_phase"] == {"phase": "backward_ms", "ms_per_batch": 50.0}
+    assert medkit["native_prefetch"]["train_native_prefetch_read_ms_per_batch"] == 1.5
+    assert comparison["train_samples_per_second_speedup"] == 1.5
+    assert comparison["profile_end_to_end_speedup"] == 1.5
+    assert comparison["phase_delta_ms_per_batch"]["batch_prepare_ms"] == -18.0
+
+
+def test_prediction_pairing_accepts_identical_samples_and_metrics():
+    benchmark = load_benchmark_module()
+    raw = _prediction_summary(benchmark, "pytorch_raw")
+    medkit = _prediction_summary(benchmark, "medkit_native_prefetch_pinned")
+
+    comparison = benchmark.paired_prediction_summary(candidate=medkit, raw=raw)
+
+    assert comparison["paired"] is True
+    assert comparison["matched_sample_count"] == 2
+    assert comparison["missing_from_raw_count"] == 0
+    assert comparison["missing_from_medkit_count"] == 0
+    assert comparison["identical_order"] is True
+    assert comparison["identical_target_order"] is True
+    assert comparison["label_mask_hash_match"] is True
+    assert comparison["macro_auroc"]["delta"] == 0.0
+
+
+def test_prediction_pairing_marks_missing_medkit_sample_unpaired():
+    benchmark = load_benchmark_module()
+    raw = _prediction_summary(benchmark, "pytorch_raw", sample_ids=["a", "b"])
+    medkit = _prediction_summary(
+        benchmark,
+        "medkit_native_prefetch_pinned",
+        sample_ids=["a"],
+    )
+
+    comparison = benchmark.paired_prediction_summary(candidate=medkit, raw=raw)
+
+    assert comparison["paired"] is False
+    assert comparison["missing_from_medkit_count"] == 1
+
+
+def test_prediction_pairing_detects_target_order_mismatch():
+    benchmark = load_benchmark_module()
+    raw = _prediction_summary(benchmark, "pytorch_raw", target_names=["A", "B"])
+    medkit = _prediction_summary(
+        benchmark,
+        "medkit_native_prefetch_pinned",
+        target_names=["B", "A"],
+    )
+
+    comparison = benchmark.paired_prediction_summary(candidate=medkit, raw=raw)
+
+    assert comparison["paired"] is False
+    assert comparison["identical_target_order"] is False
+
+
+def test_prediction_metric_recompute_rejects_nonfinite_logits():
+    benchmark = load_benchmark_module()
+    rows = _prediction_rows("pytorch_raw")
+    rows[0]["logits"][0] = float("nan")
+
+    try:
+        benchmark.metric_report_from_prediction_rows(rows, ["A", "B"])
+    except ValueError as error:
+        assert "logits contains non-finite values" in str(error)
+    else:
+        raise AssertionError("non-finite logits were accepted")
+
+
+def test_train_order_recorder_writes_epoch_dropped_evidence(tmp_path):
+    import numpy as np
+
+    benchmark = load_benchmark_module()
+    targets = ["Pneumonia", "Edema"]
+    records = [
+        benchmark.SampleRecord(
+            sample_id=sample_id,
+            patient_id=f"patient-{sample_id}",
+            study_id=f"study-{sample_id}",
+            image_id=f"image-{sample_id}",
+            image_path=f"/tmp/{sample_id}.png",
+            filename=f"{sample_id}.png",
+            source_split="hf_train_stream",
+            width=320,
+            height=320,
+            labels=labels,
+            split="train",
+            sha256=f"sha-{sample_id}",
+        )
+        for sample_id, labels in [
+            ("a", {"Pneumonia": 1, "Edema": 0}),
+            ("b", {"Pneumonia": 0, "Edema": 1}),
+            ("c", {"Pneumonia": 1, "Edema": 0}),
+        ]
+    ]
+    recorder = benchmark.TrainOrderRecorder(
+        baseline="medkit_native_prefetch_pinned",
+        targets=targets,
+        train_records=records,
+        artifact_path=tmp_path / "train-order-medkit.jsonl.gz",
+        required=True,
+    )
+    batch_ab = {
+        "image": np.zeros((2, 1, 1, 1), dtype="float32"),
+        "labels": np.asarray([[1, 0], [0, 1]], dtype="float32"),
+        "mask": np.ones((2, 2), dtype="float32"),
+        "sample_id": ["a", "b"],
+    }
+    recorder.record_batch(
+        phase="warmup",
+        epoch=None,
+        batch_index=0,
+        global_batch_index=None,
+        batch=batch_ab,
+    )
+    recorder.record_batch(
+        phase="train",
+        epoch=0,
+        batch_index=0,
+        global_batch_index=0,
+        batch=batch_ab,
+    )
+    recorder.record_batch(
+        phase="train",
+        epoch=1,
+        batch_index=0,
+        global_batch_index=1,
+        batch=batch_ab,
+    )
+
+    summary = recorder.write()
+    normalized = benchmark.train_order_summary_report(
+        report_dir=tmp_path,
+        train_order={"medkit_native_prefetch_pinned": summary},
+        targets=targets,
+        capture_enabled=True,
+    )
+
+    assert summary["status"] == "ok"
+    assert summary["warmup_batches"] == 1
+    assert summary["train_batches"] == 2
+    assert summary["train_samples"] == 4
+    assert summary["same_train_order_each_epoch"] is True
+    assert summary["epoch_summaries"][0]["dropped_sample_ids"] == ["c"]
+    assert summary["epoch_summaries"][0]["dropped_target_counts"]["Pneumonia"]["positive"] == 1
+    assert normalized["baselines"]["medkit_native_prefetch_pinned"]["artifact_rows"] == 3
+    assert (
+        normalized["baselines"]["medkit_native_prefetch_pinned"][
+            "artifact_recheck_matches_summary"
+        ]
+        is True
+    )
+
+
+def test_train_order_pairing_detects_nonidentical_schedule():
+    benchmark = load_benchmark_module()
+    raw = {
+        "status": "ok",
+        "train_batches": 1,
+        "train_samples": 2,
+        "same_train_order_each_epoch": False,
+        "hashes": {
+            "train_sample_order_hash": benchmark.stable_hash(["a", "b"]),
+            "train_sample_multiset_hash": benchmark.stable_hash(["a", "b"]),
+            "dropped_samples_by_epoch_hash": benchmark.stable_hash(
+                [{"epoch": 0, "dropped_sample_ids": ["c"]}]
+            ),
+            "batch_label_sums_hash": "raw-labels",
+        },
+        "epoch_summaries": [
+            {
+                "epoch": 0,
+                "sample_order_hash": benchmark.stable_hash(["a", "b"]),
+                "dropped_sample_count": 1,
+                "dropped_sample_ids": ["c"],
+            }
+        ],
+    }
+    medkit = {
+        "status": "ok",
+        "train_batches": 1,
+        "train_samples": 2,
+        "same_train_order_each_epoch": True,
+        "hashes": {
+            "train_sample_order_hash": benchmark.stable_hash(["b", "a"]),
+            "train_sample_multiset_hash": benchmark.stable_hash(["a", "b"]),
+            "dropped_samples_by_epoch_hash": benchmark.stable_hash(
+                [{"epoch": 0, "dropped_sample_ids": ["d"]}]
+            ),
+            "batch_label_sums_hash": "medkit-labels",
+        },
+        "epoch_summaries": [
+            {
+                "epoch": 0,
+                "sample_order_hash": benchmark.stable_hash(["b", "a"]),
+                "dropped_sample_count": 1,
+                "dropped_sample_ids": ["d"],
+            }
+        ],
+    }
+
+    comparison = benchmark.paired_train_order_summary(candidate=medkit, raw=raw)
+
+    assert comparison["paired"] is False
+    assert comparison["identical_train_order"] is False
+    assert comparison["identical_train_sample_multiset"] is True
+    assert comparison["identical_dropped_samples_by_epoch"] is False
+    assert comparison["epoch_deltas"]["0"]["candidate_only_dropped_sample_count"] == 1
+
+
+def test_paired_train_batch_schedule_is_replayable_and_epoch_varying():
+    benchmark = load_benchmark_module()
+    schedule = benchmark.build_train_batch_schedule(
+        train_records=[object() for _ in range(10)],
+        batch_size=4,
+        seed=17,
+        epochs=2,
+        warmup_batches=1,
+        drop_last_train=True,
+        shuffle_block_batches=0,
+    )
+
+    assert schedule.iteration_names == ("warmup", "epoch:0", "epoch:1")
+    assert [len(batches) for batches in schedule.iteration_batches] == [1, 2, 2]
+    assert sum(len(batch) for batch in schedule.iteration_batches[1]) == 8
+    assert schedule.iteration_batches[1] != schedule.iteration_batches[2]
+
+    raw_sampler = benchmark.FixedTrainBatchScheduleSampler(schedule)
+    medkit_sampler = benchmark.FixedTrainBatchScheduleSampler(schedule)
+
+    assert list(raw_sampler) == list(medkit_sampler)
+    assert list(raw_sampler) == list(medkit_sampler)
+    assert list(raw_sampler) == list(medkit_sampler)
+    assert list(raw_sampler) == []
+    assert raw_sampler.report_metadata()["batch_schedule_extra_empty_iterations"] == 1
 
 
 def test_drop_last_train_only_skips_incomplete_batches():
@@ -296,8 +636,11 @@ def test_quality_gate_and_balanced_loss_helpers_reject_weak_quality():
                 "metric_target_count": 0,
                 "macro_auroc": None,
                 "macro_auprc": None,
+                "prediction_capture": {"enabled": True, "status": "ok"},
+                "metric_recompute_matches_predictions": True,
             }
         },
+        train_order={},
         validation={
             "split_audit": {
                 "patient_overlap_count": 0,
@@ -352,12 +695,18 @@ def test_run_summary_consistency_accepts_matching_provenance_and_rejects_drift()
         "gpu_prefetch_batches": 0,
         "gpu_prefetch_reuse_buffers": False,
         "sync_every_step": True,
+        "channels_last": False,
+        "torch_compile": False,
+        "torch_compile_mode": "default",
         "loss_pos_weight": "none",
         "quality_gate": False,
         "quality_min_eval_samples": 0,
         "quality_min_metric_targets": 0,
         "quality_min_macro_auroc": 0.0,
         "quality_min_macro_auprc": 0.0,
+        "eval_predictions": False,
+        "train_order_evidence": False,
+        "paired_train_order": False,
         "read_mode": "mmap",
         "include_metadata": False,
         "profile_batches": 2,
@@ -523,6 +872,9 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
         assert "--gpu-prefetch-batches" in command
         assert "--no-gpu-prefetch-reuse-buffers" in command
         assert "--sync-every-step" in command
+        assert "--no-channels-last" in command
+        assert "--no-torch-compile" in command
+        assert command[command.index("--torch-compile-mode") + 1] == "default"
 
     l4_args = matrix.parse_args(
         [
@@ -575,8 +927,33 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
         row=quality_rows[0],
     )
     assert "--quality-gate" in quality_command
+    assert "--train-order-evidence" in quality_command
+    assert "--paired-train-order" in quality_command
     assert "--loss-pos-weight" in quality_command
     assert "balanced" in quality_command
+    assert "--no-channels-last" in quality_command
+    assert "--no-torch-compile" in quality_command
+
+    shared = matrix.shared_data_paths("quality-l4")
+    assert shared["manifest"] == "/cache/results/cxr/quality-l4-prepare-data/manifest.jsonl"
+    assert shared["splits"] == "/cache/results/cxr/quality-l4-prepare-data/splits.json"
+    assert matrix.auto_shared_data_required(quality_args) is True
+    quality_args.manifest = shared["manifest"]
+    quality_args.splits = shared["splits"]
+    quality_command = matrix.build_command(
+        quality_args,
+        run_id=matrix.run_id_for("quality-l4", quality_rows[0]),
+        row=quality_rows[0],
+    )
+    assert quality_command[quality_command.index("--manifest") + 1] == shared["manifest"]
+    assert quality_command[quality_command.index("--splits") + 1] == shared["splits"]
+    prepare_command = matrix.build_prepare_command(
+        matrix.parse_args(["--gate", "l4-quality-224-b64", "--batch-id", "quality-l4"]),
+        run_id="quality-l4-prepare-data",
+    )
+    assert "--prepare-only" in prepare_command
+    assert "--manifest" not in prepare_command
+    assert "--splits" not in prepare_command
 
 
 def test_matrix_modal_cli_command_can_be_overridden(monkeypatch):
@@ -596,9 +973,28 @@ def test_modal_cxr_wrapper_exposes_sync_policy():
     assert "sync_every_step: bool = True" in text
     assert '"--sync-every-step" if sync_every_step else "--no-sync-every-step"' in text
     assert "sync_every_step=sync_every_step" in text
+    assert "channels_last: bool = False" in text
+    assert '"--channels-last" if channels_last else "--no-channels-last"' in text
+    assert "channels_last=channels_last" in text
+    assert "torch_compile: bool = False" in text
+    assert '"--torch-compile" if torch_compile else "--no-torch-compile"' in text
+    assert "--torch-compile-mode" in text
+    assert "torch_compile=torch_compile" in text
+    assert "torch_compile_mode=torch_compile_mode" in text
     assert "gpu_prefetch_reuse_buffers: bool = False" in text
     assert "--gpu-prefetch-reuse-buffers" in text
     assert "gpu_prefetch_reuse_buffers=gpu_prefetch_reuse_buffers" in text
+    assert "train_order_evidence: bool | None = None" in text
+    assert "--train-order-evidence" in text
+    assert "train_order_evidence=train_order_evidence" in text
+    assert "paired_train_order: bool | None = None" in text
+    assert "--paired-train-order" in text
+    assert "paired_train_order=paired_train_order" in text
+    assert "volume.reload()" in text
+    assert "manifest: str = \"\"" in text
+    assert "--manifest" in text
+    assert "prepare_only: bool = False" in text
+    assert "--prepare-only" in text
 
 
 def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_path):
@@ -784,12 +1180,18 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
             "gpu_prefetch_batches": 0,
             "gpu_prefetch_reuse_buffers": False,
             "sync_every_step": True,
+            "channels_last": False,
+            "torch_compile": False,
+            "torch_compile_mode": "default",
             "loss_pos_weight": "none",
             "quality_gate": False,
             "quality_min_eval_samples": 0,
             "quality_min_metric_targets": 0,
             "quality_min_macro_auroc": 0.0,
             "quality_min_macro_auprc": 0.0,
+            "eval_predictions": False,
+            "train_order_evidence": False,
+            "paired_train_order": False,
             "seed": 17,
         }
     }
@@ -815,12 +1217,18 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
             "gpu_prefetch_batches": 0,
             "gpu_prefetch_reuse_buffers": False,
             "sync_every_step": True,
+            "channels_last": False,
+            "torch_compile": False,
+            "torch_compile_mode": "default",
             "loss_pos_weight": "none",
             "quality_gate": False,
             "quality_min_eval_samples": 0,
             "quality_min_metric_targets": 0,
             "quality_min_macro_auroc": 0.0,
             "quality_min_macro_auprc": 0.0,
+            "eval_predictions": False,
+            "train_order_evidence": False,
+            "paired_train_order": False,
             "read_mode": "mmap",
             "include_metadata": False,
             "profile_batches": 20,
@@ -882,6 +1290,7 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
 
 
 def test_matrix_repeat_summary_aggregates_three_repeat_metrics():
+    benchmark = load_benchmark_module()
     matrix = load_matrix_module()
     results = []
     for repeat_index, samples_per_second in enumerate([350.0, 360.0, 370.0]):
@@ -915,8 +1324,16 @@ def test_matrix_repeat_summary_aggregates_three_repeat_metrics():
                 "profile": {
                     baseline: {
                         "summary": {
-                            "profile_end_to_end_samples_per_s": samples_per_second - 1.0
+                            "profile_end_to_end_samples_per_s": samples_per_second - 1.0,
+                            "profile_batch_prepare_ms_mean": 1.0 + repeat_index,
+                            "profile_residual_step_ms_mean": 0.25 + repeat_index,
+                            "profile_prefetch_maintenance_wall_ms_mean": 0.1,
                         }
+                    }
+                },
+                "predictions": {
+                    "baselines": {
+                        baseline: _prediction_summary(benchmark, baseline),
                     }
                 },
             }
@@ -945,6 +1362,11 @@ def test_matrix_repeat_summary_aggregates_three_repeat_metrics():
                         }
                     }
                 },
+                "predictions": {
+                    "baselines": {
+                        "pytorch_raw": _prediction_summary(benchmark, "pytorch_raw"),
+                    }
+                },
             }
         )
 
@@ -962,7 +1384,301 @@ def test_matrix_repeat_summary_aggregates_three_repeat_metrics():
     assert group["metrics"]["train_native_prefetch_read_ms_per_batch"]["mean"] == 2.0
     assert group["metrics"]["train_native_prefetch_runs_per_batch"]["mean"] == 3.0
     assert group["metrics"]["profile_end_to_end_samples_per_second"]["count"] == 3
+    assert group["metrics"]["profile_batch_prepare_ms"]["mean"] == 2.0
+    assert group["metrics"]["profile_residual_step_ms"]["mean"] == 1.25
+    assert abs(group["metrics"]["profile_prefetch_maintenance_wall_ms"]["mean"] - 0.1) < 1e-12
     assert comparison["train_samples_per_second_speedup"] == 2.0
+    prediction_comparison = summary["prediction_comparisons"][
+        "medkit_native_prefetch_pinned:float32:stream:r01:vs:pytorch_raw:float32:mmap:r01"
+    ]
+    assert prediction_comparison["paired"] is True
+    assert prediction_comparison["missing_from_medkit_count"] == 0
+
+
+def test_matrix_prediction_validation_requires_quality_artifact(tmp_path):
+    matrix = load_matrix_module()
+    errors: list[str] = []
+
+    matrix.validate_prediction_artifacts(
+        errors=errors,
+        baseline="medkit_native_prefetch_pinned",
+        row_dir=tmp_path,
+        quality_row={"prediction_capture": {"enabled": True}, "metric_recompute_matches_predictions": True},
+        predictions={},
+        quality_gate_enabled=True,
+    )
+
+    assert any("missing eval-predictions-summary" in error for error in errors)
+
+    artifact_name = "eval-predictions-medkit_native_prefetch_pinned.jsonl.gz"
+    (tmp_path / artifact_name).write_bytes(b"placeholder")
+    errors = []
+    matrix.validate_prediction_artifacts(
+        errors=errors,
+        baseline="medkit_native_prefetch_pinned",
+        row_dir=tmp_path,
+        quality_row={"prediction_capture": {"enabled": True}, "metric_recompute_matches_predictions": True},
+        predictions={
+            "baselines": {
+                "medkit_native_prefetch_pinned": {
+                    "enabled": True,
+                    "status": "ok",
+                    "artifact_path": artifact_name,
+                    "metric_recompute_matches_quality": True,
+                    "metric_recompute_matches_artifact": True,
+                }
+            }
+        },
+        quality_gate_enabled=True,
+    )
+
+    assert errors == []
+
+
+def test_h100_promotion_readiness_rejects_noisy_raw_comparator():
+    matrix = load_matrix_module()
+    repeat_summary = {
+        "groups": {
+            "pytorch_raw:float32:mmap": _repeat_group(
+                baseline="pytorch_raw",
+                cv_percent=16.31,
+                classification="reject",
+            ),
+            "medkit_native_prefetch_pinned:float32:stream": _repeat_group(
+                baseline="medkit_native_prefetch_pinned",
+                cv_percent=0.56,
+                classification="ok",
+            ),
+        }
+    }
+
+    readiness = matrix.promotion_readiness_report(
+        repeat_summary,
+        batch_id="h100-noisy",
+        modal_gpu="H100",
+    )
+
+    candidate = readiness["candidates"]["medkit_native_prefetch_pinned:float32:stream"]
+    assert readiness["status"] == "rejected"
+    assert candidate["status"] == "rejected"
+    assert candidate["speedup_denominator"]["group_key"] == "pytorch_raw:float32:mmap"
+    assert candidate["speedup_denominator"]["batch_id"] == "h100-noisy"
+    assert any("raw comparator" in reason for reason in candidate["reasons"])
+
+
+def test_h100_promotion_readiness_accepts_stable_raw_and_records_thresholds():
+    matrix = load_matrix_module()
+    repeat_summary = {
+        "groups": {
+            "pytorch_raw:float32:mmap": _repeat_group(
+                baseline="pytorch_raw",
+                cv_percent=1.09,
+                classification="ok",
+            ),
+            "medkit_native_prefetch_pinned:float32:stream": _repeat_group(
+                baseline="medkit_native_prefetch_pinned",
+                cv_percent=0.56,
+                classification="ok",
+            ),
+        }
+    }
+
+    readiness = matrix.promotion_readiness_report(
+        repeat_summary,
+        batch_id="h100-stable",
+        modal_gpu="H100",
+    )
+
+    assert readiness["status"] == "eligible"
+    assert readiness["thresholds"]["H100"]["train_samples_per_second_cv_ok_percent"] == 3.0
+    assert readiness["thresholds"]["H100"]["train_samples_per_second_cv_warn_percent"] == 5.0
+    assert readiness["thresholds"]["L4"]["train_samples_per_second_cv_ok_percent"] == 3.0
+    denominator = readiness["candidates"][
+        "medkit_native_prefetch_pinned:float32:stream"
+    ]["speedup_denominator"]
+    assert denominator == {
+        "batch_id": "h100-stable",
+        "group_key": "pytorch_raw:float32:mmap",
+        "source": "same_batch",
+        "stability": repeat_summary["groups"]["pytorch_raw:float32:mmap"]["stability"],
+    }
+
+
+def test_h100_medkit_only_requires_external_comparator():
+    matrix = load_matrix_module()
+    medkit_only = {
+        "groups": {
+            "medkit_native_prefetch_pinned:float32:stream": _repeat_group(
+                baseline="medkit_native_prefetch_pinned",
+                cv_percent=0.56,
+                classification="ok",
+            ),
+        }
+    }
+    rejected = matrix.promotion_readiness_report(
+        medkit_only,
+        batch_id="h100-medkit-only",
+        modal_gpu="H100",
+    )
+    assert rejected["status"] == "rejected"
+
+    comparator = {
+        "groups": {
+            "pytorch_raw:float32:mmap": _repeat_group(
+                baseline="pytorch_raw",
+                cv_percent=1.09,
+                classification="ok",
+            ),
+        }
+    }
+    accepted = matrix.promotion_readiness_report(
+        medkit_only,
+        batch_id="h100-medkit-only",
+        modal_gpu="H100",
+        comparator_summary=comparator,
+        comparator_batch_id="h100-rawcontrol",
+    )
+    denominator = accepted["candidates"][
+        "medkit_native_prefetch_pinned:float32:stream"
+    ]["speedup_denominator"]
+    assert accepted["status"] == "eligible"
+    assert denominator["source"] == "external_comparator_batch"
+    assert denominator["batch_id"] == "h100-rawcontrol"
+
+
+def test_h100_raw_only_batch_is_comparator_ready():
+    matrix = load_matrix_module()
+    repeat_summary = {
+        "groups": {
+            "pytorch_raw:float32:mmap": _repeat_group(
+                baseline="pytorch_raw",
+                cv_percent=1.09,
+                classification="ok",
+            ),
+        }
+    }
+
+    readiness = matrix.promotion_readiness_report(
+        repeat_summary,
+        batch_id="h100-rawcontrol",
+        modal_gpu="H100",
+    )
+
+    assert readiness["status"] == "comparator_ready"
+    assert readiness["raw_comparators"]["pytorch_raw:float32:mmap"]["status"] == "eligible"
+
+
+def _prediction_rows(
+    baseline: str,
+    *,
+    sample_ids: list[str] | None = None,
+    target_names: list[str] | None = None,
+) -> list[dict[str, object]]:
+    sample_ids = sample_ids or ["a", "b"]
+    target_names = target_names or ["A", "B"]
+    base_rows = [
+        {
+            "labels": [0.0, 1.0],
+            "label_mask": [1.0, 1.0],
+            "logits": [-2.0, 2.0],
+            "probabilities": [0.1, 0.9],
+        },
+        {
+            "labels": [1.0, 0.0],
+            "label_mask": [1.0, 1.0],
+            "logits": [2.0, -2.0],
+            "probabilities": [0.9, 0.1],
+        },
+    ]
+    rows = []
+    for index, sample_id in enumerate(sample_ids):
+        values = base_rows[index % len(base_rows)]
+        rows.append(
+            {
+                "schema_version": 1,
+                "baseline": baseline,
+                "eval_index": index,
+                "sample_id": sample_id,
+                "patient_id": f"patient-{sample_id}",
+                "study_id": f"study-{sample_id}",
+                "image_id": f"image-{sample_id}",
+                "source_path": f"/images/{sample_id}.png",
+                "sample_hash": f"sha-{sample_id}",
+                "target_names": target_names,
+                "labels": values["labels"],
+                "label_mask": values["label_mask"],
+                "logits": values["logits"],
+                "probabilities": values["probabilities"],
+                "thresholds": [0.5 for _target in target_names],
+                "predictions": [0, 1] if index % len(base_rows) == 0 else [1, 0],
+            }
+        )
+    return rows
+
+
+def _prediction_summary(
+    benchmark,
+    baseline: str,
+    *,
+    sample_ids: list[str] | None = None,
+    target_names: list[str] | None = None,
+) -> dict[str, object]:
+    target_names = target_names or ["A", "B"]
+    rows = _prediction_rows(baseline, sample_ids=sample_ids, target_names=target_names)
+    metrics = {
+        "samples": len(rows),
+        "macro_auroc": 1.0,
+        "macro_auprc": 1.0,
+        "metric_target_count": len(target_names),
+        "targets": {
+            target: {
+                "auroc": 1.0,
+                "auprc": 1.0,
+                "valid_samples": len(rows),
+                "positives": 1,
+                "negatives": max(len(rows) - 1, 0),
+            }
+            for target in target_names
+        },
+    }
+    return {
+        "status": "ok",
+        "enabled": True,
+        "baseline": baseline,
+        "artifact_path": f"eval-predictions-{baseline}.jsonl.gz",
+        "artifact_sha256": "sha256",
+        "samples": len(rows),
+        "sample_ids": [str(row["sample_id"]) for row in rows],
+        "target_names": target_names,
+        "hashes": benchmark.eval_prediction_hashes(rows, target_names),
+        "metric_recompute": metrics,
+        "metric_recompute_matches_quality": True,
+        "metric_recompute_matches_artifact": True,
+    }
+
+
+def _repeat_group(*, baseline: str, cv_percent: float, classification: str) -> dict[str, object]:
+    return {
+        "baseline": baseline,
+        "status": "ok",
+        "metrics": {
+            "train_samples_per_second": {
+                "count": 3,
+                "mean": 100.0,
+                "cv_percent": cv_percent,
+            }
+        },
+        "stability": {
+            "metric": "train_samples_per_second",
+            "classification": classification,
+            "cv_percent": cv_percent,
+            "count": 3,
+            "thresholds": {
+                "train_samples_per_second_cv_ok_percent": 3.0,
+                "train_samples_per_second_cv_warn_percent": 5.0,
+            },
+        },
+    }
 
 
 def _memory_report() -> dict[str, object]:

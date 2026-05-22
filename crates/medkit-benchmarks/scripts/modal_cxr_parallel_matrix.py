@@ -29,9 +29,56 @@ LOCAL_REPO_ROOT = next(
 MODAL_SCRIPT = "crates/medkit-benchmarks/scripts/modal_cxr_classification.py"
 SOURCE_REPORT_ROOT = LOCAL_REPO_ROOT / "target" / "reports" / "cxr"
 CURRENT_TOOLS_ROOT = LOCAL_REPO_ROOT / "target" / "reports" / "cxr-current-tools"
+REMOTE_REPORT_ROOT = Path("/cache/results/cxr")
 CACHE_IMAGE_PSS_MIN_MB = 1.0
 CACHE_IMAGE_PSS_NEAR_ZERO_MB = 1.0
 RAW_MEDKIT_BASELINES = "pytorch_raw,medkit_native_prefetch_pinned"
+STABILITY_THRESHOLDS = {
+    "H100": {
+        "train_samples_per_second_cv_ok_percent": 3.0,
+        "train_samples_per_second_cv_warn_percent": 5.0,
+    },
+    "L4": {
+        "train_samples_per_second_cv_ok_percent": 3.0,
+        "train_samples_per_second_cv_warn_percent": 5.0,
+    },
+}
+PROFILE_PHASE_METRICS = (
+    "profile_data_wait_ms",
+    "profile_batch_prepare_ms",
+    "profile_zero_grad_wall_ms",
+    "profile_forward_ms",
+    "profile_backward_ms",
+    "profile_optimizer_ms",
+    "profile_prefetch_maintenance_wall_ms",
+    "profile_residual_step_ms_signed",
+)
+PROFILE_EVENT_METRICS = (
+    "profile_h2d_ms",
+    "profile_batch_prepare_wall_ms",
+    "profile_accounted_step_ms",
+    "profile_residual_step_ms",
+    "profile_residual_step_percent",
+    "profile_total_step_ms",
+    "profile_step_accounted_percent",
+    "profile_residual_step_signed_percent",
+    "profile_step_reconciled_percent",
+)
+MEMORY_METRICS = (
+    "gpu_pss_mb",
+    "gpu_anon_pss_mb",
+    "gpu_file_pss_mb",
+    "gpu_private_dirty_mb",
+    "gpu_pinned_estimated_mb",
+    "cache_image_pss_mb",
+    "loader_pss_mb",
+    "loader_cache_image_pss_mb",
+)
+RUNTIME_METRICS = (
+    "warmup_ms",
+    "torch_compile_setup_ms",
+    "cuda_peak_allocated_mb",
+)
 GATE_PRESETS: dict[str, dict[str, Any]] = {
     "h100-512-b32": {
         "baselines": RAW_MEDKIT_BASELINES,
@@ -153,12 +200,17 @@ GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
         "--no-gpu-prefetch-reuse-buffers",
     ),
     "sync_every_step": ("--sync-every-step", "--no-sync-every-step"),
+    "channels_last": ("--channels-last", "--no-channels-last"),
+    "torch_compile": ("--torch-compile", "--no-torch-compile"),
+    "torch_compile_mode": ("--torch-compile-mode",),
     "loss_pos_weight": ("--loss-pos-weight",),
     "quality_gate": ("--quality-gate", "--no-quality-gate"),
     "quality_min_eval_samples": ("--quality-min-eval-samples",),
     "quality_min_metric_targets": ("--quality-min-metric-targets",),
     "quality_min_macro_auroc": ("--quality-min-macro-auroc",),
     "quality_min_macro_auprc": ("--quality-min-macro-auprc",),
+    "train_order_evidence": ("--train-order-evidence", "--no-train-order-evidence"),
+    "paired_train_order": ("--paired-train-order", "--no-paired-train-order"),
     "read_modes": ("--read-modes", "--read-mode"),
     "include_metadata": ("--include-metadata", "--no-include-metadata"),
     "modal_gpu": ("--modal-gpu",),
@@ -206,7 +258,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Re-validate an existing batch artifact directory without launching Modal.",
     )
+    parser.add_argument(
+        "--comparator-batch",
+        type=Path,
+        help="Optional stable comparator batch directory for promotion readiness checks.",
+    )
     parser.add_argument("--batch-id", default="")
+    parser.add_argument("--manifest", default="")
     parser.add_argument("--splits", default="")
     parser.add_argument(
         "--baselines",
@@ -238,12 +296,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument("--sync-every-step", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch-compile-mode", default="default")
     parser.add_argument("--loss-pos-weight", choices=("none", "balanced"), default="none")
     parser.add_argument("--quality-gate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--quality-min-eval-samples", type=int, default=0)
     parser.add_argument("--quality-min-metric-targets", type=int, default=0)
     parser.add_argument("--quality-min-macro-auroc", type=float, default=0.0)
     parser.add_argument("--quality-min-macro-auprc", type=float, default=0.0)
+    parser.add_argument("--train-order-evidence", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--paired-train-order", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
     parser.add_argument(
         "--read-modes",
@@ -316,19 +379,124 @@ def gate_catalog() -> dict[str, dict[str, Any]]:
     }
 
 
+def serializable_settings(args: argparse.Namespace) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for key, value in vars(args).items():
+        output[key] = str(value) if isinstance(value, Path) else value
+    return output
+
+
+def namespace_with(args: argparse.Namespace, **changes: Any) -> argparse.Namespace:
+    values = vars(args).copy()
+    values.update(changes)
+    return argparse.Namespace(**values)
+
+
+def auto_shared_data_required(args: argparse.Namespace) -> bool:
+    return bool(args.quality_gate and not args.manifest and not args.splits)
+
+
+def shared_data_paths(batch_id: str) -> dict[str, str]:
+    run_id = f"{batch_id}-prepare-data"
+    report_dir = REMOTE_REPORT_ROOT / run_id
+    return {
+        "run_id": run_id,
+        "remote_report_dir": str(report_dir),
+        "manifest": str(report_dir / "manifest.jsonl"),
+        "splits": str(report_dir / "splits.json"),
+    }
+
+
+def build_prepare_command(args: argparse.Namespace, *, run_id: str) -> list[str]:
+    cache_dtypes = parse_csv(args.cache_dtypes) or [args.cache_dtype]
+    read_modes = parse_csv(args.read_modes) or [args.read_mode]
+    prepare_args = namespace_with(
+        args,
+        baselines="pytorch_raw",
+        quality_gate=False,
+        train_order_evidence=False,
+        paired_train_order=False,
+        manifest="",
+        splits="",
+    )
+    prepare_row = Row(
+        name="prepare-data",
+        baseline="pytorch_raw",
+        cache_dtype=cache_dtypes[0],
+        read_mode=read_modes[0],
+        purpose="Shared manifest/split/cache preparation.",
+    )
+    command = build_command(prepare_args, run_id=run_id, row=prepare_row)
+    command.append("--prepare-only")
+    return command
+
+
+def run_prepare_data(
+    args: argparse.Namespace,
+    *,
+    batch_dir: Path,
+    shared_data: dict[str, str],
+) -> dict[str, Any]:
+    run_id = shared_data["run_id"]
+    row_dir = batch_dir / run_id
+    if row_dir.exists():
+        shutil.rmtree(row_dir)
+    row_dir.mkdir(parents=True, exist_ok=True)
+    source_dir = SOURCE_REPORT_ROOT / run_id
+    if source_dir.exists():
+        shutil.rmtree(source_dir)
+    command = build_prepare_command(args, run_id=run_id)
+    (row_dir / "launcher-command.txt").write_text(
+        " ".join(command_with_env(args, command)) + "\n"
+    )
+    output_path = row_dir / "modal-output.log"
+    started = time.perf_counter()
+    with output_path.open("w") as output_handle:
+        completed = subprocess.run(
+            command,
+            cwd=LOCAL_REPO_ROOT,
+            env=row_environment(args),
+            text=True,
+            stdout=output_handle,
+            stderr=subprocess.STDOUT,
+        )
+    elapsed = time.perf_counter() - started
+    if source_dir.exists():
+        copy_report_artifacts(source_dir, row_dir)
+    result = {
+        **shared_data,
+        "status": "ok" if completed.returncode == 0 else "failed",
+        "returncode": completed.returncode,
+        "elapsed_seconds": elapsed,
+        "local_report_dir": str(row_dir),
+    }
+    write_json(row_dir / "shared-data-result.json", result)
+    return result
+
+
 def main() -> int:
     args = parse_args()
     if args.list_gates:
         print(json.dumps(gate_catalog(), indent=2, sort_keys=True))
         return 0
     if args.audit_batch:
-        return audit_batch(args.audit_batch)
+        return audit_batch(args.audit_batch, comparator_batch=args.comparator_batch)
 
     batch_id = batch_id_for_args(args)
     batch_dir = CURRENT_TOOLS_ROOT / batch_id
     batch_dir.mkdir(parents=True, exist_ok=True)
 
     rows = rows_for_args(args)
+    shared_data: dict[str, Any] | None = None
+    prepare_command: list[str] | None = None
+    if auto_shared_data_required(args):
+        shared_data = {
+            **shared_data_paths(batch_id),
+            "mode": "auto_quality_gate",
+        }
+        prepare_command = build_prepare_command(args, run_id=str(shared_data["run_id"]))
+        args.manifest = str(shared_data["manifest"])
+        args.splits = str(shared_data["splits"])
 
     pending = list(rows)
     running: list[RunningRow] = []
@@ -342,17 +510,37 @@ def main() -> int:
             "gate": args.gate or None,
             "gate_preset": GATE_PRESETS.get(args.gate),
             "rows": [row.__dict__ for row in rows],
-            "settings": vars(args),
+            "settings": serializable_settings(args),
+            "shared_data": shared_data,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         },
     )
 
     if args.dry_run:
+        if prepare_command is not None:
+            print(" ".join(command_with_env(args, prepare_command)))
         for row in rows:
             run_id = run_id_for(batch_id, row)
             command = build_command(args, run_id=run_id, row=row)
             print(" ".join(command_with_env(args, command)))
         return 0
+
+    if shared_data is not None:
+        prepare_result = run_prepare_data(args, batch_dir=batch_dir, shared_data=shared_data)
+        shared_data.update(prepare_result)
+        write_json(batch_dir / "shared-data.json", shared_data)
+        if prepare_result.get("status") != "ok":
+            write_batch_summary(
+                batch_dir,
+                batch_id,
+                completed,
+                running=[],
+                pending=pending,
+                batch_started=batch_started,
+                modal_gpu=args.modal_gpu,
+                comparator_batch=args.comparator_batch,
+            )
+            return 1
 
     while pending or running:
         while pending and len(running) < max(args.concurrency, 1):
@@ -414,7 +602,16 @@ def main() -> int:
             if args.fail_fast and result.get("status") != "ok":
                 should_abort = True
         running = still_running
-        write_batch_summary(batch_dir, batch_id, completed, running, pending, batch_started)
+        write_batch_summary(
+            batch_dir,
+            batch_id,
+            completed,
+            running,
+            pending,
+            batch_started,
+            modal_gpu=args.modal_gpu,
+            comparator_batch=args.comparator_batch,
+        )
         if should_abort:
             terminate_running_rows(running)
             write_batch_summary(
@@ -425,12 +622,25 @@ def main() -> int:
                 pending=[],
                 batch_started=batch_started,
                 fail_fast_aborted=True,
+                modal_gpu=args.modal_gpu,
+                comparator_batch=args.comparator_batch,
             )
             return 1
 
-    write_batch_summary(batch_dir, batch_id, completed, running, pending, batch_started)
+    write_batch_summary(
+        batch_dir,
+        batch_id,
+        completed,
+        running,
+        pending,
+        batch_started,
+        modal_gpu=args.modal_gpu,
+        comparator_batch=args.comparator_batch,
+    )
     failures = [row for row in completed if row.get("status") != "ok"]
-    return 1 if failures else 0
+    repeat_summary = load_json_if_exists(batch_dir / "repeat-summary.json")
+    repeat_errors = list(repeat_summary.get("train_order_pairing_errors") or [])
+    return 1 if failures or repeat_errors else 0
 
 
 def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[str]:
@@ -477,6 +687,10 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         if args.gpu_prefetch_reuse_buffers
         else "--no-gpu-prefetch-reuse-buffers",
         "--sync-every-step" if args.sync_every_step else "--no-sync-every-step",
+        "--channels-last" if args.channels_last else "--no-channels-last",
+        "--torch-compile" if args.torch_compile else "--no-torch-compile",
+        "--torch-compile-mode",
+        str(args.torch_compile_mode),
         "--loss-pos-weight",
         str(args.loss_pos_weight),
         "--quality-gate" if args.quality_gate else "--no-quality-gate",
@@ -488,6 +702,12 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         str(args.quality_min_macro_auroc),
         "--quality-min-macro-auprc",
         str(args.quality_min_macro_auprc),
+        "--train-order-evidence"
+        if (args.quality_gate if args.train_order_evidence is None else args.train_order_evidence)
+        else "--no-train-order-evidence",
+        "--paired-train-order"
+        if (args.quality_gate if args.paired_train_order is None else args.paired_train_order)
+        else "--no-paired-train-order",
         "--read-mode",
         row.read_mode,
         "--include-metadata" if args.include_metadata else "--no-include-metadata",
@@ -498,6 +718,8 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         command.extend(["--max-train-batches", str(args.max_train_batches)])
     if args.max_eval_batches:
         command.extend(["--max-eval-batches", str(args.max_eval_batches)])
+    if args.manifest:
+        command.extend(["--manifest", args.manifest])
     if args.splits:
         command.extend(["--splits", args.splits])
     if args.smoke:
@@ -552,6 +774,9 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
     profile = load_json_if_exists(row_dir / "step-profile.json")
     quality = load_json_if_exists(row_dir / "model-quality.json")
     quality_gate = load_json_if_exists(row_dir / "quality-gate.json")
+    ground_truth = load_json_if_exists(row_dir / "training-ground-truth.json")
+    predictions = load_json_if_exists(row_dir / "eval-predictions-summary.json")
+    train_order = load_json_if_exists(row_dir / "train-order-summary.json")
     environment = load_json_if_exists(row_dir / "environment.json")
     summary_consistency = load_json_if_exists(row_dir / "summary-consistency.json")
     elapsed = time.perf_counter() - active.started_at
@@ -565,8 +790,11 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
         profile=profile,
         quality=quality,
         quality_gate=quality_gate,
+        predictions=predictions,
+        train_order=train_order,
         environment=environment,
         summary_consistency=summary_consistency,
+        artifact_dir=row_dir,
     )
     status = "ok" if not validation_errors else "failed"
     result = {
@@ -588,6 +816,9 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
         "profile": profile,
         "quality": quality,
         "quality_gate": quality_gate,
+        "ground_truth": ground_truth,
+        "predictions": predictions,
+        "train_order": train_order,
         "environment": environment,
         "summary_consistency": summary_consistency,
         "modal_status": modal_result.get("status") if modal_result else None,
@@ -618,11 +849,21 @@ def write_batch_summary(
     batch_started: float,
     *,
     fail_fast_aborted: bool = False,
+    modal_gpu: str = "",
+    comparator_batch: Path | None = None,
 ) -> None:
-    repeat_summary = summarize_repeats(completed, running, pending)
+    repeat_summary = summarize_repeats(completed, running, pending, modal_gpu=modal_gpu)
+    comparator = load_comparator_repeat_summary(comparator_batch) if comparator_batch else None
+    promotion_readiness = promotion_readiness_report(
+        repeat_summary,
+        batch_id=batch_id,
+        modal_gpu=modal_gpu,
+        comparator_summary=comparator[1] if comparator else None,
+        comparator_batch_id=comparator[0] if comparator else None,
+    )
     summary = {
         "batch_id": batch_id,
-        "status": "running" if running or pending else "ok",
+        "status": "running" if running or pending else repeat_summary.get("status", "ok"),
         "elapsed_seconds": time.perf_counter() - batch_started,
         "fail_fast_aborted": fail_fast_aborted,
         "completed": completed,
@@ -640,6 +881,7 @@ def write_batch_summary(
         ],
         "pending": [row.__dict__ for row in pending],
         "repeat_summary": repeat_summary,
+        "promotion_readiness": promotion_readiness,
     }
     if any(row.get("status") != "ok" for row in completed):
         summary["status"] = "failed" if not running else "running_with_failures"
@@ -667,6 +909,8 @@ def summarize_repeats(
     completed: list[dict[str, Any]],
     running: list[RunningRow],
     pending: list[Row],
+    *,
+    modal_gpu: str = "",
 ) -> dict[str, Any]:
     expected: dict[str, dict[str, Any]] = {}
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -693,6 +937,7 @@ def summarize_repeats(
             ]
         )
         metrics = repeat_metric_summary(ok_results)
+        stability = repeat_group_stability(metrics, modal_gpu=modal_gpu)
         if failed_results:
             status = "failed"
         elif len(ok_results) >= expected_repeats:
@@ -707,6 +952,8 @@ def summarize_repeats(
             "ok_repeats": len(ok_results),
             "failed_repeats": len(failed_results),
             "metrics": metrics,
+            "diagnostics": repeat_group_diagnostics(metrics),
+            "stability": stability,
             "runs": [
                 {
                     "run_id": result.get("run_id"),
@@ -718,20 +965,32 @@ def summarize_repeats(
             ],
         }
     comparisons = summarize_repeat_comparisons(summaries)
+    prediction_comparisons = summarize_repeat_prediction_comparisons(completed)
+    train_order_comparisons = summarize_repeat_train_order_comparisons(completed)
+    train_order_pairing_errors = repeat_train_order_pairing_errors(
+        completed,
+        train_order_comparisons,
+    )
     return {
         "schema_version": 1,
+        "stability_thresholds": STABILITY_THRESHOLDS,
+        "modal_gpu": modal_gpu or None,
         "status": "failed"
         if any(group["status"] == "failed" for group in summaries.values())
+        or train_order_pairing_errors
         else "ok"
         if summaries and all(group["status"] == "ok" for group in summaries.values())
         else "running",
         "groups": summaries,
         "comparisons": comparisons,
+        "prediction_comparisons": prediction_comparisons,
+        "train_order_comparisons": train_order_comparisons,
+        "train_order_pairing_errors": train_order_pairing_errors,
     }
 
 
 def repeat_metric_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
+    metrics = {
         "train_samples_per_second": summarize_metric_values(
             extract_metric(result, "train_samples_per_second") for result in results
         ),
@@ -764,11 +1023,14 @@ def repeat_metric_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
             extract_metric(result, "train_native_prefetch_runs_per_batch")
             for result in results
         ),
-        "gpu_pss_mb": summarize_metric_values(extract_metric(result, "gpu_pss_mb") for result in results),
-        "cache_image_pss_mb": summarize_metric_values(
-            extract_metric(result, "cache_image_pss_mb") for result in results
-        ),
     }
+    for metric in (*PROFILE_PHASE_METRICS, *PROFILE_EVENT_METRICS):
+        metrics[metric] = summarize_metric_values(extract_metric(result, metric) for result in results)
+    for metric in MEMORY_METRICS:
+        metrics[metric] = summarize_metric_values(extract_metric(result, metric) for result in results)
+    for metric in RUNTIME_METRICS:
+        metrics[metric] = summarize_metric_values(extract_metric(result, metric) for result in results)
+    return metrics
 
 
 def summarize_repeat_comparisons(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -800,13 +1062,529 @@ def summarize_repeat_comparisons(groups: dict[str, dict[str, Any]]) -> dict[str,
             "status": "ok" if train_speedup is not None else "insufficient_data",
             "train_samples_per_second_speedup": train_speedup,
             "profile_end_to_end_speedup": profile_speedup,
+            "phase_delta_ms_per_batch": metric_deltas(group, raw_group, PROFILE_PHASE_METRICS),
+            "phase_ratio": metric_ratios(group, raw_group, PROFILE_PHASE_METRICS),
+            "memory_delta_mb": metric_deltas(group, raw_group, MEMORY_METRICS),
+            "train_samples_per_second_per_gpu_pss_gb_delta": delta_or_none(
+                samples_per_second_per_gpu_pss_gb(group),
+                samples_per_second_per_gpu_pss_gb(raw_group),
+            ),
         }
     return comparisons
+
+
+def summarize_repeat_prediction_comparisons(results: list[dict[str, Any]]) -> dict[str, Any]:
+    ok_results = [result for result in results if result.get("status") == "ok"]
+    raw_results = [
+        result
+        for result in ok_results
+        if result.get("baseline") == "pytorch_raw"
+        and result_prediction_summary(result).get("status") == "ok"
+    ]
+    if not raw_results:
+        return {}
+    by_repeat = {int(result.get("repeat_index") or 0): result for result in raw_results}
+    fallback_raw = raw_results[0]
+    comparisons: dict[str, Any] = {}
+    for result in ok_results:
+        if result.get("baseline") == "pytorch_raw":
+            continue
+        candidate = result_prediction_summary(result)
+        if candidate.get("status") != "ok":
+            continue
+        repeat_index = int(result.get("repeat_index") or 0)
+        raw_result = by_repeat.get(repeat_index, fallback_raw)
+        raw = result_prediction_summary(raw_result)
+        key = (
+            f"{repeat_group_key(result)}:r{repeat_index + 1:02d}:"
+            f"vs:{repeat_group_key(raw_result)}:r{int(raw_result.get('repeat_index') or 0) + 1:02d}"
+        )
+        comparisons[key] = paired_prediction_summary(candidate=candidate, raw=raw)
+    return comparisons
+
+
+def summarize_repeat_train_order_comparisons(results: list[dict[str, Any]]) -> dict[str, Any]:
+    ok_results = [result for result in results if result.get("status") == "ok"]
+    raw_results = [
+        result
+        for result in ok_results
+        if result.get("baseline") == "pytorch_raw"
+        and result_train_order_summary(result).get("status") == "ok"
+    ]
+    if not raw_results:
+        return {}
+    by_repeat = {int(result.get("repeat_index") or 0): result for result in raw_results}
+    fallback_raw = raw_results[0]
+    comparisons: dict[str, Any] = {}
+    for result in ok_results:
+        if result.get("baseline") == "pytorch_raw":
+            continue
+        candidate = result_train_order_summary(result)
+        if candidate.get("status") != "ok":
+            continue
+        repeat_index = int(result.get("repeat_index") or 0)
+        raw_result = by_repeat.get(repeat_index, fallback_raw)
+        raw = result_train_order_summary(raw_result)
+        key = (
+            f"{repeat_group_key(result)}:r{repeat_index + 1:02d}:"
+            f"vs:{repeat_group_key(raw_result)}:r{int(raw_result.get('repeat_index') or 0) + 1:02d}"
+        )
+        comparisons[key] = paired_train_order_summary(candidate=candidate, raw=raw)
+    return comparisons
+
+
+def repeat_train_order_pairing_errors(
+    results: list[dict[str, Any]],
+    comparisons: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    for result in results:
+        if result.get("status") != "ok" or result.get("baseline") == "pytorch_raw":
+            continue
+        metadata = ((result.get("environment") or {}).get("run_metadata") or {})
+        if not bool(metadata.get("paired_train_order")):
+            continue
+        repeat_index = int(result.get("repeat_index") or 0)
+        prefix = f"{repeat_group_key(result)}:r{repeat_index + 1:02d}:"
+        matched = [
+            comparison
+            for key, comparison in comparisons.items()
+            if key.startswith(prefix)
+        ]
+        if not matched:
+            errors.append(
+                f"{repeat_group_key(result)} repeat {repeat_index + 1} has no paired "
+                "train-order comparison against pytorch_raw"
+            )
+            continue
+        if not any(isinstance(comparison, dict) and comparison.get("paired") is True for comparison in matched):
+            errors.append(
+                f"{repeat_group_key(result)} repeat {repeat_index + 1} train order is not paired"
+            )
+    return errors
+
+
+def repeat_group_stability(metrics: dict[str, Any], *, modal_gpu: str = "") -> dict[str, Any]:
+    thresholds = stability_thresholds_for(modal_gpu)
+    train_metric = metrics.get("train_samples_per_second") or {}
+    return {
+        "metric": "train_samples_per_second",
+        "classification": classify_metric_cv(train_metric, thresholds),
+        "cv_percent": numeric_value(train_metric.get("cv_percent")),
+        "count": int(train_metric.get("count") or 0),
+        "thresholds": thresholds,
+    }
+
+
+def stability_thresholds_for(modal_gpu: str = "") -> dict[str, float]:
+    gpu = (modal_gpu or "").upper()
+    if gpu in STABILITY_THRESHOLDS:
+        return dict(STABILITY_THRESHOLDS[gpu])
+    return dict(STABILITY_THRESHOLDS["H100"])
+
+
+def classify_metric_cv(metric: dict[str, Any], thresholds: dict[str, float]) -> str:
+    count = int(metric.get("count") or 0)
+    if count < 2:
+        return "insufficient_repeats"
+    cv = numeric_value(metric.get("cv_percent"))
+    if cv is None:
+        return "insufficient_data"
+    if cv <= thresholds["train_samples_per_second_cv_ok_percent"]:
+        return "ok"
+    if cv <= thresholds["train_samples_per_second_cv_warn_percent"]:
+        return "warn"
+    return "reject"
+
+
+def load_comparator_repeat_summary(path: Path | None) -> tuple[str, dict[str, Any]] | None:
+    if path is None:
+        return None
+    batch_summary_path = path / "batch-summary.json"
+    repeat_summary_path = path / "repeat-summary.json"
+    if batch_summary_path.exists():
+        summary = load_json_if_exists(batch_summary_path)
+        return str(summary.get("batch_id") or path.name), summary.get("repeat_summary") or {}
+    if repeat_summary_path.exists():
+        return path.name, load_json_if_exists(repeat_summary_path)
+    return None
+
+
+def promotion_readiness_report(
+    repeat_summary: dict[str, Any],
+    *,
+    batch_id: str,
+    modal_gpu: str = "",
+    comparator_summary: dict[str, Any] | None = None,
+    comparator_batch_id: str | None = None,
+) -> dict[str, Any]:
+    groups = repeat_summary.get("groups") or {}
+    raw_key, raw_group, raw_source = promotion_denominator(
+        groups=groups,
+        batch_id=batch_id,
+        comparator_summary=comparator_summary,
+        comparator_batch_id=comparator_batch_id,
+    )
+    raw_comparators = raw_comparator_readiness(groups, modal_gpu=modal_gpu)
+    candidates: dict[str, Any] = {}
+    for key, group in groups.items():
+        if group.get("baseline") == "pytorch_raw":
+            continue
+        if group.get("status") != "ok":
+            continue
+        candidate_stability = group.get("stability") or repeat_group_stability(
+            group.get("metrics") or {},
+            modal_gpu=modal_gpu,
+        )
+        candidate_reasons: list[str] = []
+        candidate_status = "eligible"
+        if not raw_group:
+            candidate_status = "rejected"
+            candidate_reasons.append(
+                "H100 medkit speed promotion requires a same-batch raw row or an external stable raw-control batch"
+            )
+        else:
+            raw_stability = raw_group.get("stability") or repeat_group_stability(
+                raw_group.get("metrics") or {},
+                modal_gpu=modal_gpu,
+            )
+            raw_classification = raw_stability.get("classification")
+            candidate_classification = candidate_stability.get("classification")
+            if raw_classification == "reject":
+                candidate_status = "rejected"
+                candidate_reasons.append("raw comparator train_samples_per_second CV exceeds reject threshold")
+            elif raw_classification == "warn":
+                candidate_status = "warning"
+                candidate_reasons.append("raw comparator train_samples_per_second CV is in warning range")
+            elif raw_classification != "ok":
+                candidate_status = "rejected"
+                candidate_reasons.append(f"raw comparator stability is {raw_classification!r}")
+            if candidate_classification == "reject":
+                candidate_status = "rejected"
+                candidate_reasons.append("candidate train_samples_per_second CV exceeds reject threshold")
+            elif candidate_classification == "warn" and candidate_status == "eligible":
+                candidate_status = "warning"
+                candidate_reasons.append("candidate train_samples_per_second CV is in warning range")
+            elif candidate_classification != "ok":
+                candidate_status = "rejected"
+                candidate_reasons.append(f"candidate stability is {candidate_classification!r}")
+        candidates[key] = {
+            "status": candidate_status,
+            "reasons": candidate_reasons,
+            "candidate_stability": candidate_stability,
+            "speedup_denominator": (
+                {
+                    "batch_id": raw_source.get("batch_id"),
+                    "group_key": raw_key,
+                    "source": raw_source.get("source"),
+                    "stability": raw_group.get("stability") if raw_group else None,
+                }
+                if raw_group
+                else None
+            ),
+        }
+    statuses = [candidate.get("status") for candidate in candidates.values()]
+    if any(status == "eligible" for status in statuses):
+        status = "eligible"
+    elif any(status == "warning" for status in statuses):
+        status = "warning"
+    elif candidates:
+        status = "rejected"
+    elif any(row.get("status") == "eligible" for row in raw_comparators.values()):
+        status = "comparator_ready"
+    else:
+        status = "no_speed_candidates"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "modal_gpu": modal_gpu or None,
+        "thresholds": STABILITY_THRESHOLDS,
+        "batch_id": batch_id,
+        "raw_comparators": raw_comparators,
+        "candidates": candidates,
+    }
+
+
+def raw_comparator_readiness(groups: dict[str, Any], *, modal_gpu: str) -> dict[str, Any]:
+    comparators: dict[str, Any] = {}
+    for key, group in groups.items():
+        if group.get("baseline") != "pytorch_raw" or group.get("status") != "ok":
+            continue
+        stability = group.get("stability") or repeat_group_stability(
+            group.get("metrics") or {},
+            modal_gpu=modal_gpu,
+        )
+        classification = stability.get("classification")
+        if classification == "ok":
+            status = "eligible"
+        elif classification == "warn":
+            status = "warning"
+        else:
+            status = "rejected"
+        comparators[key] = {
+            "status": status,
+            "stability": stability,
+            "role": "raw_speed_denominator",
+        }
+    return comparators
+
+
+def promotion_denominator(
+    *,
+    groups: dict[str, Any],
+    batch_id: str,
+    comparator_summary: dict[str, Any] | None,
+    comparator_batch_id: str | None,
+) -> tuple[str | None, dict[str, Any] | None, dict[str, str]]:
+    if comparator_summary:
+        comparator_groups = comparator_summary.get("groups") or {}
+        raw_groups = [
+            (key, group)
+            for key, group in comparator_groups.items()
+            if group.get("baseline") == "pytorch_raw" and group.get("status") == "ok"
+        ]
+        if raw_groups:
+            key, group = raw_groups[0]
+            return key, group, {
+                "source": "external_comparator_batch",
+                "batch_id": comparator_batch_id or "external",
+            }
+    raw_groups = [
+        (key, group)
+        for key, group in groups.items()
+        if group.get("baseline") == "pytorch_raw" and group.get("status") == "ok"
+    ]
+    if raw_groups:
+        key, group = raw_groups[0]
+        return key, group, {"source": "same_batch", "batch_id": batch_id}
+    return None, None, {}
+
+
+def result_prediction_summary(result: dict[str, Any]) -> dict[str, Any]:
+    baseline = str(result.get("baseline") or "")
+    predictions = result.get("predictions") or {}
+    summary = (predictions.get("baselines") or {}).get(baseline)
+    return summary if isinstance(summary, dict) else {}
+
+
+def result_train_order_summary(result: dict[str, Any]) -> dict[str, Any]:
+    baseline = str(result.get("baseline") or "")
+    train_order = result.get("train_order") or {}
+    summary = (train_order.get("baselines") or {}).get(baseline)
+    return summary if isinstance(summary, dict) else {}
+
+
+def paired_train_order_summary(
+    *,
+    candidate: dict[str, Any],
+    raw: dict[str, Any],
+) -> dict[str, Any]:
+    candidate_hashes = candidate.get("hashes") or {}
+    raw_hashes = raw.get("hashes") or {}
+    return {
+        "paired": (
+            candidate_hashes.get("train_sample_order_hash")
+            == raw_hashes.get("train_sample_order_hash")
+            and candidate_hashes.get("train_sample_multiset_hash")
+            == raw_hashes.get("train_sample_multiset_hash")
+            and candidate_hashes.get("dropped_samples_by_epoch_hash")
+            == raw_hashes.get("dropped_samples_by_epoch_hash")
+        ),
+        "identical_train_order": (
+            candidate_hashes.get("train_sample_order_hash")
+            == raw_hashes.get("train_sample_order_hash")
+        ),
+        "identical_train_sample_multiset": (
+            candidate_hashes.get("train_sample_multiset_hash")
+            == raw_hashes.get("train_sample_multiset_hash")
+        ),
+        "identical_dropped_samples_by_epoch": (
+            candidate_hashes.get("dropped_samples_by_epoch_hash")
+            == raw_hashes.get("dropped_samples_by_epoch_hash")
+        ),
+        "identical_batch_label_sums": (
+            candidate_hashes.get("batch_label_sums_hash")
+            == raw_hashes.get("batch_label_sums_hash")
+        ),
+        "candidate_same_train_order_each_epoch": candidate.get("same_train_order_each_epoch"),
+        "raw_same_train_order_each_epoch": raw.get("same_train_order_each_epoch"),
+        "candidate_train_batches": candidate.get("train_batches"),
+        "raw_train_batches": raw.get("train_batches"),
+        "candidate_train_samples": candidate.get("train_samples"),
+        "raw_train_samples": raw.get("train_samples"),
+        "epoch_deltas": paired_train_order_epoch_deltas(
+            candidate_epochs=candidate.get("epoch_summaries") or [],
+            raw_epochs=raw.get("epoch_summaries") or [],
+        ),
+    }
+
+
+def paired_train_order_epoch_deltas(
+    *,
+    candidate_epochs: Sequence[dict[str, Any]],
+    raw_epochs: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    raw_by_epoch = {
+        int(row.get("epoch")): row for row in raw_epochs if row.get("epoch") is not None
+    }
+    deltas: dict[str, Any] = {}
+    for candidate_row in candidate_epochs:
+        if candidate_row.get("epoch") is None:
+            continue
+        epoch = int(candidate_row.get("epoch"))
+        raw_row = raw_by_epoch.get(epoch, {})
+        candidate_dropped = set(str(value) for value in candidate_row.get("dropped_sample_ids", []))
+        raw_dropped = set(str(value) for value in raw_row.get("dropped_sample_ids", []))
+        deltas[str(epoch)] = {
+            "identical_order": candidate_row.get("sample_order_hash")
+            == raw_row.get("sample_order_hash"),
+            "candidate_dropped_sample_count": candidate_row.get("dropped_sample_count"),
+            "raw_dropped_sample_count": raw_row.get("dropped_sample_count"),
+            "shared_dropped_sample_count": len(candidate_dropped & raw_dropped),
+            "candidate_only_dropped_sample_count": len(candidate_dropped - raw_dropped),
+            "raw_only_dropped_sample_count": len(raw_dropped - candidate_dropped),
+            "candidate_dropped_target_counts": candidate_row.get("dropped_target_counts"),
+            "raw_dropped_target_counts": raw_row.get("dropped_target_counts"),
+        }
+    return deltas
+
+
+def paired_prediction_summary(
+    *,
+    candidate: dict[str, Any],
+    raw: dict[str, Any],
+) -> dict[str, Any]:
+    candidate_ids = [str(value) for value in candidate.get("sample_ids", [])]
+    raw_ids = [str(value) for value in raw.get("sample_ids", [])]
+    candidate_set = set(candidate_ids)
+    raw_set = set(raw_ids)
+    candidate_metrics = candidate.get("metric_recompute") or {}
+    raw_metrics = raw.get("metric_recompute") or {}
+    missing_from_raw = sorted(candidate_set - raw_set)
+    missing_from_candidate = sorted(raw_set - candidate_set)
+    label_mask_hash_match = (
+        (candidate.get("hashes") or {}).get("label_mask_hash")
+        == (raw.get("hashes") or {}).get("label_mask_hash")
+    )
+    identical_target_order = candidate.get("target_names") == raw.get("target_names")
+    paired = (
+        not missing_from_raw
+        and not missing_from_candidate
+        and candidate_ids == raw_ids
+        and identical_target_order
+        and label_mask_hash_match
+    )
+    return {
+        "paired": paired,
+        "matched_sample_count": len(candidate_set.intersection(raw_set)),
+        "missing_from_raw_count": len(missing_from_raw),
+        "missing_from_candidate_count": len(missing_from_candidate),
+        "missing_from_medkit_count": len(missing_from_candidate),
+        "identical_order": candidate_ids == raw_ids,
+        "identical_target_order": identical_target_order,
+        "label_mask_hash_match": label_mask_hash_match,
+        "threshold_hash_match": (
+            (candidate.get("hashes") or {}).get("threshold_hash")
+            == (raw.get("hashes") or {}).get("threshold_hash")
+        ),
+        "macro_auroc_delta": delta_or_none(
+            numeric_value(candidate_metrics.get("macro_auroc")),
+            numeric_value(raw_metrics.get("macro_auroc")),
+        ),
+        "macro_auprc_delta": delta_or_none(
+            numeric_value(candidate_metrics.get("macro_auprc")),
+            numeric_value(raw_metrics.get("macro_auprc")),
+        ),
+        "target_metric_deltas": target_metric_deltas(candidate_metrics, raw_metrics),
+    }
+
+
+def target_metric_deltas(candidate_metrics: dict[str, Any], raw_metrics: dict[str, Any]) -> dict[str, Any]:
+    candidate_targets = candidate_metrics.get("targets") or {}
+    raw_targets = raw_metrics.get("targets") or {}
+    deltas: dict[str, Any] = {}
+    for target in sorted(set(candidate_targets).intersection(raw_targets)):
+        candidate_row = candidate_targets.get(target) or {}
+        raw_row = raw_targets.get(target) or {}
+        deltas[target] = {
+            "auroc_delta": delta_or_none(
+                numeric_value(candidate_row.get("auroc")),
+                numeric_value(raw_row.get("auroc")),
+            ),
+            "auprc_delta": delta_or_none(
+                numeric_value(candidate_row.get("auprc")),
+                numeric_value(raw_row.get("auprc")),
+            ),
+        }
+    return deltas
+
+
+def repeat_group_diagnostics(metrics: dict[str, Any]) -> dict[str, Any]:
+    phase_means = {
+        metric: numeric_value(metrics.get(metric, {}).get("mean"))
+        for metric in PROFILE_PHASE_METRICS
+    }
+    phase_means = {metric: value for metric, value in phase_means.items() if value is not None}
+    largest_phase = None
+    if phase_means:
+        largest_metric, largest_value = max(phase_means.items(), key=lambda item: item[1])
+        largest_phase = {"metric": largest_metric, "mean_ms_per_batch": largest_value}
+    return {
+        "largest_profile_phase": largest_phase,
+        "train_samples_per_second_per_gpu_pss_gb": samples_per_second_per_gpu_pss_gb(
+            {"metrics": metrics}
+        ),
+        "cache_image_pss_mb": numeric_value(metrics.get("cache_image_pss_mb", {}).get("mean")),
+        "gpu_pss_mb": numeric_value(metrics.get("gpu_pss_mb", {}).get("mean")),
+        "profile_step_accounted_percent": numeric_value(
+            metrics.get("profile_step_accounted_percent", {}).get("mean")
+        ),
+    }
 
 
 def metric_mean(group: dict[str, Any], metric: str) -> float | None:
     value = ((group.get("metrics") or {}).get(metric) or {}).get("mean")
     return numeric_value(value)
+
+
+def metric_deltas(
+    candidate: dict[str, Any],
+    baseline: dict[str, Any],
+    metrics: Sequence[str],
+) -> dict[str, float]:
+    deltas: dict[str, float] = {}
+    for metric in metrics:
+        delta = delta_or_none(metric_mean(candidate, metric), metric_mean(baseline, metric))
+        if delta is not None:
+            deltas[metric] = delta
+    return deltas
+
+
+def metric_ratios(
+    candidate: dict[str, Any],
+    baseline: dict[str, Any],
+    metrics: Sequence[str],
+) -> dict[str, float]:
+    ratios: dict[str, float] = {}
+    for metric in metrics:
+        ratio = ratio_or_none(metric_mean(candidate, metric), metric_mean(baseline, metric))
+        if ratio is not None:
+            ratios[metric] = ratio
+    return ratios
+
+
+def delta_or_none(candidate: float | None, baseline: float | None) -> float | None:
+    if candidate is None or baseline is None:
+        return None
+    return candidate - baseline
+
+
+def samples_per_second_per_gpu_pss_gb(group: dict[str, Any]) -> float | None:
+    samples_per_second = metric_mean(group, "train_samples_per_second")
+    gpu_pss_mb = metric_mean(group, "gpu_pss_mb")
+    if samples_per_second is None or gpu_pss_mb is None or gpu_pss_mb <= 0.0:
+        return None
+    return samples_per_second / (gpu_pss_mb / 1024.0)
 
 
 def ratio_or_none(numerator: float | None, denominator: float | None) -> float | None:
@@ -822,6 +1600,7 @@ def extract_metric(result: dict[str, Any], metric: str) -> float | None:
     profile_row = ((result.get("profile") or {}).get(baseline) or {})
     profile_summary = profile_row.get("summary") or {}
     memory = gpu_row.get("memory") or {}
+    loader_memory = loader_row.get("memory") or {}
     fields = {
         "train_samples_per_second": gpu_row.get("samples_per_second"),
         "profile_end_to_end_samples_per_second": profile_summary.get(
@@ -829,6 +1608,9 @@ def extract_metric(result: dict[str, Any], metric: str) -> float | None:
         ),
         "loader_samples_per_second": loader_row.get("samples_per_second"),
         "data_wait_percent": gpu_row.get("data_wait_percent"),
+        "warmup_ms": gpu_row.get("warmup_ms"),
+        "torch_compile_setup_ms": gpu_row.get("torch_compile_setup_ms"),
+        "cuda_peak_allocated_mb": gpu_row.get("cuda_peak_allocated_mb"),
         "train_native_prefetch_read_ms_per_batch": gpu_row.get(
             "train_native_prefetch_read_ms_per_batch"
         ),
@@ -845,9 +1627,24 @@ def extract_metric(result: dict[str, Any], metric: str) -> float | None:
             "train_native_prefetch_runs_per_batch"
         ),
         "gpu_pss_mb": memory.get("smaps_pss_mb"),
+        "gpu_anon_pss_mb": memory.get("smaps_pss_anon_mb"),
+        "gpu_file_pss_mb": memory.get("smaps_pss_file_mb"),
+        "gpu_private_dirty_mb": memory.get("smaps_private_dirty_mb"),
+        "gpu_pinned_estimated_mb": memory.get("estimated_pinned_memory_mb"),
         "cache_image_pss_mb": memory.get("smaps_pss_cache_images_mb"),
+        "loader_pss_mb": loader_memory.get("smaps_pss_mb"),
+        "loader_cache_image_pss_mb": loader_memory.get("smaps_pss_cache_images_mb"),
     }
-    return numeric_value(fields.get(metric))
+    value = fields.get(metric)
+    if value is None and metric.startswith("profile_"):
+        value = profile_summary.get(f"{metric}_mean")
+    if value is None and metric in (
+        "profile_step_accounted_percent",
+        "profile_residual_step_signed_percent",
+        "profile_step_reconciled_percent",
+    ):
+        value = profile_summary.get(metric)
+    return numeric_value(value)
 
 
 def summarize_metric_values(values: Iterable[float | None]) -> dict[str, Any]:
@@ -903,12 +1700,17 @@ def validate_row_artifacts(
     environment: dict[str, Any],
     summary_consistency: dict[str, Any] | None = None,
     quality_gate: dict[str, Any] | None = None,
+    predictions: dict[str, Any] | None = None,
+    train_order: dict[str, Any] | None = None,
+    artifact_dir: Path | None = None,
 ) -> list[str]:
     errors: list[str] = []
     baseline = active.row.baseline
     quality_gate = quality_gate or {}
     summary_consistency = summary_consistency or {}
     metadata = environment.get("run_metadata") or {}
+    predictions = predictions or {}
+    train_order = train_order or {}
 
     if returncode != 0:
         errors.append(f"modal command returned {returncode}")
@@ -955,6 +1757,18 @@ def validate_row_artifacts(
         artifact_name="summary-consistency.json",
         local_artifact=summary_consistency,
     )
+    compare_modal_artifact(
+        errors,
+        modal_result=modal_result,
+        artifact_name="eval-predictions-summary.json",
+        local_artifact=predictions,
+    )
+    compare_modal_artifact(
+        errors,
+        modal_result=modal_result,
+        artifact_name="train-order-summary.json",
+        local_artifact=train_order,
+    )
 
     loader_row = loader.get(baseline)
     gpu_row = gpu.get(baseline)
@@ -972,11 +1786,35 @@ def validate_row_artifacts(
             f"quality-gate status is {quality_gate.get('status')!r}: "
             + "; ".join(str(error) for error in quality_gate.get("errors", []))
         )
+    validate_prediction_artifacts(
+        errors=errors,
+        baseline=baseline,
+        row_dir=artifact_dir,
+        quality_row=quality_row if isinstance(quality_row, dict) else {},
+        predictions=predictions,
+        quality_gate_enabled=bool(metadata.get("quality_gate")),
+    )
+    validate_train_order_artifacts(
+        errors=errors,
+        baseline=baseline,
+        row_dir=artifact_dir,
+        gpu_row=gpu_row,
+        train_order=train_order,
+        train_order_required=bool(metadata.get("train_order_evidence")),
+    )
 
     if loader_row.get("status") and loader_row.get("status") != "ok":
         errors.append(f"loader status is {loader_row.get('status')!r}")
     if gpu_row.get("status") and gpu_row.get("status") != "ok":
         errors.append(f"gpu status is {gpu_row.get('status')!r}")
+    if metadata.get("channels_last"):
+        if gpu_row.get("channels_last_active") is not True:
+            errors.append("channels-last requested but gpu row did not report it active")
+        if gpu_row.get("channels_last_all_checked_batches") is not True:
+            errors.append("channels-last requested but not all checked train batches were channels-last")
+    if metadata.get("torch_compile"):
+        if gpu_row.get("torch_compile_status") != "active":
+            errors.append("torch.compile requested but gpu row did not report active compilation")
     compare_float(
         errors,
         "train samples/s",
@@ -1046,8 +1884,17 @@ def validate_row_artifacts(
                 f"{phase} pipeline read_mode {pipeline.get('read_mode')!r} "
                 f"!= expected {active.row.read_mode!r}"
             )
-        if active.row.baseline.startswith("medkit") and pipeline.get("include_metadata") is not False:
-            errors.append(f"{phase} pipeline include_metadata is not false")
+        expected_include_metadata = bool(
+            metadata.get("include_metadata") or metadata.get("train_order_evidence")
+        )
+        if (
+            active.row.baseline.startswith("medkit")
+            and pipeline.get("include_metadata") is not expected_include_metadata
+        ):
+            errors.append(
+                f"{phase} pipeline include_metadata {pipeline.get('include_metadata')!r} "
+                f"!= expected {expected_include_metadata!r}"
+            )
         validate_pipeline_request_metadata(
             errors=errors,
             context=phase,
@@ -1091,6 +1938,80 @@ def validate_pipeline_request_metadata(
                     f"{context} pipeline {field} {pipeline.get(field)!r} "
                     f"!= expected {expected!r}"
                 )
+
+
+def validate_prediction_artifacts(
+    *,
+    errors: list[str],
+    baseline: str,
+    row_dir: Path | None,
+    quality_row: dict[str, Any],
+    predictions: dict[str, Any],
+    quality_gate_enabled: bool,
+) -> None:
+    if not quality_gate_enabled:
+        return
+    if not predictions:
+        errors.append("missing eval-predictions-summary.json for quality-gated row")
+        return
+    baseline_summary = ((predictions.get("baselines") or {}).get(baseline) or {})
+    if not isinstance(baseline_summary, dict) or not baseline_summary:
+        errors.append(f"eval-predictions-summary missing baseline {baseline!r}")
+        return
+    if baseline_summary.get("enabled") is not True:
+        errors.append(f"{baseline} prediction capture not enabled")
+    if baseline_summary.get("status") != "ok":
+        errors.append(f"{baseline} prediction summary status is {baseline_summary.get('status')!r}")
+    artifact_name = baseline_summary.get("artifact_path")
+    if not artifact_name:
+        errors.append(f"{baseline} prediction artifact path missing")
+    elif row_dir is not None and not (row_dir / str(artifact_name)).exists():
+        errors.append(f"{baseline} prediction artifact missing: {artifact_name}")
+    if baseline_summary.get("metric_recompute_matches_quality") is not True:
+        errors.append(f"{baseline} prediction metrics did not match model-quality.json")
+    if baseline_summary.get("metric_recompute_matches_artifact") is not True:
+        errors.append(f"{baseline} prediction summary did not match artifact rows")
+    quality_capture = quality_row.get("prediction_capture") or {}
+    if quality_capture.get("enabled") is not True:
+        errors.append(f"{baseline} model-quality prediction_capture not enabled")
+    if quality_row.get("metric_recompute_matches_predictions") is not True:
+        errors.append(f"{baseline} model-quality metric recompute flag is not true")
+
+
+def validate_train_order_artifacts(
+    *,
+    errors: list[str],
+    baseline: str,
+    row_dir: Path | None,
+    gpu_row: dict[str, Any],
+    train_order: dict[str, Any],
+    train_order_required: bool,
+) -> None:
+    if not train_order_required:
+        return
+    if not train_order:
+        errors.append("missing train-order-summary.json for train-order-evidence row")
+        return
+    baseline_summary = ((train_order.get("baselines") or {}).get(baseline) or {})
+    if not isinstance(baseline_summary, dict) or not baseline_summary:
+        errors.append(f"train-order-summary missing baseline {baseline!r}")
+        return
+    if baseline_summary.get("enabled") is not True:
+        errors.append(f"{baseline} train order evidence not enabled")
+    if baseline_summary.get("status") != "ok":
+        errors.append(f"{baseline} train order summary status is {baseline_summary.get('status')!r}")
+    artifact_name = baseline_summary.get("artifact_path")
+    if not artifact_name:
+        errors.append(f"{baseline} train order artifact path missing")
+    elif row_dir is not None and not (row_dir / str(artifact_name)).exists():
+        errors.append(f"{baseline} train order artifact missing: {artifact_name}")
+    if baseline_summary.get("artifact_recheck_matches_summary") is not True:
+        errors.append(f"{baseline} train order artifact recheck did not match summary")
+    capture = gpu_row.get("train_order_capture") or {}
+    if capture.get("enabled") is not True:
+        errors.append(f"{baseline} gpu train_order_capture not enabled")
+    if capture.get("status") != "ok":
+        errors.append(f"{baseline} gpu train_order_capture status is {capture.get('status')!r}")
 
 
 def validate_memory_telemetry(
@@ -1178,6 +2099,9 @@ def validate_summary_provenance_artifacts(
         "gpu_prefetch_batches",
         "gpu_prefetch_reuse_buffers",
         "sync_every_step",
+        "channels_last",
+        "torch_compile",
+        "torch_compile_mode",
         "loss_pos_weight",
         "quality_gate",
         "quality_min_eval_samples",
@@ -1224,12 +2148,18 @@ def validate_summary_provenance_artifacts(
             "gpu_prefetch_batches",
             "gpu_prefetch_reuse_buffers",
             "sync_every_step",
+            "channels_last",
+            "torch_compile",
+            "torch_compile_mode",
             "loss_pos_weight",
             "quality_gate",
             "quality_min_eval_samples",
             "quality_min_metric_targets",
             "quality_min_macro_auroc",
             "quality_min_macro_auprc",
+            "eval_predictions",
+            "train_order_evidence",
+            "paired_train_order",
             "profile_batches",
             "seed",
         ):
@@ -1243,6 +2173,18 @@ def validate_summary_provenance_artifacts(
         errors.append("provenance summary_consistency artifact path missing")
     if profile_batches_requested(provenance) > 0 and artifacts.get("step_profile") != "step-profile.json":
         errors.append("provenance step_profile artifact path missing")
+    ground_truth_artifact = artifacts.get("training_ground_truth")
+    if ground_truth_artifact is not None and ground_truth_artifact != "training-ground-truth.json":
+        errors.append("provenance training_ground_truth artifact path invalid")
+    splits_artifact = artifacts.get("splits")
+    if splits_artifact is not None and splits_artifact != "splits.json":
+        errors.append("provenance splits artifact path invalid")
+    predictions_artifact = artifacts.get("eval_predictions_summary")
+    if predictions_artifact is not None and predictions_artifact != "eval-predictions-summary.json":
+        errors.append("provenance eval_predictions_summary artifact path invalid")
+    train_order_artifact = artifacts.get("train_order_summary")
+    if train_order_artifact is not None and train_order_artifact != "train-order-summary.json":
+        errors.append("provenance train_order_summary artifact path invalid")
 
 
 def validate_profile_artifacts(
@@ -1297,13 +2239,26 @@ def profile_summary_fields() -> tuple[str, ...]:
         "profile_train_samples_per_s",
         "profile_end_to_end_ms",
         "profile_end_to_end_samples_per_s",
+        "profile_step_accounted_percent",
+        "profile_residual_step_signed_total_ms",
+        "profile_residual_step_signed_percent",
+        "profile_step_reconciled_percent",
     ]
     for field in (
         "data_wait_ms",
         "h2d_ms",
+        "batch_prepare_ms",
+        "batch_prepare_wall_ms",
+        "zero_grad_wall_ms",
         "forward_ms",
         "backward_ms",
         "optimizer_ms",
+        "prefetch_maintenance_wall_ms",
+        "accounted_step_ms",
+        "residual_step_ms",
+        "residual_step_ms_signed",
+        "residual_step_percent",
+        "total_step_ms",
     ):
         fields.extend(
             [
@@ -1326,6 +2281,25 @@ def validate_profile_records(
     profiled_samples = 0
     data_wait_total_ms = 0.0
     total_step_ms = 0.0
+    required_record_fields = {
+        "data_wait_ms",
+        "h2d_ms",
+        "forward_ms",
+        "backward_ms",
+        "optimizer_ms",
+        "total_step_ms",
+    }
+    optional_record_fields = {
+        "batch_prepare_ms",
+        "batch_prepare_wall_ms",
+        "zero_grad_wall_ms",
+        "prefetch_maintenance_wall_ms",
+        "accounted_step_ms",
+        "residual_step_ms",
+        "residual_step_ms_signed",
+        "residual_step_percent",
+    }
+    signed_record_fields = {"residual_step_ms_signed", "residual_step_percent"}
     for index, record in enumerate(records):
         if not isinstance(record, dict):
             errors.append(f"{context} record {index} is not an object")
@@ -1335,16 +2309,15 @@ def validate_profile_records(
             errors.append(f"{context} record {index} samples invalid: {record.get('samples')!r}")
         else:
             profiled_samples += int(samples)
-        for field in (
-            "data_wait_ms",
-            "h2d_ms",
-            "forward_ms",
-            "backward_ms",
-            "optimizer_ms",
-            "total_step_ms",
-        ):
+        for field in (*sorted(required_record_fields), *sorted(optional_record_fields)):
+            if field in optional_record_fields and field not in record:
+                continue
             value = numeric_value(record.get(field))
-            value_valid = value is not None and math.isfinite(value) and value >= 0.0
+            value_valid = (
+                value is not None
+                and math.isfinite(value)
+                and (value >= 0.0 or field in signed_record_fields)
+            )
             if not value_valid:
                 errors.append(f"{context} record {index} {field} invalid: {record.get(field)!r}")
             if field == "data_wait_ms" and value_valid:
@@ -1583,14 +2556,14 @@ def rows_for_settings(settings: dict[str, Any]) -> list[Row]:
     return rows
 
 
-def audit_batch(batch_dir: Path) -> int:
+def audit_batch(batch_dir: Path, *, comparator_batch: Path | None = None) -> int:
     config = load_json_if_exists(batch_dir / "batch-config.json")
     if not config:
         raise FileNotFoundError(f"Missing batch-config.json in {batch_dir}")
     batch_id = str(config.get("batch_id") or batch_dir.name)
+    settings = config.get("settings") or {}
     rows = [Row(**row) for row in config.get("rows", [])]
     if not rows:
-        settings = config.get("settings") or {}
         rows = rows_for_settings(settings)
     completed: list[dict[str, Any]] = []
     started = time.perf_counter()
@@ -1630,10 +2603,33 @@ def audit_batch(batch_dir: Path) -> int:
                 returncode=returncode,
             )
         )
-    write_batch_summary(batch_dir, batch_id, completed, running=[], pending=[], batch_started=started)
+    write_batch_summary(
+        batch_dir,
+        batch_id,
+        completed,
+        running=[],
+        pending=[],
+        batch_started=started,
+        modal_gpu=str(settings.get("modal_gpu") or ""),
+        comparator_batch=comparator_batch,
+    )
     failures = [row for row in completed if row.get("status") != "ok"]
-    print(json.dumps({"batch_id": batch_id, "status": "failed" if failures else "ok", "failures": failures}, indent=2, sort_keys=True))
-    return 1 if failures else 0
+    repeat_summary = load_json_if_exists(batch_dir / "repeat-summary.json")
+    repeat_errors = list(repeat_summary.get("train_order_pairing_errors") or [])
+    status = "failed" if failures or repeat_errors else "ok"
+    print(
+        json.dumps(
+            {
+                "batch_id": batch_id,
+                "status": status,
+                "failures": failures,
+                "repeat_errors": repeat_errors,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 1 if failures or repeat_errors else 0
 
 
 def collect_existing_row(

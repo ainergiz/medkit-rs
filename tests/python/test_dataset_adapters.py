@@ -536,6 +536,27 @@ def test_cxr_native_batch_iterable_covers_range_shuffle_and_validation(
         {"mode": "range", "start": 0, "count": 2, "include_metadata": True}
     ]
 
+    scheduled = ds.MedkitCxrNativeBatchIterableDataset(
+        tmp_path,
+        length=4,
+        batch_size=2,
+        batch_indices_by_iteration=([([2, 0]), ([1, 3])],),
+    )
+    assert list(scheduled) == [
+        {"mode": "indices", "indices": [2, 0], "include_metadata": False},
+        {"mode": "indices", "indices": [1, 3], "include_metadata": False},
+    ]
+    assert scheduled.report_metadata()["batch_schedule"] == "fixed_by_iteration"
+    with pytest.raises(RuntimeError, match="schedule exhausted"):
+        list(scheduled)
+    with pytest.raises(ValueError, match="negative indices"):
+        ds.MedkitCxrNativeBatchIterableDataset(
+            tmp_path,
+            length=4,
+            batch_size=2,
+            batch_indices_by_iteration=([([-1, 0])],),
+        )
+
     with pytest.raises(ValueError, match="batch_size must be greater than zero"):
         ds.MedkitCxrNativeBatchIterableDataset(tmp_path, batch_size=0)
     with pytest.raises(ValueError, match="length cannot exceed"):
@@ -633,6 +654,17 @@ def test_cxr_prefetch_iterable_batches_releases_and_worker_guard(
     assert dataset.__getstate__()["_handle"] is None
     assert FakeCxrCacheHandle.last_prefetch_kwargs is not None
     assert FakeCxrCacheHandle.last_prefetch_kwargs["include_metadata"] is True
+
+    scheduled_prefetch = ds.MedkitCxrNativePrefetchDataset(
+        tmp_path,
+        length=4,
+        batch_size=2,
+        batch_indices_by_iteration=([([3, 1]), ([2, 0])],),
+    )
+    assert scheduled_prefetch._batch_indices() == [[3, 1], [2, 0]]
+    assert scheduled_prefetch.report_metadata()["batch_schedule"] == "fixed_by_iteration"
+    with pytest.raises(RuntimeError, match="schedule exhausted"):
+        scheduled_prefetch._batch_indices()
 
     worker_ds = reload_dataset_module(
         monkeypatch, types.SimpleNamespace(id=0, num_workers=2)
