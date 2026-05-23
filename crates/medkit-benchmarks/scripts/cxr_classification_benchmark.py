@@ -17,6 +17,7 @@ Rust CLI surface. The report records that limitation explicitly.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import gzip
 import hashlib
@@ -147,6 +148,21 @@ def main() -> int:
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--cache-image-size", type=int, default=0)
     parser.add_argument("--cache-dtype", choices=("float32", "float16", "uint8"), default="float32")
+    parser.add_argument(
+        "--cache-build-workers",
+        type=int,
+        default=1,
+        help="Threads used by the Python cache builder. 1 preserves the historical serial path.",
+    )
+    parser.add_argument(
+        "--cache-key-mode",
+        choices=("legacy", "content"),
+        default="legacy",
+        help=(
+            "legacy uses cache-{size}-{dtype}; content includes manifest, transform, "
+            "and target fingerprints so subset/full caches cannot overwrite each other."
+        ),
+    )
     parser.add_argument("--targets", default=",".join(DEFAULT_TARGETS))
     parser.add_argument("--max-samples", type=int, default=6000)
     parser.add_argument("--max-train", type=int, default=4096)
@@ -313,6 +329,14 @@ def main() -> int:
     parser.add_argument("--force-rematerialize", action="store_true")
     parser.add_argument("--force-cache", action="store_true")
     parser.add_argument(
+        "--allow-destructive-cache",
+        action="store_true",
+        help=(
+            "Allow --force-cache to remove an existing non-smoke cache. Without this, "
+            "--force-cache may only build missing caches or smoke caches."
+        ),
+    )
+    parser.add_argument(
         "--prepare-only",
         action="store_true",
         help="Materialize, split, cache, and emit reproducibility artifacts without training.",
@@ -331,6 +355,8 @@ def main() -> int:
         args.epochs = min(args.epochs, 1)
     if args.force_rematerialize:
         args.force_cache = True
+    if args.cache_build_workers < 1:
+        raise ValueError("--cache-build-workers must be >= 1")
     if args.loss_pos_weight_cap < 0.0:
         raise ValueError("--loss-pos-weight-cap must be >= 0")
     if args.focal_gamma < 0.0:
@@ -374,7 +400,6 @@ def main() -> int:
     data_dir = dataset_work_dir / "materialized"
     manifest_path = dataset_work_dir / "manifest.jsonl"
     split_path = dataset_work_dir / "splits.json"
-    cache_dir = dataset_work_dir / f"cache-{cache_size}-{args.cache_dtype}"
     webdataset_dir = dataset_work_dir / f"webdataset-{cache_size}"
     dataset_metadata = dataset_metadata_for_args(args)
 
@@ -410,6 +435,9 @@ def main() -> int:
         "image_size": args.image_size,
         "cache_image_size": cache_size,
         "cache_dtype": args.cache_dtype,
+        "cache_build_workers": args.cache_build_workers,
+        "cache_key_mode": args.cache_key_mode,
+        "allow_destructive_cache": args.allow_destructive_cache,
         "batch_size": args.batch_size,
         "drop_last_train": args.drop_last_train,
         "workers": args.workers,
@@ -529,8 +557,30 @@ def main() -> int:
     train_schedule_report = train_batch_schedule_report(train_batch_schedule)
     write_json(report_dir / "train-schedule-summary.json", train_schedule_report)
 
+    cache_dir = cache_dir_for_run(
+        dataset_work_dir=dataset_work_dir,
+        image_size=cache_size,
+        cache_dtype=args.cache_dtype,
+        cache_key_mode=args.cache_key_mode,
+        records=records,
+        targets=targets,
+    )
+    run_metadata["cache_dir"] = str(cache_dir)
+    run_metadata["cache_identity"] = cache_identity_report(
+        records=records,
+        targets=targets,
+        image_size=cache_size,
+        cache_dtype=args.cache_dtype,
+    )
     cache_start = time.perf_counter()
     cache_metadata_path = cache_dir / "cache-metadata.json"
+    enforce_destructive_cache_guard(
+        force_cache=args.force_cache,
+        allow_destructive_cache=args.allow_destructive_cache,
+        smoke=args.smoke,
+        cache_dir=cache_dir,
+        cache_metadata_path=cache_metadata_path,
+    )
     rebuild_cache = args.force_cache or not cache_metadata_path.exists()
     if not rebuild_cache:
         existing_cache = load_json(cache_metadata_path)
@@ -548,6 +598,8 @@ def main() -> int:
             cache_dir=cache_dir,
             image_size=cache_size,
             cache_dtype=args.cache_dtype,
+            cache_build_workers=args.cache_build_workers,
+            cache_key_mode=args.cache_key_mode,
             seed=args.seed,
         )
     else:
@@ -1552,33 +1604,26 @@ def build_cache(
     cache_dir: Path,
     image_size: int,
     cache_dtype: str,
+    cache_build_workers: int,
+    cache_key_mode: str,
     seed: int,
 ) -> dict[str, Any]:
     numpy = import_numpy()
     if cache_dir.exists():
         shutil.rmtree(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    transform = {
-        "name": f"cxr-{image_size}",
-        "channels": 1,
-        "size": [image_size, image_size],
-        "dtype": cache_dtype,
-        "operations": [
-            "decode_png_or_jpeg",
-            "convert_grayscale",
-            "resize_square_area",
-            "store_uint8_pixels" if cache_dtype == "uint8" else "scale_0_1",
-            "defer_normalize_to_reader" if cache_dtype == "uint8" else "normalize_train_mean_std",
-        ],
-    }
+    transform = cache_transform_plan(image_size=image_size, cache_dtype=cache_dtype)
     transform_hash = stable_hash(transform)
 
-    train_records = [record for record in records if record.split == "train"]
-    mean, std = estimate_mean_std(train_records, image_size)
     build_start = time.perf_counter()
+    train_records = [record for record in records if record.split == "train"]
+    mean_std_start = time.perf_counter()
+    mean, std = estimate_mean_std(train_records, image_size)
+    mean_std_seconds = time.perf_counter() - mean_std_start
     split_reports: dict[str, Any] = {}
     failed: list[str] = []
     for split in ("train", "val", "test"):
+        split_start = time.perf_counter()
         split_records = [record for record in records if record.split == split]
         images_path = cache_dir / f"{split}-images.{cache_dtype}.dat"
         labels_path = cache_dir / f"{split}-labels.float32.dat"
@@ -1588,47 +1633,60 @@ def build_cache(
         images = numpy.memmap(images_path, dtype=cache_dtype, mode="w+", shape=shape)
         labels = numpy.zeros((len(split_records), len(targets)), dtype="float32")
         masks = numpy.zeros((len(split_records), len(targets)), dtype="float32")
+        samples_start = time.perf_counter()
+        payloads = cache_sample_payloads(
+            records=split_records,
+            targets=targets,
+            image_size=image_size,
+            cache_dtype=cache_dtype,
+            mean=mean,
+            std=std,
+            workers=cache_build_workers,
+        )
+        samples_seconds = time.perf_counter() - samples_start
+        metadata_start = time.perf_counter()
         with metadata_path.open("w", encoding="utf-8") as handle:
-            for index, record in enumerate(split_records):
-                try:
-                    if cache_dtype == "uint8":
-                        images[index, 0, :, :] = load_resized_grayscale(
-                            record.image_path, image_size
-                        )
-                    else:
-                        images[index, 0, :, :] = preprocess_image_to_numpy(
-                            record.image_path,
-                            image_size=image_size,
-                            mean=mean,
-                            std=std,
-                        ).astype(cache_dtype)
-                except Exception as error:
-                    failed.append(f"{record.sample_id}: {error}")
+            for index, payload in enumerate(payloads):
+                error = payload.get("error")
+                if error:
+                    failed.append(str(error))
                     continue
-                for target_index, target in enumerate(targets):
-                    value = record.labels.get(target)
-                    if value is None or value == -1:
-                        masks[index, target_index] = 0.0
-                        labels[index, target_index] = 0.0
-                    else:
-                        masks[index, target_index] = 1.0
-                        labels[index, target_index] = float(value)
-                handle.write(json.dumps(record_to_json(record), sort_keys=True) + "\n")
+                images[index, 0, :, :] = payload["image"]
+                labels[index, :] = payload["labels"]
+                masks[index, :] = payload["mask"]
+                handle.write(str(payload["metadata_json"]) + "\n")
+        metadata_seconds = time.perf_counter() - metadata_start
+        flush_start = time.perf_counter()
         images.flush()
+        image_flush_seconds = time.perf_counter() - flush_start
+        labels_masks_start = time.perf_counter()
         labels.tofile(labels_path)
         masks.tofile(masks_path)
+        labels_masks_seconds = time.perf_counter() - labels_masks_start
+        hash_start = time.perf_counter()
+        images_sha256 = hash_file(images_path)
+        labels_sha256 = hash_file(labels_path)
+        masks_sha256 = hash_file(masks_path)
+        metadata_sha256 = hash_file(metadata_path)
+        hash_seconds = time.perf_counter() - hash_start
         split_reports[split] = {
             "samples": len(split_records),
             "images_path": str(images_path),
-            "images_sha256": hash_file(images_path),
+            "images_sha256": images_sha256,
             "labels_path": str(labels_path),
-            "labels_sha256": hash_file(labels_path),
+            "labels_sha256": labels_sha256,
             "masks_path": str(masks_path),
-            "masks_sha256": hash_file(masks_path),
+            "masks_sha256": masks_sha256,
             "metadata_path": str(metadata_path),
-            "metadata_sha256": hash_file(metadata_path),
+            "metadata_sha256": metadata_sha256,
             "shape": list(shape),
             "image_bytes": images_path.stat().st_size if images_path.exists() else 0,
+            "build_seconds": time.perf_counter() - split_start,
+            "sample_payload_seconds": samples_seconds,
+            "metadata_write_seconds": metadata_seconds,
+            "image_flush_seconds": image_flush_seconds,
+            "labels_masks_write_seconds": labels_masks_seconds,
+            "hash_seconds": hash_seconds,
         }
 
     report = {
@@ -1636,6 +1694,13 @@ def build_cache(
         "report_schema_version": 1,
         "cache_dir": str(cache_dir),
         "cache_kind": f"medkit_rust_compatible_mmap_{cache_dtype}",
+        "cache_key_mode": cache_key_mode,
+        "cache_identity": cache_identity_report(
+            records=records,
+            targets=targets,
+            image_size=image_size,
+            cache_dtype=cache_dtype,
+        ),
         "cache_reused": False,
         "channels": 1,
         "dtype": cache_dtype,
@@ -1661,6 +1726,8 @@ def build_cache(
             "transform": "decode grayscale, resize square, normalize dataset mean/std",
         },
         "normalization": {"mean": mean, "std": std},
+        "cache_build_workers": cache_build_workers,
+        "mean_std_seconds": mean_std_seconds,
         "build_seconds": time.perf_counter() - build_start,
         "failed_samples": failed,
         "filtered_samples": [],
@@ -1675,6 +1742,173 @@ def build_cache(
     }
     write_json(cache_dir / "cache-metadata.json", report)
     return report
+
+
+def cache_sample_payloads(
+    *,
+    records: Sequence[SampleRecord],
+    targets: Sequence[str],
+    image_size: int,
+    cache_dtype: str,
+    mean: float,
+    std: float,
+    workers: int,
+) -> list[dict[str, Any]]:
+    if workers <= 1 or len(records) <= 1:
+        return [
+            cache_sample_payload(
+                record=record,
+                targets=targets,
+                image_size=image_size,
+                cache_dtype=cache_dtype,
+                mean=mean,
+                std=std,
+            )
+            for record in records
+        ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                cache_sample_payload,
+                record=record,
+                targets=targets,
+                image_size=image_size,
+                cache_dtype=cache_dtype,
+                mean=mean,
+                std=std,
+            )
+            for record in records
+        ]
+        return [future.result() for future in futures]
+
+
+def cache_sample_payload(
+    *,
+    record: SampleRecord,
+    targets: Sequence[str],
+    image_size: int,
+    cache_dtype: str,
+    mean: float,
+    std: float,
+) -> dict[str, Any]:
+    numpy = import_numpy()
+    try:
+        if cache_dtype == "uint8":
+            image = load_resized_grayscale(record.image_path, image_size)
+        else:
+            image = preprocess_image_to_numpy(
+                record.image_path,
+                image_size=image_size,
+                mean=mean,
+                std=std,
+            ).astype(cache_dtype)
+        labels = numpy.zeros((len(targets),), dtype="float32")
+        mask = numpy.zeros((len(targets),), dtype="float32")
+        for target_index, target in enumerate(targets):
+            value = record.labels.get(target)
+            if value is None or value == -1:
+                mask[target_index] = 0.0
+                labels[target_index] = 0.0
+            else:
+                mask[target_index] = 1.0
+                labels[target_index] = float(value)
+        return {
+            "image": image,
+            "labels": labels,
+            "mask": mask,
+            "metadata_json": json.dumps(record_to_json(record), sort_keys=True),
+            "error": "",
+        }
+    except Exception as error:
+        return {
+            "image": None,
+            "labels": numpy.zeros((len(targets),), dtype="float32"),
+            "mask": numpy.zeros((len(targets),), dtype="float32"),
+            "metadata_json": "",
+            "error": f"{record.sample_id}: {error}",
+        }
+
+
+def cache_transform_plan(*, image_size: int, cache_dtype: str) -> dict[str, Any]:
+    return {
+        "name": f"cxr-{image_size}",
+        "channels": 1,
+        "size": [image_size, image_size],
+        "dtype": cache_dtype,
+        "operations": [
+            "decode_png_or_jpeg",
+            "convert_grayscale",
+            "resize_square_area",
+            "store_uint8_pixels" if cache_dtype == "uint8" else "scale_0_1",
+            "defer_normalize_to_reader" if cache_dtype == "uint8" else "normalize_train_mean_std",
+        ],
+    }
+
+
+def cache_identity_report(
+    *,
+    records: Sequence[SampleRecord],
+    targets: Sequence[str],
+    image_size: int,
+    cache_dtype: str,
+) -> dict[str, Any]:
+    transform_fingerprint = stable_hash(
+        cache_transform_plan(image_size=image_size, cache_dtype=cache_dtype)
+    )
+    source_manifest_checksum = manifest_checksum(records)
+    target_fingerprint = stable_hash({"targets": list(targets)})
+    return {
+        "schema_version": 1,
+        "image_size": image_size,
+        "cache_dtype": cache_dtype,
+        "source_manifest_checksum": source_manifest_checksum,
+        "transform_fingerprint": transform_fingerprint,
+        "target_fingerprint": target_fingerprint,
+        "content_key": (
+            f"cache-{image_size}-{cache_dtype}-"
+            f"m{source_manifest_checksum[:12]}-"
+            f"x{transform_fingerprint[:12]}-"
+            f"y{target_fingerprint[:12]}"
+        ),
+    }
+
+
+def cache_dir_for_run(
+    *,
+    dataset_work_dir: Path,
+    image_size: int,
+    cache_dtype: str,
+    cache_key_mode: str,
+    records: Sequence[SampleRecord],
+    targets: Sequence[str],
+) -> Path:
+    if cache_key_mode == "legacy":
+        return dataset_work_dir / f"cache-{image_size}-{cache_dtype}"
+    if cache_key_mode != "content":
+        raise ValueError(f"unsupported cache key mode: {cache_key_mode}")
+    return dataset_work_dir / "caches" / cache_identity_report(
+        records=records,
+        targets=targets,
+        image_size=image_size,
+        cache_dtype=cache_dtype,
+    )["content_key"]
+
+
+def enforce_destructive_cache_guard(
+    *,
+    force_cache: bool,
+    allow_destructive_cache: bool,
+    smoke: bool,
+    cache_dir: Path,
+    cache_metadata_path: Path,
+) -> None:
+    if not force_cache or allow_destructive_cache or smoke or not cache_metadata_path.exists():
+        return
+    raise ValueError(
+        "--force-cache would rebuild an existing non-smoke cache at "
+        f"{cache_dir}. Pass --allow-destructive-cache for intentional rebuilds, "
+        "or omit --force-cache to reuse a matching cache."
+    )
 
 
 def cache_matches_run(
@@ -6343,6 +6577,9 @@ def build_run_provenance(
         "image_size": run_metadata.get("image_size"),
         "cache_image_size": run_metadata.get("cache_image_size"),
         "cache_dtype": run_metadata.get("cache_dtype"),
+        "cache_build_workers": run_metadata.get("cache_build_workers"),
+        "cache_key_mode": run_metadata.get("cache_key_mode"),
+        "allow_destructive_cache": run_metadata.get("allow_destructive_cache"),
         "batch_size": run_metadata.get("batch_size"),
         "drop_last_train": run_metadata.get("drop_last_train"),
         "workers": run_metadata.get("workers"),
@@ -6385,6 +6622,8 @@ def build_run_provenance(
             "cache_reused": cache_report.get("cache_reused"),
             "dtype": cache_report.get("dtype"),
             "image_size": cache_report.get("image_size"),
+            "cache_key_mode": cache_report.get("cache_key_mode"),
+            "cache_identity": cache_report.get("cache_identity"),
             "transform_fingerprint": cache_report.get("transform_fingerprint"),
             "source_manifest_checksum": cache_report.get("source_manifest_checksum"),
             "split_samples": {
@@ -6514,6 +6753,9 @@ def run_summary_consistency_errors(
         "image_size",
         "cache_image_size",
         "cache_dtype",
+        "cache_build_workers",
+        "cache_key_mode",
+        "allow_destructive_cache",
         "batch_size",
         "drop_last_train",
         "workers",
@@ -6556,6 +6798,18 @@ def run_summary_consistency_errors(
     cache_provenance = provenance.get("cache") or {}
     expect_equal(errors, "cache.dtype", cache_report.get("dtype"), run_metadata.get("cache_dtype"))
     expect_equal(errors, "cache.image_size", cache_report.get("image_size"), run_metadata.get("cache_image_size"))
+    expect_equal(
+        errors,
+        "cache.cache_key_mode",
+        cache_report.get("cache_key_mode"),
+        run_metadata.get("cache_key_mode"),
+    )
+    expect_equal(
+        errors,
+        "provenance.cache.cache_identity",
+        cache_provenance.get("cache_identity"),
+        cache_report.get("cache_identity"),
+    )
     expect_equal(
         errors,
         "provenance.cache.transform_fingerprint",

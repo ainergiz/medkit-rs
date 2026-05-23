@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import importlib.util
 import sys
 import types
@@ -707,6 +708,100 @@ def test_gpu_utilization_summary_from_nvidia_smi_values():
     assert report["power_draw_w"]["mean"] == 113.0
 
 
+def test_content_cache_key_includes_manifest_transform_and_targets(tmp_path):
+    benchmark = load_benchmark_module()
+    first = benchmark.SampleRecord(
+        sample_id="sample-1",
+        patient_id="patient-1",
+        study_id="study-1",
+        image_id="image-1",
+        image_path="/tmp/one.dcm",
+        filename="one.dcm",
+        source_split="train",
+        width=10,
+        height=10,
+        labels={"Pneumonia": 1},
+        split="train",
+        sha256="sha-one",
+        source_format="dicom",
+    )
+    second = dataclasses.replace(first, sample_id="sample-2", image_id="image-2", sha256="sha-two")
+
+    legacy_first = benchmark.cache_dir_for_run(
+        dataset_work_dir=tmp_path,
+        image_size=224,
+        cache_dtype="float32",
+        cache_key_mode="legacy",
+        records=[first],
+        targets=["Pneumonia"],
+    )
+    legacy_second = benchmark.cache_dir_for_run(
+        dataset_work_dir=tmp_path,
+        image_size=224,
+        cache_dtype="float32",
+        cache_key_mode="legacy",
+        records=[second],
+        targets=["Pneumonia"],
+    )
+    content_first = benchmark.cache_dir_for_run(
+        dataset_work_dir=tmp_path,
+        image_size=224,
+        cache_dtype="float32",
+        cache_key_mode="content",
+        records=[first],
+        targets=["Pneumonia"],
+    )
+    content_second = benchmark.cache_dir_for_run(
+        dataset_work_dir=tmp_path,
+        image_size=224,
+        cache_dtype="float32",
+        cache_key_mode="content",
+        records=[second],
+        targets=["Pneumonia"],
+    )
+
+    assert legacy_first == legacy_second == tmp_path / "cache-224-float32"
+    assert content_first != content_second
+    assert content_first.parent == tmp_path / "caches"
+    assert content_first.name == benchmark.cache_identity_report(
+        records=[first],
+        targets=["Pneumonia"],
+        image_size=224,
+        cache_dtype="float32",
+    )["content_key"]
+
+
+def test_force_cache_requires_explicit_destructive_allowance(tmp_path):
+    benchmark = load_benchmark_module()
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    metadata_path = cache_dir / "cache-metadata.json"
+    metadata_path.write_text("{}\n")
+
+    with pytest.raises(ValueError, match="--allow-destructive-cache"):
+        benchmark.enforce_destructive_cache_guard(
+            force_cache=True,
+            allow_destructive_cache=False,
+            smoke=False,
+            cache_dir=cache_dir,
+            cache_metadata_path=metadata_path,
+        )
+    benchmark.enforce_destructive_cache_guard(
+        force_cache=True,
+        allow_destructive_cache=True,
+        smoke=False,
+        cache_dir=cache_dir,
+        cache_metadata_path=metadata_path,
+    )
+    benchmark.enforce_destructive_cache_guard(
+        force_cache=True,
+        allow_destructive_cache=False,
+        smoke=True,
+        cache_dir=cache_dir,
+        cache_metadata_path=metadata_path,
+    )
+
+
 def test_split_report_records_reproducibility_checksums(tmp_path):
     benchmark = load_benchmark_module()
     records = [
@@ -1023,6 +1118,9 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
         )
         assert command[0] == "MEDKIT_MODAL_GPU=H100"
         assert "--shuffle-block-batches" in command
+        assert command[command.index("--dataset") + 1] == "arudaev/chest-xray-14-320"
+        assert command[command.index("--cache-build-workers") + 1] == "1"
+        assert command[command.index("--cache-key-mode") + 1] == "legacy"
         assert "--gpu-prefetch-batches" in command
         assert "--no-gpu-prefetch-reuse-buffers" in command
         assert "--sync-every-step" in command
@@ -1112,6 +1210,52 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
     assert "--manifest" not in prepare_command
     assert "--splits" not in prepare_command
 
+    shared_speed_args = matrix.parse_args(
+        ["--gate", "l4-224-b64", "--batch-id", "speed-shared", "--shared-data"]
+    )
+    shared_speed_paths = matrix.shared_data_paths("speed-shared")
+    assert matrix.auto_shared_data_required(shared_speed_args) is True
+    shared_speed_args.manifest = shared_speed_paths["manifest"]
+    shared_speed_args.splits = shared_speed_paths["splits"]
+    shared_speed_row = matrix.rows_for_args(shared_speed_args)[0]
+    shared_speed_command = matrix.build_command(
+        shared_speed_args,
+        run_id=matrix.run_id_for("speed-shared", shared_speed_row),
+        row=shared_speed_row,
+    )
+    assert (
+        shared_speed_command[shared_speed_command.index("--manifest") + 1]
+        == shared_speed_paths["manifest"]
+    )
+    assert (
+        shared_speed_command[shared_speed_command.index("--splits") + 1]
+        == shared_speed_paths["splits"]
+    )
+
+    rsna_args = matrix.parse_args(
+        [
+            "--gate",
+            "l4-224-b64",
+            "--batch-id",
+            "rsna-speed",
+            "--dataset",
+            "rsna-pneumonia-2018",
+            "--rsna-root",
+            "/cache/cxr/datasets/rsna-pneumonia-2018",
+        ]
+    )
+    rsna_row = matrix.rows_for_args(rsna_args)[0]
+    rsna_command = matrix.build_command(
+        rsna_args,
+        run_id=matrix.run_id_for("rsna-speed", rsna_row),
+        row=rsna_row,
+    )
+    assert rsna_command[rsna_command.index("--dataset") + 1] == "rsna-pneumonia-2018"
+    assert (
+        rsna_command[rsna_command.index("--rsna-root") + 1]
+        == "/cache/cxr/datasets/rsna-pneumonia-2018"
+    )
+
 
 def test_matrix_modal_cli_command_can_be_overridden(monkeypatch):
     matrix = load_matrix_module()
@@ -1173,6 +1317,15 @@ def test_modal_cxr_wrapper_exposes_sync_policy():
     assert "--manifest" in text
     assert "prepare_only: bool = False" in text
     assert "--prepare-only" in text
+    assert "cache_build_workers: int = 1" in text
+    assert "--cache-build-workers" in text
+    assert "cache_build_workers=cache_build_workers" in text
+    assert 'cache_key_mode: str = "legacy"' in text
+    assert "--cache-key-mode" in text
+    assert "cache_key_mode=cache_key_mode" in text
+    assert "allow_destructive_cache: bool = False" in text
+    assert "--allow-destructive-cache" in text
+    assert "allow_destructive_cache=allow_destructive_cache" in text
 
 
 def test_native_prefetch_loader_factory_passes_block_shuffle(monkeypatch, tmp_path):

@@ -272,6 +272,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional stable comparator batch directory for promotion readiness checks.",
     )
     parser.add_argument("--batch-id", default="")
+    parser.add_argument("--dataset", default="arudaev/chest-xray-14-320")
+    parser.add_argument("--rsna-root", default="")
     parser.add_argument("--manifest", default="")
     parser.add_argument("--splits", default="")
     parser.add_argument(
@@ -281,6 +283,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--cache-dtype", choices=("float32", "float16", "uint8"), default="float32")
+    parser.add_argument("--cache-build-workers", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-samples", type=int, default=6000)
@@ -333,15 +336,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional comma-separated read modes; overrides --read-mode for matrix rows.",
     )
     parser.add_argument("--include-metadata", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--shared-data",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Run one prepare-only job and pass its manifest/splits/cache inputs to matrix rows. "
+            "Defaults to enabled for quality gates and disabled for speed gates."
+        ),
+    )
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument(
         "--cache-dtypes",
         default="",
         help="Optional comma-separated cache dtypes; overrides --cache-dtype for matrix rows.",
     )
+    parser.add_argument(
+        "--cache-key-mode",
+        choices=("legacy", "content"),
+        default="legacy",
+        help="Cache key mode forwarded to the Modal CXR benchmark.",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--force-cache", action="store_true")
     parser.add_argument("--force-rematerialize", action="store_true")
+    parser.add_argument("--allow-destructive-cache", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--modal-gpu",
@@ -412,7 +431,11 @@ def namespace_with(args: argparse.Namespace, **changes: Any) -> argparse.Namespa
 
 
 def auto_shared_data_required(args: argparse.Namespace) -> bool:
-    return bool(args.quality_gate and not args.manifest and not args.splits)
+    if args.manifest or args.splits:
+        return False
+    if args.shared_data is not None:
+        return bool(args.shared_data)
+    return bool(args.quality_gate)
 
 
 def shared_data_paths(batch_id: str) -> dict[str, str]:
@@ -669,6 +692,8 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         MODAL_SCRIPT,
         "--run-id",
         run_id,
+        "--dataset",
+        args.dataset,
         "--max-samples",
         str(args.max_samples),
         "--max-train",
@@ -681,6 +706,10 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         str(args.image_size),
         "--cache-dtype",
         row.cache_dtype,
+        "--cache-build-workers",
+        str(args.cache_build_workers),
+        "--cache-key-mode",
+        args.cache_key_mode,
         "--batch-size",
         str(args.batch_size),
         "--workers",
@@ -755,12 +784,16 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         command.extend(["--manifest", args.manifest])
     if args.splits:
         command.extend(["--splits", args.splits])
+    if args.rsna_root:
+        command.extend(["--rsna-root", args.rsna_root])
     if args.smoke:
         command.append("--smoke")
     if args.force_cache:
         command.append("--force-cache")
     if args.force_rematerialize:
         command.append("--force-rematerialize")
+    if args.allow_destructive_cache:
+        command.append("--allow-destructive-cache")
     return command
 
 

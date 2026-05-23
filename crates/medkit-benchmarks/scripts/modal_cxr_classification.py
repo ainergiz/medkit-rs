@@ -190,6 +190,8 @@ def run_cxr_benchmark(
     max_test: int = 1024,
     image_size: int = 224,
     cache_dtype: str = "float32",
+    cache_build_workers: int = 1,
+    cache_key_mode: str = "legacy",
     batch_size: int = 64,
     workers: int = 4,
     epochs: int = 1,
@@ -232,6 +234,7 @@ def run_cxr_benchmark(
     smoke: bool = False,
     force_rematerialize: bool = False,
     force_cache: bool = False,
+    allow_destructive_cache: bool = False,
 ) -> dict[str, Any]:
     os.chdir(APP_ROOT)
     volume.reload()
@@ -260,6 +263,10 @@ def run_cxr_benchmark(
         str(image_size),
         "--cache-dtype",
         cache_dtype,
+        "--cache-build-workers",
+        str(cache_build_workers),
+        "--cache-key-mode",
+        cache_key_mode,
         "--batch-size",
         str(batch_size),
         "--workers",
@@ -344,6 +351,8 @@ def run_cxr_benchmark(
         command.append("--force-rematerialize")
     if force_cache:
         command.append("--force-cache")
+    if allow_destructive_cache:
+        command.append("--allow-destructive-cache")
     if prepare_only:
         command.append("--prepare-only")
 
@@ -399,6 +408,8 @@ def main(
     max_test: int = 1024,
     image_size: int = 224,
     cache_dtype: str = "float32",
+    cache_build_workers: int = 1,
+    cache_key_mode: str = "legacy",
     batch_size: int = 64,
     workers: int = 4,
     epochs: int = 1,
@@ -441,6 +452,7 @@ def main(
     smoke: bool = False,
     force_rematerialize: bool = False,
     force_cache: bool = False,
+    allow_destructive_cache: bool = False,
     background: bool = False,
     wait: bool = True,
 ) -> None:
@@ -457,6 +469,8 @@ def main(
     # focal_gamma=focal_gamma, focal_alpha=focal_alpha.
     # gpu_prefetch_reuse_buffers=gpu_prefetch_reuse_buffers.
     # train_order_evidence=train_order_evidence, paired_train_order=paired_train_order.
+    # cache_build_workers=cache_build_workers, cache_key_mode=cache_key_mode.
+    # allow_destructive_cache=allow_destructive_cache.
     benchmark_kwargs = {
         "run_id": run_id,
         "dataset": dataset,
@@ -467,6 +481,8 @@ def main(
         "max_test": max_test,
         "image_size": image_size,
         "cache_dtype": cache_dtype,
+        "cache_build_workers": cache_build_workers,
+        "cache_key_mode": cache_key_mode,
         "batch_size": batch_size,
         "workers": workers,
         "epochs": epochs,
@@ -509,6 +525,7 @@ def main(
         "smoke": smoke,
         "force_rematerialize": force_rematerialize,
         "force_cache": force_cache,
+        "allow_destructive_cache": allow_destructive_cache,
     }
     function_call = run_cxr_benchmark.spawn(**benchmark_kwargs)
     if background:
