@@ -449,6 +449,14 @@ def main(
         mode = "smoke" if smoke else gpu_label
         dataset_label = dataset.replace("/", "-").replace("_", "-").lower()
         run_id = f"{dataset_label}-{mode}-size{image_size}-n{max_samples}-{time.strftime('%Y%m%d-%H%M%S')}"
+    # Keep the forwarding contract explicit for audit tests:
+    # sync_every_step=sync_every_step, channels_last=channels_last.
+    # torch_compile=torch_compile, torch_compile_mode=torch_compile_mode.
+    # learning_rate=learning_rate, amp_dtype=amp_dtype, model_init=model_init.
+    # loss_kind=loss_kind, loss_pos_weight_cap=loss_pos_weight_cap.
+    # focal_gamma=focal_gamma, focal_alpha=focal_alpha.
+    # gpu_prefetch_reuse_buffers=gpu_prefetch_reuse_buffers.
+    # train_order_evidence=train_order_evidence, paired_train_order=paired_train_order.
     benchmark_kwargs = {
         "run_id": run_id,
         "dataset": dataset,

@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_PATH = (
@@ -579,6 +581,132 @@ def test_patient_safe_split_assignment_preserves_manifest_schema(tmp_path):
     ) is None
 
 
+def test_rsna_localization_boxes_roundtrip_and_report(tmp_path):
+    benchmark = load_benchmark_module()
+    box = benchmark.rsna_annotation_box(
+        {
+            "labelId": benchmark.RSNA_CALCULATED_LUNG_OPACITY_LABEL,
+            "width": 100,
+            "height": 200,
+            "data": {"x": 10, "y": 20, "width": 30, "height": 40},
+        }
+    )
+    assert box is not None
+    assert box["area_fraction"] == 0.06
+    records = [
+        benchmark.SampleRecord(
+            sample_id="sample-positive",
+            patient_id="patient-positive",
+            study_id="study-positive",
+            image_id="image-positive",
+            image_path="/tmp/positive.dcm",
+            filename="positive.dcm",
+            source_split="rsna_subset_group_train",
+            width=100,
+            height=200,
+            labels={"Pneumonia": 1},
+            split="train",
+            sha256="sha-positive",
+            source_format="dicom",
+            localization_boxes=[box],
+        ),
+        benchmark.SampleRecord(
+            sample_id="sample-negative",
+            patient_id="patient-negative",
+            study_id="study-negative",
+            image_id="image-negative",
+            image_path="/tmp/negative.dcm",
+            filename="negative.dcm",
+            source_split="rsna_subset_group_train",
+            width=100,
+            height=200,
+            labels={"Pneumonia": 0},
+            split="val",
+            sha256="sha-negative",
+            source_format="dicom",
+        ),
+    ]
+
+    manifest = tmp_path / "manifest.jsonl"
+    benchmark.write_manifest(manifest, records)
+    reloaded = benchmark.load_manifest(manifest)
+    report = benchmark.localization_report(reloaded, ["Pneumonia"])
+
+    assert reloaded[0].localization_boxes == [box]
+    assert reloaded[1].localization_boxes == []
+    assert report["status"] == "ok"
+    assert report["overall"]["positive_samples_with_boxes"] == 1
+    assert report["overall"]["positive_samples_without_boxes"] == 0
+    assert report["overall"]["negative_samples_with_boxes"] == 0
+    assert report["overall"]["box_area_fraction"]["median"] == 0.06
+
+
+def test_cam_localization_metrics_hit_box():
+    benchmark = load_benchmark_module()
+    numpy = benchmark.import_numpy()
+    heatmap = numpy.zeros((10, 10), dtype="float32")
+    heatmap[3, 3] = 1.0
+    mask = benchmark.box_union_mask(
+        boxes=[
+            {
+                "x1": 2,
+                "y1": 2,
+                "x2": 5,
+                "y2": 5,
+                "image_width": 10,
+                "image_height": 10,
+            }
+        ],
+        height=10,
+        width=10,
+    )
+
+    row = benchmark.cam_localization_sample_metrics(
+        heatmap=heatmap,
+        box_mask=mask,
+        sample_id="sample-positive",
+        box_count=1,
+    )
+    report = benchmark.summarize_cam_localization_rows(
+        target="Pneumonia",
+        rows=[row],
+    )
+
+    assert row["top1_hit"] is True
+    assert row["top_1pct"]["hit"] is True
+    assert row["top_1pct"]["box_coverage"] == pytest.approx(1 / 9)
+    assert report["status"] == "ok"
+    assert report["method"] == "densenet121_classifier_cam"
+    assert report["top1_hit_rate"] == 1.0
+    assert report["top_percent"]["top_1pct"]["hit_rate"] == 1.0
+
+
+def test_gpu_utilization_summary_from_nvidia_smi_values():
+    benchmark = load_benchmark_module()
+    first = benchmark.parse_nvidia_smi_utilization_values(["12", "4", "1024", "81920", "85.5"])
+    second = benchmark.parse_nvidia_smi_utilization_values(["48", "9", "2048", "81920", "140.5"])
+
+    report = benchmark.gpu_utilization_summary(
+        samples=[first, second],
+        errors=[],
+        enabled=True,
+        device_index=0,
+        interval_seconds=1.0,
+        disabled_reason="",
+        started_at=10.0,
+        stopped_at=12.5,
+    )
+
+    assert report["status"] == "ok"
+    assert report["sample_count"] == 2
+    assert report["duration_seconds"] == 2.5
+    assert report["gpu_utilization_percent"]["mean"] == 30.0
+    assert report["gpu_utilization_percent"]["median"] == 30.0
+    assert report["memory_utilization_percent"]["max"] == 9.0
+    assert report["memory_used_mb"]["mean"] == 1536.0
+    assert report["power_draw_w"]["mean"] == 113.0
+
+
 def test_split_report_records_reproducibility_checksums(tmp_path):
     benchmark = load_benchmark_module()
     records = [
@@ -792,6 +920,9 @@ def test_run_summary_consistency_accepts_matching_provenance_and_rejects_drift()
             }
         },
         "thresholds": {},
+        "predictions": {},
+        "train_order": {},
+        "localization_eval": {},
     }
     environment = {
         "git_commit": "abc123",
@@ -821,6 +952,8 @@ def test_run_summary_consistency_accepts_matching_provenance_and_rejects_drift()
         "quality_gate": {"status": "recorded", "enabled": False, "errors": []},
         "profile": {"pytorch_raw": profile_summary},
         "memory": benchmark.memory_summary(reports),
+        "predictions": {},
+        "localization_eval": {},
         "provenance": provenance,
     }
 

@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import zipfile
 from dataclasses import dataclass
@@ -94,6 +95,7 @@ class SampleRecord:
     modality: str = "CR"
     view_position: str = "unknown"
     label_source: str = "nih_chestxray14_nlp_labels"
+    localization_boxes: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -121,6 +123,7 @@ class EvaluationOutputs:
     y_mask: Any
     y_logits: Any
     samples: list[dict[str, Any]]
+    localization: dict[str, Any] | None = None
 
 
 def main() -> int:
@@ -508,6 +511,8 @@ def main() -> int:
     write_json(report_dir / "split-audit.json", split_report | validation["split_audit"])
     label_balance = label_balance_report(records, targets)
     write_json(report_dir / "label-balance.json", label_balance)
+    localization = localization_report(records, targets)
+    write_json(report_dir / "localization-report.json", localization)
     train_batch_schedule = (
         build_train_batch_schedule(
             train_records=[record for record in records if record.split == "train"],
@@ -589,6 +594,7 @@ def main() -> int:
             "prepare_only": True,
             "manifest": "manifest.jsonl",
             "splits": "splits.json",
+            "localization": localization,
             "cache_report": cache_report,
             "provenance": provenance,
         }
@@ -626,6 +632,7 @@ def main() -> int:
         write_json(report_dir / "step-profile.json", reports["profile"])
     write_json(report_dir / "model-quality.json", reports["quality"])
     write_json(report_dir / "threshold-report.json", reports["thresholds"])
+    write_json(report_dir / "localization-eval.json", reports["localization_eval"])
     write_json(report_dir / "eval-predictions-summary.json", reports["predictions"])
     write_json(report_dir / "train-order-summary.json", reports["train_order"])
     quality_gate = quality_gate_report(
@@ -683,7 +690,9 @@ def main() -> int:
         "ground_truth": ground_truth,
         "predictions": reports["predictions"],
         "train_order": reports["train_order"],
+        "localization_eval": reports["localization_eval"],
         "train_schedule": train_schedule_report,
+        "localization": localization,
         "provenance": provenance,
     }
     write_json(report_dir / "run-summary.json", summary)
@@ -845,6 +854,7 @@ def materialize_rsna_pneumonia(
     annotations = load_json(annotations_path)
     mappings = load_json(mappings_path)
     final_labels_by_sop: dict[str, set[str]] = {}
+    lung_opacity_boxes_by_sop: dict[str, list[dict[str, Any]]] = {}
     for annotation in annotations.get("datasets", [{}])[0].get("annotations", []):
         label_id = str(annotation.get("labelId") or "")
         if label_id not in {
@@ -856,6 +866,10 @@ def materialize_rsna_pneumonia(
         sop_uid = str(annotation.get("SOPInstanceUID") or "")
         if sop_uid:
             final_labels_by_sop.setdefault(sop_uid, set()).add(label_id)
+            if label_id == RSNA_CALCULATED_LUNG_OPACITY_LABEL:
+                box = rsna_annotation_box(annotation)
+                if box is not None:
+                    lung_opacity_boxes_by_sop.setdefault(sop_uid, []).append(box)
 
     dicom_by_sop = {path.stem: path for path in extracted_dir.rglob("*.dcm")}
     records: list[SampleRecord] = []
@@ -906,6 +920,7 @@ def materialize_rsna_pneumonia(
                 modality="CR",
                 view_position="unknown",
                 label_source="rsna_2018_adjudicated_mdai_calculated_labels",
+                localization_boxes=lung_opacity_boxes_by_sop.get(sop_uid, []),
             )
         )
 
@@ -936,6 +951,51 @@ def materialize_rsna_pneumonia(
         },
     )
     return records, RSNA_PNEUMONIA_DATASET
+
+
+def rsna_annotation_box(annotation: dict[str, Any]) -> dict[str, Any] | None:
+    data = annotation.get("data")
+    if not isinstance(data, dict):
+        return None
+    try:
+        image_width = float(annotation.get("width") or 1024)
+        image_height = float(annotation.get("height") or 1024)
+        x = float(data.get("x"))
+        y = float(data.get("y"))
+        width = float(data.get("width"))
+        height = float(data.get("height"))
+    except (TypeError, ValueError):
+        return None
+    if image_width <= 0 or image_height <= 0 or width <= 0 or height <= 0:
+        return None
+    x1 = max(0.0, min(x, image_width))
+    y1 = max(0.0, min(y, image_height))
+    x2 = max(0.0, min(x + width, image_width))
+    y2 = max(0.0, min(y + height, image_height))
+    clamped_width = x2 - x1
+    clamped_height = y2 - y1
+    if clamped_width <= 0 or clamped_height <= 0:
+        return None
+    area_fraction = (clamped_width * clamped_height) / (image_width * image_height)
+    return {
+        "label": "lung_opacity",
+        "label_id": RSNA_CALCULATED_LUNG_OPACITY_LABEL,
+        "x": x1,
+        "y": y1,
+        "width": clamped_width,
+        "height": clamped_height,
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "image_width": int(image_width),
+        "image_height": int(image_height),
+        "area_fraction": area_fraction,
+        "width_fraction": clamped_width / image_width,
+        "height_fraction": clamped_height / image_height,
+        "center_x_fraction": ((x1 + x2) / 2.0) / image_width,
+        "center_y_fraction": ((y1 + y2) / 2.0) / image_height,
+    }
 
 
 def ensure_rsna_pneumonia_extracted(root: Path) -> Path:
@@ -1259,6 +1319,158 @@ def label_balance_report(
         "targets": list(targets),
         "splits": by_split,
     }
+
+
+def localization_report(
+    records: Sequence[SampleRecord],
+    targets: Sequence[str],
+) -> dict[str, Any]:
+    target = "Pneumonia" if "Pneumonia" in targets else targets[0] if targets else ""
+    overall = localization_split_report(records, target)
+    by_split = {
+        split: localization_split_report(
+            [record for record in records if record.split == split],
+            target,
+        )
+        for split in ("train", "val", "test")
+    }
+    status = "ok" if overall["total_boxes"] > 0 else "not_available"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "target": target,
+        "box_source": "rsna_2018_adjudicated_mdai_lung_opacity_boxes",
+        "box_label_id": RSNA_CALCULATED_LUNG_OPACITY_LABEL,
+        "overall": overall,
+        "splits": by_split,
+        "notes": [
+            "These are annotation/readiness metrics, not detector mAP.",
+            (
+                "Image-level classifier localization needs a CAM/heatmap or detection head "
+                "before box-hit metrics are meaningful."
+            ),
+        ],
+    }
+
+
+def localization_split_report(
+    records: Sequence[SampleRecord],
+    target: str,
+) -> dict[str, Any]:
+    positive_records = [record for record in records if record.labels.get(target) == 1]
+    negative_records = [record for record in records if record.labels.get(target) == 0]
+    boxed_records = [record for record in records if record.localization_boxes]
+    positive_boxed_records = [
+        record for record in positive_records if record.localization_boxes
+    ]
+    negative_boxed_records = [
+        record for record in negative_records if record.localization_boxes
+    ]
+    boxes = [box for record in records for box in (record.localization_boxes or [])]
+    positive_box_counts = [
+        len(record.localization_boxes or []) for record in positive_records
+    ]
+    multi_box_positive = sum(1 for count in positive_box_counts if count > 1)
+    area_values = numeric_box_values(boxes, "area_fraction")
+    width_values = numeric_box_values(boxes, "width_fraction")
+    height_values = numeric_box_values(boxes, "height_fraction")
+    center_x_values = numeric_box_values(boxes, "center_x_fraction")
+    center_y_values = numeric_box_values(boxes, "center_y_fraction")
+    return {
+        "samples": len(records),
+        "positive_samples": len(positive_records),
+        "negative_samples": len(negative_records),
+        "target_prevalence": safe_ratio(
+            len(positive_records),
+            len(positive_records) + len(negative_records),
+        ),
+        "samples_with_boxes": len(boxed_records),
+        "positive_samples_with_boxes": len(positive_boxed_records),
+        "positive_samples_without_boxes": len(positive_records) - len(positive_boxed_records),
+        "negative_samples_with_boxes": len(negative_boxed_records),
+        "box_positive_coverage": safe_ratio(len(positive_boxed_records), len(positive_records)),
+        "total_boxes": len(boxes),
+        "boxes_per_positive_sample": safe_ratio(len(boxes), len(positive_records)),
+        "boxes_per_positive_boxed_sample": safe_ratio(len(boxes), len(positive_boxed_records)),
+        "multi_box_positive_samples": multi_box_positive,
+        "multi_box_positive_fraction": safe_ratio(multi_box_positive, len(positive_records)),
+        "box_area_fraction": numeric_distribution(area_values),
+        "box_width_fraction": numeric_distribution(width_values),
+        "box_height_fraction": numeric_distribution(height_values),
+        "box_center_x_fraction": numeric_distribution(center_x_values),
+        "box_center_y_fraction": numeric_distribution(center_y_values),
+        "box_area_bins": box_area_bins(area_values),
+    }
+
+
+def numeric_box_values(boxes: Sequence[dict[str, Any]], key: str) -> list[float]:
+    values: list[float] = []
+    for box in boxes:
+        try:
+            value = float(box.get(key))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return values
+
+
+def numeric_distribution(values: Sequence[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "min": None,
+            "p25": None,
+            "median": None,
+            "p75": None,
+            "max": None,
+            "mean": None,
+        }
+    ordered = sorted(float(value) for value in values)
+    return {
+        "count": len(ordered),
+        "min": ordered[0],
+        "p25": percentile(ordered, 0.25),
+        "median": percentile(ordered, 0.50),
+        "p75": percentile(ordered, 0.75),
+        "max": ordered[-1],
+        "mean": sum(ordered) / len(ordered),
+    }
+
+
+def percentile(ordered_values: Sequence[float], p: float) -> float | None:
+    if not ordered_values:
+        return None
+    if len(ordered_values) == 1:
+        return float(ordered_values[0])
+    position = (len(ordered_values) - 1) * p
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return float(ordered_values[lower])
+    weight = position - lower
+    return float(ordered_values[lower] * (1.0 - weight) + ordered_values[upper] * weight)
+
+
+def box_area_bins(area_values: Sequence[float]) -> dict[str, Any]:
+    small = sum(1 for value in area_values if value < 0.02)
+    medium = sum(1 for value in area_values if 0.02 <= value < 0.10)
+    large = sum(1 for value in area_values if value >= 0.10)
+    total = len(area_values)
+    return {
+        "small_lt_2pct": small,
+        "medium_2pct_to_10pct": medium,
+        "large_gte_10pct": large,
+        "small_fraction": safe_ratio(small, total),
+        "medium_fraction": safe_ratio(medium, total),
+        "large_fraction": safe_ratio(large, total),
+    }
+
+
+def safe_ratio(numerator: int | float, denominator: int | float) -> float | None:
+    if denominator == 0:
+        return None
+    return float(numerator) / float(denominator)
 
 
 def label_counts_for_records(
@@ -1689,6 +1901,34 @@ class FixedBatchSampler:
         return len(self.batches)
 
 
+class FixedTrainBatchScheduleSampler:
+    def __init__(self, schedule: TrainBatchSchedule) -> None:
+        self.schedule = schedule
+        self.iteration_index = 0
+        self.extra_empty_iterations = 0
+
+    def __iter__(self) -> Iterable[list[int]]:
+        if self.iteration_index >= len(self.schedule.iteration_batches):
+            self.iteration_index += 1
+            self.extra_empty_iterations += 1
+            return iter(())
+        batches = self.schedule.batches_for_iteration(self.iteration_index)
+        self.iteration_index += 1
+        return iter([list(batch) for batch in batches])
+
+    def report_metadata(self) -> dict[str, Any]:
+        summary = self.schedule.summary()
+        return {
+            "paired_train_order": True,
+            "batch_schedule": "fixed_by_iteration",
+            "batch_schedule_hash": (summary.get("hashes") or {}).get("schedule_hash"),
+            "batch_schedule_iteration_count": summary.get("iteration_count"),
+            "batch_schedule_iteration_names": summary.get("iteration_names"),
+            "batch_schedule_current_iteration": self.iteration_index,
+            "batch_schedule_extra_empty_iterations": self.extra_empty_iterations,
+        }
+
+
 class ScheduledTorchMapLoader:
     """Build a fresh DataLoader for each fixed train-schedule iteration."""
 
@@ -1950,6 +2190,7 @@ def run_all_baselines(
         "thresholds": {},
         "predictions": {},
         "train_order": {},
+        "localization_eval": {},
     }
     eval_records = [record for record in records if record.split == "val"]
     train_records = [record for record in records if record.split == "train"]
@@ -1984,6 +2225,10 @@ def run_all_baselines(
                 reason=str(error),
             )
             reports["train_order"][baseline] = train_order_capture_disabled_report(
+                baseline=baseline,
+                reason=str(error),
+            )
+            reports["localization_eval"][baseline] = localization_eval_disabled_report(
                 baseline=baseline,
                 reason=str(error),
             )
@@ -2055,6 +2300,13 @@ def run_all_baselines(
             reports["thresholds"][baseline] = threshold_report
             reports["predictions"][baseline] = prediction_report
             reports["train_order"][baseline] = train_order_report
+            reports["localization_eval"][baseline] = quality_report.get(
+                "localization",
+                localization_eval_disabled_report(
+                    baseline=baseline,
+                    reason="localization evaluation not emitted",
+                ),
+            )
         except Exception as error:
             failed = {
                 "status": "failed",
@@ -2068,6 +2320,7 @@ def run_all_baselines(
             reports["thresholds"][baseline] = failed
             reports["predictions"][baseline] = failed
             reports["train_order"][baseline] = failed
+            reports["localization_eval"][baseline] = failed
     reports["predictions"] = prediction_summary_report(
         report_dir=report_dir,
         predictions=reports["predictions"],
@@ -3259,7 +3512,9 @@ def train_and_evaluate(
     gpu_prefetch_buffer_shape_misses = 0
     channels_last_batches = 0
     channels_last_checked_batches = 0
+    gpu_utilization_sampler = NvidiaSmiUtilizationSampler.for_device(device)
     train_start = time.perf_counter()
+    gpu_utilization_sampler.start()
     model.train()
     for _epoch in range(epochs):
         iterator = iter(train_loader)
@@ -3508,6 +3763,7 @@ def train_and_evaluate(
         torch.cuda.synchronize(device)
         losses.extend(float(loss.cpu().item()) for loss in deferred_losses)
     total_seconds = time.perf_counter() - train_start
+    gpu_utilization = gpu_utilization_sampler.stop()
     evaluation = evaluate_model(
         torch=torch,
         model=model,
@@ -3516,6 +3772,7 @@ def train_and_evaluate(
         max_batches=max_eval_batches,
         channels_last=channels_last_active,
         fallback_records=eval_records,
+        targets=targets,
     )
     validate_eval_arrays(
         y_true=evaluation.y_true,
@@ -3527,6 +3784,9 @@ def train_and_evaluate(
     quality = metric_report(evaluation.y_true, evaluation.y_score, evaluation.y_mask, targets)
     quality["status"] = "ok"
     quality["baseline"] = baseline
+    if evaluation.localization is not None:
+        evaluation.localization.setdefault("baseline", baseline)
+        quality["localization"] = evaluation.localization
     thresholds = threshold_report(evaluation.y_true, evaluation.y_score, evaluation.y_mask, targets)
     thresholds["status"] = "ok"
     thresholds["baseline"] = baseline
@@ -3625,6 +3885,7 @@ def train_and_evaluate(
             else None
         ),
         "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "gpu_utilization": gpu_utilization,
         "h2d_gb_per_second_estimate": (h2d_bytes / (1024.0**3))
         / max(total_seconds, sys.float_info.epsilon),
     }
@@ -3670,6 +3931,214 @@ def train_and_evaluate(
         max_batch_tensor_bytes=max_batch_tensor_bytes,
     )
     return train_report, quality, thresholds, profile_report, prediction_report, train_order_report
+
+
+class NvidiaSmiUtilizationSampler:
+    QUERY_FIELDS = (
+        "utilization.gpu",
+        "utilization.memory",
+        "memory.used",
+        "memory.total",
+        "power.draw",
+    )
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        device_index: int | None,
+        interval_seconds: float = 1.0,
+        disabled_reason: str = "",
+    ) -> None:
+        self.enabled = enabled
+        self.device_index = device_index
+        self.interval_seconds = max(float(interval_seconds), 0.1)
+        self.disabled_reason = disabled_reason
+        self._samples: list[dict[str, Any]] = []
+        self._errors: list[str] = []
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._started_at: float | None = None
+        self._stopped_at: float | None = None
+
+    @classmethod
+    def for_device(cls, device: Any) -> "NvidiaSmiUtilizationSampler":
+        if getattr(device, "type", None) != "cuda":
+            return cls(
+                enabled=False,
+                device_index=None,
+                disabled_reason=f"device is not cuda: {device}",
+            )
+        if shutil.which("nvidia-smi") is None:
+            return cls(
+                enabled=False,
+                device_index=cuda_device_index(device),
+                disabled_reason="nvidia-smi not found",
+            )
+        interval = gpu_utilization_interval_seconds()
+        return cls(enabled=True, device_index=cuda_device_index(device), interval_seconds=interval)
+
+    def start(self) -> "NvidiaSmiUtilizationSampler":
+        self._started_at = time.perf_counter()
+        if not self.enabled:
+            return self
+        self._thread = threading.Thread(target=self._run, name="nvidia-smi-sampler", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> dict[str, Any]:
+        self._stopped_at = time.perf_counter()
+        if self._thread is not None:
+            self._stop_event.set()
+            self._thread.join(timeout=max(2.0, self.interval_seconds + 1.0))
+        with self._lock:
+            samples = list(self._samples)
+            errors = list(self._errors)
+        return gpu_utilization_summary(
+            samples=samples,
+            errors=errors,
+            enabled=self.enabled,
+            device_index=self.device_index,
+            interval_seconds=self.interval_seconds,
+            disabled_reason=self.disabled_reason,
+            started_at=self._started_at,
+            stopped_at=self._stopped_at,
+        )
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                sample = query_nvidia_smi_utilization(self.device_index)
+                with self._lock:
+                    self._samples.append(sample)
+            except Exception as error:
+                with self._lock:
+                    if len(self._errors) < 5:
+                        self._errors.append(f"{type(error).__name__}: {error}")
+            self._stop_event.wait(self.interval_seconds)
+
+
+def cuda_device_index(device: Any) -> int:
+    index = getattr(device, "index", None)
+    if index is not None:
+        return int(index)
+    match = re.search(r"cuda:(\d+)", str(device))
+    if match:
+        return int(match.group(1))
+    return 0
+
+
+def gpu_utilization_interval_seconds() -> float:
+    raw = os.environ.get("MEDKIT_GPU_UTIL_INTERVAL_SECONDS", "1.0")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 1.0
+    return min(max(value, 0.1), 10.0)
+
+
+def query_nvidia_smi_utilization(device_index: int | None) -> dict[str, Any]:
+    command = [
+        "nvidia-smi",
+        "--query-gpu=" + ",".join(NvidiaSmiUtilizationSampler.QUERY_FIELDS),
+        "--format=csv,noheader,nounits",
+    ]
+    if device_index is not None:
+        command.extend(["--id", str(device_index)])
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=2.0,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError((completed.stderr or completed.stdout).strip())
+    line = next(
+        (item.strip() for item in completed.stdout.splitlines() if item.strip()),
+        "",
+    )
+    if not line:
+        raise RuntimeError("nvidia-smi returned no utilization rows")
+    values = [part.strip() for part in line.split(",")]
+    if len(values) < len(NvidiaSmiUtilizationSampler.QUERY_FIELDS):
+        raise RuntimeError(f"unexpected nvidia-smi utilization row: {line!r}")
+    return parse_nvidia_smi_utilization_values(values)
+
+
+def parse_nvidia_smi_utilization_values(values: Sequence[str]) -> dict[str, Any]:
+    return {
+        "gpu_utilization_percent": parse_float_or_none(values[0]),
+        "memory_utilization_percent": parse_float_or_none(values[1]),
+        "memory_used_mb": parse_float_or_none(values[2]),
+        "memory_total_mb": parse_float_or_none(values[3]),
+        "power_draw_w": parse_float_or_none(values[4]),
+    }
+
+
+def parse_float_or_none(value: Any) -> float | None:
+    text = str(value).strip()
+    if text.upper() in {"", "N/A", "[N/A]", "NA"}:
+        return None
+    try:
+        parsed = float(text)
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def gpu_utilization_summary(
+    *,
+    samples: Sequence[dict[str, Any]],
+    errors: Sequence[str],
+    enabled: bool,
+    device_index: int | None,
+    interval_seconds: float,
+    disabled_reason: str,
+    started_at: float | None,
+    stopped_at: float | None,
+) -> dict[str, Any]:
+    duration = (
+        stopped_at - started_at
+        if started_at is not None and stopped_at is not None
+        else None
+    )
+    status = "ok" if enabled and samples else "unavailable" if enabled else "disabled"
+    summary = {
+        "schema_version": 1,
+        "status": status,
+        "enabled": enabled,
+        "device_index": device_index,
+        "sample_count": len(samples),
+        "interval_seconds": interval_seconds,
+        "duration_seconds": duration,
+        "query": list(NvidiaSmiUtilizationSampler.QUERY_FIELDS),
+        "gpu_utilization_percent": numeric_distribution(
+            numeric_sample_values(samples, "gpu_utilization_percent")
+        ),
+        "memory_utilization_percent": numeric_distribution(
+            numeric_sample_values(samples, "memory_utilization_percent")
+        ),
+        "memory_used_mb": numeric_distribution(numeric_sample_values(samples, "memory_used_mb")),
+        "memory_total_mb": numeric_distribution(numeric_sample_values(samples, "memory_total_mb")),
+        "power_draw_w": numeric_distribution(numeric_sample_values(samples, "power_draw_w")),
+    }
+    if disabled_reason:
+        summary["reason"] = disabled_reason
+    if errors:
+        summary["errors"] = list(errors)
+    return summary
+
+
+def numeric_sample_values(samples: Sequence[dict[str, Any]], key: str) -> list[float]:
+    values: list[float] = []
+    for sample in samples:
+        value = sample.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            values.append(float(value))
+    return values
 
 
 def native_prefetch_timing_fields(
@@ -4254,6 +4723,7 @@ def evaluate_model(
     max_batches: int,
     channels_last: bool,
     fallback_records: Sequence[SampleRecord] = (),
+    targets: Sequence[str] = (),
 ) -> EvaluationOutputs:
     numpy = import_numpy()
     model.eval()
@@ -4263,6 +4733,12 @@ def evaluate_model(
     y_logits: list[Any] = []
     samples: list[dict[str, Any]] = []
     eval_offset = 0
+    localization_recorder = CamLocalizationRecorder(
+        target="Pneumonia" if "Pneumonia" in targets else "",
+        target_index=list(targets).index("Pneumonia") if "Pneumonia" in targets else None,
+        eval_records=fallback_records,
+    )
+    localization_supported = False
     with torch.no_grad():
         for batch_index, batch in enumerate(loader):
             image = image_to_float_on_device(
@@ -4271,7 +4747,26 @@ def evaluate_model(
                 device,
                 channels_last=channels_last,
             )
-            logits = model(image)
+            cam_result = (
+                dense_classifier_logits_and_cam(
+                    torch=torch,
+                    model=model,
+                    image=image,
+                    target_index=localization_recorder.target_index,
+                )
+                if localization_recorder.enabled
+                else None
+            )
+            if cam_result is None:
+                logits = model(image)
+            else:
+                logits, heatmaps = cam_result
+                localization_supported = True
+                localization_recorder.record_batch(
+                    heatmaps=tensor_to_numpy(heatmaps),
+                    start_index=eval_offset,
+                    count=int(logits.shape[0]),
+                )
             logits_np = logits.detach().cpu().numpy()
             probs = torch.sigmoid(logits).detach().cpu().numpy()
             y_score.append(probs)
@@ -4298,6 +4793,7 @@ def evaluate_model(
             y_mask=empty,
             y_logits=empty,
             samples=[],
+            localization=localization_recorder.report(localization_supported),
         )
     return EvaluationOutputs(
         y_true=numpy.concatenate(y_true),
@@ -4305,7 +4801,259 @@ def evaluate_model(
         y_mask=numpy.concatenate(y_mask),
         y_logits=numpy.concatenate(y_logits),
         samples=samples,
+        localization=localization_recorder.report(localization_supported),
     )
+
+
+class CamLocalizationRecorder:
+    def __init__(
+        self,
+        *,
+        target: str,
+        target_index: int | None,
+        eval_records: Sequence[SampleRecord],
+    ) -> None:
+        self.target = target
+        self.target_index = target_index
+        self.eval_records = list(eval_records)
+        self.enabled = (
+            target_index is not None
+            and bool(target)
+            and any(record.localization_boxes for record in eval_records)
+        )
+        self.rows: list[dict[str, Any]] = []
+
+    def record_batch(self, *, heatmaps: Any, start_index: int, count: int) -> None:
+        if not self.enabled:
+            return
+        numpy = import_numpy()
+        heatmaps_np = numpy.asarray(heatmaps, dtype="float64")
+        if heatmaps_np.ndim != 3:
+            return
+        for local_index in range(min(count, heatmaps_np.shape[0])):
+            global_index = start_index + local_index
+            if global_index >= len(self.eval_records):
+                continue
+            record = self.eval_records[global_index]
+            if record.labels.get(self.target) != 1 or not record.localization_boxes:
+                continue
+            heatmap = normalize_heatmap(heatmaps_np[local_index])
+            box_mask = box_union_mask(
+                boxes=record.localization_boxes or [],
+                height=int(heatmap.shape[0]),
+                width=int(heatmap.shape[1]),
+            )
+            if box_mask is None or not bool(box_mask.any()):
+                continue
+            row = cam_localization_sample_metrics(
+                heatmap=heatmap,
+                box_mask=box_mask,
+                sample_id=record.sample_id,
+                box_count=len(record.localization_boxes or []),
+            )
+            self.rows.append(row)
+
+    def report(self, supported: bool) -> dict[str, Any]:
+        if not self.enabled:
+            return localization_eval_disabled_report(
+                baseline="",
+                reason="no localization boxes for requested target",
+                target=self.target,
+            )
+        if not supported:
+            return localization_eval_disabled_report(
+                baseline="",
+                reason="model does not expose DenseNet-style classifier CAM features",
+                target=self.target,
+            )
+        return summarize_cam_localization_rows(target=self.target, rows=self.rows)
+
+
+def dense_classifier_logits_and_cam(
+    *,
+    torch: Any,
+    model: Any,
+    image: Any,
+    target_index: int | None,
+) -> tuple[Any, Any] | None:
+    if target_index is None:
+        return None
+    base_model = getattr(model, "_orig_mod", model)
+    features_module = getattr(base_model, "features", None)
+    classifier = getattr(base_model, "classifier", None)
+    if features_module is None or classifier is None or not hasattr(classifier, "weight"):
+        return None
+    features = features_module(image)
+    activations = torch.nn.functional.relu(features, inplace=False)
+    pooled = torch.nn.functional.adaptive_avg_pool2d(activations, (1, 1))
+    logits = classifier(torch.flatten(pooled, 1))
+    weight = classifier.weight[target_index].reshape(1, -1, 1, 1)
+    heatmaps = (activations * weight).sum(dim=1)
+    heatmaps = torch.nn.functional.relu(heatmaps, inplace=False)
+    heatmaps = torch.nn.functional.interpolate(
+        heatmaps.unsqueeze(1),
+        size=tuple(image.shape[-2:]),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(1)
+    return logits, heatmaps
+
+
+def normalize_heatmap(heatmap: Any) -> Any:
+    numpy = import_numpy()
+    array = numpy.asarray(heatmap, dtype="float64")
+    finite = numpy.isfinite(array)
+    if not bool(finite.any()):
+        return numpy.zeros_like(array, dtype="float64")
+    clean = numpy.where(finite, array, 0.0)
+    minimum = float(clean[finite].min())
+    maximum = float(clean[finite].max())
+    if maximum <= minimum:
+        return numpy.zeros_like(clean, dtype="float64")
+    return (clean - minimum) / (maximum - minimum)
+
+
+def box_union_mask(*, boxes: Sequence[dict[str, Any]], height: int, width: int) -> Any | None:
+    if height <= 0 or width <= 0:
+        return None
+    numpy = import_numpy()
+    mask = numpy.zeros((height, width), dtype=bool)
+    for box in boxes:
+        try:
+            image_width = float(box.get("image_width") or 1.0)
+            image_height = float(box.get("image_height") or 1.0)
+            x1 = float(box.get("x1"))
+            y1 = float(box.get("y1"))
+            x2 = float(box.get("x2"))
+            y2 = float(box.get("y2"))
+        except (TypeError, ValueError):
+            continue
+        if image_width <= 0.0 or image_height <= 0.0:
+            continue
+        left = max(0, min(width - 1, int(math.floor((x1 / image_width) * width))))
+        top = max(0, min(height - 1, int(math.floor((y1 / image_height) * height))))
+        right = max(left + 1, min(width, int(math.ceil((x2 / image_width) * width))))
+        bottom = max(top + 1, min(height, int(math.ceil((y2 / image_height) * height))))
+        mask[top:bottom, left:right] = True
+    return mask
+
+
+def cam_localization_sample_metrics(
+    *,
+    heatmap: Any,
+    box_mask: Any,
+    sample_id: str,
+    box_count: int,
+) -> dict[str, Any]:
+    numpy = import_numpy()
+    flat_index = int(numpy.argmax(heatmap))
+    top_y, top_x = numpy.unravel_index(flat_index, heatmap.shape)
+    total_heat = float(heatmap.sum())
+    box_heat = float(heatmap[box_mask].sum())
+    row: dict[str, Any] = {
+        "sample_id": sample_id,
+        "box_count": int(box_count),
+        "top1_hit": bool(box_mask[int(top_y), int(top_x)]),
+        "heat_in_box_fraction": (box_heat / total_heat if total_heat > 0.0 else None),
+    }
+    for fraction in (0.01, 0.05, 0.10, 0.20):
+        pred_mask = top_fraction_mask(heatmap, fraction)
+        intersection = int(numpy.logical_and(pred_mask, box_mask).sum())
+        union = int(numpy.logical_or(pred_mask, box_mask).sum())
+        box_area = int(box_mask.sum())
+        key = f"top_{int(fraction * 100)}pct"
+        row[key] = {
+            "hit": intersection > 0,
+            "iou": (intersection / union if union else None),
+            "box_coverage": (intersection / box_area if box_area else None),
+            "predicted_area_fraction": float(pred_mask.mean()),
+        }
+    return row
+
+
+def top_fraction_mask(heatmap: Any, fraction: float) -> Any:
+    numpy = import_numpy()
+    array = numpy.asarray(heatmap, dtype="float64")
+    total = int(array.size)
+    k = max(1, min(total, int(math.ceil(total * fraction))))
+    flat = array.reshape(-1)
+    if k >= total:
+        return numpy.ones_like(array, dtype=bool)
+    indices = numpy.argpartition(flat, total - k)[total - k :]
+    mask = numpy.zeros(total, dtype=bool)
+    mask[indices] = True
+    return mask.reshape(array.shape)
+
+
+def summarize_cam_localization_rows(*, target: str, rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "status": "ok" if rows else "not_available",
+        "method": "densenet121_classifier_cam",
+        "target": target,
+        "evaluated_positive_boxed_samples": len(rows),
+        "top1_hit_rate": mean_boolean(row.get("top1_hit") for row in rows),
+        "heat_in_box_fraction": numeric_distribution(
+            [value for value in (row.get("heat_in_box_fraction") for row in rows) if value is not None]
+        ),
+        "top_percent": {
+            key: summarize_cam_threshold_rows(rows, key)
+            for key in ("top_1pct", "top_5pct", "top_10pct", "top_20pct")
+        },
+        "notes": [
+            "Classifier CAM localization is a weakly supervised box-overlap metric.",
+            "It is not detector mAP; use it to compare recipes before adding a detection head.",
+        ],
+    }
+
+
+def summarize_cam_threshold_rows(rows: Sequence[dict[str, Any]], key: str) -> dict[str, Any]:
+    values = [row.get(key) for row in rows if isinstance(row.get(key), dict)]
+    return {
+        "hit_rate": mean_boolean(value.get("hit") for value in values),
+        "iou": numeric_distribution(
+            [value.get("iou") for value in values if value.get("iou") is not None]
+        ),
+        "box_coverage": numeric_distribution(
+            [
+                value.get("box_coverage")
+                for value in values
+                if value.get("box_coverage") is not None
+            ]
+        ),
+        "predicted_area_fraction": numeric_distribution(
+            [
+                value.get("predicted_area_fraction")
+                for value in values
+                if value.get("predicted_area_fraction") is not None
+            ]
+        ),
+    }
+
+
+def mean_boolean(values: Iterable[Any]) -> float | None:
+    clean = [bool(value) for value in values if value is not None]
+    if not clean:
+        return None
+    return sum(1 for value in clean if value) / len(clean)
+
+
+def localization_eval_disabled_report(
+    *,
+    baseline: str,
+    reason: str,
+    target: str = "Pneumonia",
+) -> dict[str, Any]:
+    report = {
+        "schema_version": 1,
+        "status": "disabled",
+        "enabled": False,
+        "target": target,
+        "reason": reason,
+    }
+    if baseline:
+        report["baseline"] = baseline
+    return report
 
 
 def tensor_to_numpy(value: Any) -> Any:
@@ -5653,6 +6401,7 @@ def build_run_provenance(
             "step_profile": "step-profile.json",
             "environment": "environment.json",
             "training_ground_truth": "training-ground-truth.json",
+            "localization_eval": "localization-eval.json",
             "eval_predictions_summary": "eval-predictions-summary.json",
             "train_order_summary": "train-order-summary.json",
             "train_schedule_summary": "train-schedule-summary.json",
@@ -5849,6 +6598,12 @@ def run_summary_consistency_errors(
     )
     expect_equal(errors, "summary.memory", summary.get("memory"), memory_summary(reports))
     expect_equal(errors, "summary.predictions", summary.get("predictions"), reports.get("predictions"))
+    expect_equal(
+        errors,
+        "summary.localization_eval",
+        summary.get("localization_eval"),
+        reports.get("localization_eval"),
+    )
     expected_quality_gate = summary.get("quality_gate")
     if not isinstance(expected_quality_gate, dict):
         errors.append("summary.quality_gate missing")
@@ -6060,6 +6815,7 @@ def record_to_json(record: SampleRecord) -> dict[str, Any]:
         "photometric_interpretation": "MONOCHROME2",
         "labels": record.labels,
         "label_source": record.label_source,
+        "localization_boxes": record.localization_boxes or [],
         "source_split": record.source_split,
         "split": record.split,
         "sha256": record.sha256,
@@ -6229,6 +6985,7 @@ def training_ground_truth_row(
             ),
             "data_wait_percent": gpu.get("data_wait_percent"),
         },
+        "gpu_utilization": gpu.get("gpu_utilization"),
         "pipeline": pipeline_summary(gpu=gpu, loader=loader),
         "profile": {
             "timing_scope": profile_record_modes(profile, "timing_scope"),
@@ -6333,6 +7090,22 @@ def compare_ground_truth_rows(
         "gpu_cache_image_pss_mb_delta": delta_values(
             nested_numeric(candidate, "memory", "gpu_cache_image_pss_mb"),
             nested_numeric(raw, "memory", "gpu_cache_image_pss_mb"),
+        ),
+        "gpu_utilization_percent_mean_delta": delta_values(
+            nested_numeric(candidate, "gpu_utilization", "gpu_utilization_percent", "mean"),
+            nested_numeric(raw, "gpu_utilization", "gpu_utilization_percent", "mean"),
+        ),
+        "gpu_utilization_percent_mean_speedup": ratio_values(
+            nested_numeric(candidate, "gpu_utilization", "gpu_utilization_percent", "mean"),
+            nested_numeric(raw, "gpu_utilization", "gpu_utilization_percent", "mean"),
+        ),
+        "memory_utilization_percent_mean_delta": delta_values(
+            nested_numeric(candidate, "gpu_utilization", "memory_utilization_percent", "mean"),
+            nested_numeric(raw, "gpu_utilization", "memory_utilization_percent", "mean"),
+        ),
+        "power_draw_w_mean_delta": delta_values(
+            nested_numeric(candidate, "gpu_utilization", "power_draw_w", "mean"),
+            nested_numeric(raw, "gpu_utilization", "power_draw_w", "mean"),
         ),
         "macro_auroc_delta": delta_values(
             nested_numeric(candidate, "quality", "macro_auroc"),
