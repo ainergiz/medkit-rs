@@ -627,6 +627,7 @@ def test_quality_gate_and_balanced_loss_helpers_reject_weak_quality():
     ]
 
     assert benchmark.class_pos_weight_values(records, ["Pneumonia"]) == [3.0]
+    assert benchmark.class_pos_weight_values(records, ["Pneumonia"], cap=2.0) == [2.0]
 
     report = benchmark.quality_gate_report(
         quality={
@@ -918,6 +919,7 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
     assert quality_args.epochs == 2
     assert quality_args.max_eval_batches == 0
     assert quality_args.loss_pos_weight == "balanced"
+    assert quality_args.loss_pos_weight_cap == 10.0
     assert quality_args.quality_gate is True
     assert quality_args.quality_min_eval_samples == 900
     assert quality_args.quality_min_metric_targets == 5
@@ -933,6 +935,8 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
     assert "--paired-train-order" in quality_command
     assert "--loss-pos-weight" in quality_command
     assert "balanced" in quality_command
+    assert "--loss-pos-weight-cap" in quality_command
+    assert "10.0" in quality_command
     assert "--no-channels-last" in quality_command
     assert "--no-torch-compile" in quality_command
 
@@ -989,6 +993,21 @@ def test_modal_cxr_wrapper_exposes_sync_policy():
     assert 'amp_dtype: str = "auto"' in text
     assert "--amp-dtype" in text
     assert "amp_dtype=amp_dtype" in text
+    assert 'model_init: str = "random"' in text
+    assert "--model-init" in text
+    assert "model_init=model_init" in text
+    assert 'loss_kind: str = "bce"' in text
+    assert "--loss-kind" in text
+    assert "loss_kind=loss_kind" in text
+    assert "loss_pos_weight_cap: float = 0.0" in text
+    assert "--loss-pos-weight-cap" in text
+    assert "loss_pos_weight_cap=loss_pos_weight_cap" in text
+    assert "focal_gamma: float = 2.0" in text
+    assert "--focal-gamma" in text
+    assert "focal_gamma=focal_gamma" in text
+    assert "focal_alpha: float = 0.0" in text
+    assert "--focal-alpha" in text
+    assert "focal_alpha=focal_alpha" in text
     assert "gpu_prefetch_reuse_buffers: bool = False" in text
     assert "--gpu-prefetch-reuse-buffers" in text
     assert "gpu_prefetch_reuse_buffers=gpu_prefetch_reuse_buffers" in text
@@ -1201,7 +1220,12 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
             "torch_compile_mode": "default",
             "learning_rate": 1.0e-4,
             "amp_dtype": "auto",
+            "model_init": "random",
+            "loss_kind": "bce",
             "loss_pos_weight": "none",
+            "loss_pos_weight_cap": 0.0,
+            "focal_gamma": 2.0,
+            "focal_alpha": 0.0,
             "quality_gate": False,
             "quality_min_eval_samples": 0,
             "quality_min_metric_targets": 0,
@@ -1240,7 +1264,12 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
             "torch_compile_mode": "default",
             "learning_rate": 1.0e-4,
             "amp_dtype": "auto",
+            "model_init": "random",
+            "loss_kind": "bce",
             "loss_pos_weight": "none",
+            "loss_pos_weight_cap": 0.0,
+            "focal_gamma": 2.0,
+            "focal_alpha": 0.0,
             "quality_gate": False,
             "quality_min_eval_samples": 0,
             "quality_min_metric_targets": 0,

@@ -220,6 +220,12 @@ def main() -> int:
             "CUDA autocast dtype, disabled turns autocast and GradScaler off."
         ),
     )
+    parser.add_argument(
+        "--model-init",
+        choices=("random", "imagenet"),
+        default="random",
+        help="DenseNet121 initialization policy. imagenet adapts RGB conv0 weights to grayscale.",
+    )
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
     parser.add_argument("--include-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
@@ -232,6 +238,20 @@ def main() -> int:
         choices=("none", "balanced"),
         default="none",
         help="Use train-split positive class weights in BCE when set to balanced.",
+    )
+    parser.add_argument(
+        "--loss-pos-weight-cap",
+        type=float,
+        default=0.0,
+        help="Optional cap for balanced positive class weights. 0 disables capping.",
+    )
+    parser.add_argument("--loss-kind", choices=("bce", "focal"), default="bce")
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument(
+        "--focal-alpha",
+        type=float,
+        default=0.0,
+        help="Optional focal alpha in (0, 1). 0 disables alpha weighting.",
     )
     parser.add_argument(
         "--quality-gate",
@@ -293,6 +313,12 @@ def main() -> int:
         args.epochs = min(args.epochs, 1)
     if args.force_rematerialize:
         args.force_cache = True
+    if args.loss_pos_weight_cap < 0.0:
+        raise ValueError("--loss-pos-weight-cap must be >= 0")
+    if args.focal_gamma < 0.0:
+        raise ValueError("--focal-gamma must be >= 0")
+    if args.focal_alpha < 0.0 or args.focal_alpha >= 1.0:
+        raise ValueError("--focal-alpha must be >= 0 and < 1")
     if args.eval_predictions is None:
         args.eval_predictions = bool(args.quality_gate)
     if args.paired_train_order is None:
@@ -344,7 +370,12 @@ def main() -> int:
         "targets": targets,
         "uncertain_policy": args.uncertain,
         "missing_policy": "mask_missing",
+        "model_init": args.model_init,
+        "loss_kind": args.loss_kind,
         "loss_pos_weight": args.loss_pos_weight,
+        "loss_pos_weight_cap": args.loss_pos_weight_cap,
+        "focal_gamma": args.focal_gamma,
+        "focal_alpha": args.focal_alpha,
         "quality_gate": args.quality_gate,
         "quality_min_eval_samples": args.quality_min_eval_samples,
         "quality_min_metric_targets": args.quality_min_metric_targets,
@@ -1607,7 +1638,11 @@ def run_all_baselines(
     train_batch_schedule: TrainBatchSchedule | None,
 ) -> dict[str, dict[str, Any]]:
     loss_pos_weight_values = (
-        class_pos_weight_values(records, targets)
+        class_pos_weight_values(
+            records,
+            targets,
+            cap=args.loss_pos_weight_cap if args.loss_pos_weight_cap > 0.0 else None,
+        )
         if args.loss_pos_weight == "balanced"
         else None
     )
@@ -1707,8 +1742,13 @@ def run_all_baselines(
                 torch_compile_mode=args.torch_compile_mode,
                 learning_rate=args.learning_rate,
                 amp_dtype=args.amp_dtype,
+                model_init=args.model_init,
+                loss_kind=args.loss_kind,
                 loss_pos_weight_values=loss_pos_weight_values,
                 loss_pos_weight_mode=args.loss_pos_weight,
+                loss_pos_weight_cap=args.loss_pos_weight_cap,
+                focal_gamma=args.focal_gamma,
+                focal_alpha=args.focal_alpha,
                 seed=args.seed,
                 prediction_artifact_path=prediction_artifact_path,
                 train_order_artifact_path=train_order_artifact_path,
@@ -2816,8 +2856,13 @@ def train_and_evaluate(
     torch_compile_mode: str,
     learning_rate: float,
     amp_dtype: str,
+    model_init: str,
+    loss_kind: str,
     loss_pos_weight_values: Sequence[float] | None,
     loss_pos_weight_mode: str,
+    loss_pos_weight_cap: float,
+    focal_gamma: float,
+    focal_alpha: float,
     seed: int,
     prediction_artifact_path: Path | None,
     train_order_artifact_path: Path | None,
@@ -2831,7 +2876,7 @@ def train_and_evaluate(
 ]:
     set_torch_seed(torch, seed)
     channels_last_active = bool(channels_last)
-    model = make_model(torch, len(targets))
+    model, model_info = make_model(torch, len(targets), model_init=model_init)
     if channels_last_active:
         model = model.to(device=device, memory_format=torch.channels_last)
     else:
@@ -2897,6 +2942,9 @@ def train_and_evaluate(
             channels_last=channels_last_active,
             autocast_dtype=autocast_dtype,
             pos_weight=pos_weight,
+            loss_kind=loss_kind,
+            focal_gamma=focal_gamma,
+            focal_alpha=focal_alpha,
             train_order_recorder=train_order_recorder,
         )
         if device.type == "cuda":
@@ -3040,13 +3088,16 @@ def train_and_evaluate(
                 **autocast_kwargs(enabled=autocast_enabled, dtype=autocast_dtype)
             ):
                 logits = model(image)
-                raw_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                    logits,
-                    labels,
-                    reduction="none",
+                loss = masked_multilabel_loss(
+                    torch=torch,
+                    logits=logits,
+                    labels=labels,
+                    mask=mask,
                     pos_weight=pos_weight,
+                    loss_kind=loss_kind,
+                    focal_gamma=focal_gamma,
+                    focal_alpha=focal_alpha,
                 )
-                loss = (raw_loss * mask).sum() / mask.sum().clamp_min(1.0)
             if cuda_profile:
                 forward_end.record()
             forward_wall_ms = (time.perf_counter() - forward_wall_start) * 1000.0
@@ -3253,12 +3304,20 @@ def train_and_evaluate(
         "autocast_enabled": autocast_enabled,
         "grad_scaler_enabled": grad_scaler_enabled,
         "warmup_ms": warmup_seconds * 1000.0,
+        "model_init": model_init,
+        "model_architecture": model_info.get("architecture"),
+        "model_pretrained": model_info.get("pretrained"),
+        "model_pretrained_weights": model_info.get("pretrained_weights"),
+        "loss_kind": loss_kind,
         "loss_pos_weight": loss_pos_weight_mode,
+        "loss_pos_weight_cap": loss_pos_weight_cap,
         "loss_pos_weight_values": (
             [float(value) for value in loss_pos_weight_values]
             if loss_pos_weight_values is not None
             else None
         ),
+        "focal_gamma": focal_gamma,
+        "focal_alpha": focal_alpha,
         "h2d_timing_mode": h2d_timing_mode,
         "skipped_incomplete_batches": skipped_incomplete_batches,
         "skipped_incomplete_samples": skipped_incomplete_samples,
@@ -3394,6 +3453,7 @@ def should_skip_incomplete_train_batch(
 def class_pos_weight_values(
     records: Sequence[SampleRecord],
     targets: Sequence[str],
+    cap: float | None = None,
 ) -> list[float]:
     train_records = [record for record in records if record.split == "train"]
     weights: list[float] = []
@@ -3406,7 +3466,10 @@ def class_pos_weight_values(
                 positive += 1
             elif value == 0:
                 negative += 1
-        weights.append(float(negative / positive) if positive > 0 else 1.0)
+        weight = float(negative / positive) if positive > 0 else 1.0
+        if cap is not None and cap > 0.0:
+            weight = min(weight, float(cap))
+        weights.append(weight)
     return weights
 
 
@@ -3735,6 +3798,9 @@ def run_warmup_steps(
     channels_last: bool,
     autocast_dtype: Any | None = None,
     pos_weight: Any | None = None,
+    loss_kind: str = "bce",
+    focal_gamma: float = 2.0,
+    focal_alpha: float = 0.0,
     train_order_recorder: TrainOrderRecorder | None = None,
 ) -> None:
     model.train()
@@ -3761,13 +3827,16 @@ def run_warmup_steps(
             **autocast_kwargs(enabled=autocast_enabled, dtype=autocast_dtype)
         ):
             logits = model(image)
-            raw_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                logits,
-                labels,
-                reduction="none",
+            loss = masked_multilabel_loss(
+                torch=torch,
+                logits=logits,
+                labels=labels,
+                mask=mask,
                 pos_weight=pos_weight,
+                loss_kind=loss_kind,
+                focal_gamma=focal_gamma,
+                focal_alpha=focal_alpha,
             )
-            loss = (raw_loss * mask).sum() / mask.sum().clamp_min(1.0)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -3803,11 +3872,48 @@ def image_to_float_on_device(torch: Any, image: Any, device: Any, *, channels_la
     return image.to(device=device, dtype=torch.float32, non_blocking=True)
 
 
-def make_model(torch: Any, num_targets: int) -> Any:
+def masked_multilabel_loss(
+    *,
+    torch: Any,
+    logits: Any,
+    labels: Any,
+    mask: Any,
+    pos_weight: Any | None,
+    loss_kind: str,
+    focal_gamma: float,
+    focal_alpha: float,
+) -> Any:
+    raw_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        labels,
+        reduction="none",
+        pos_weight=pos_weight,
+    )
+    if loss_kind == "focal":
+        probabilities = torch.sigmoid(logits)
+        p_t = probabilities * labels + (1.0 - probabilities) * (1.0 - labels)
+        raw_loss = raw_loss * (1.0 - p_t).clamp_min(1.0e-6).pow(float(focal_gamma))
+        if focal_alpha > 0.0:
+            alpha_t = focal_alpha * labels + (1.0 - focal_alpha) * (1.0 - labels)
+            raw_loss = raw_loss * alpha_t
+    elif loss_kind != "bce":
+        raise ValueError(f"Unsupported loss kind: {loss_kind!r}")
+    return (raw_loss * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def make_model(torch: Any, num_targets: int, *, model_init: str = "random") -> tuple[Any, dict[str, Any]]:
     try:
         torchvision = import_torchvision()
-        model = torchvision.models.densenet121(weights=None)
-        model.features.conv0 = torch.nn.Conv2d(
+        weights = None
+        weights_name = None
+        if model_init == "imagenet":
+            weights_enum = getattr(torchvision.models, "DenseNet121_Weights", None)
+            weights = weights_enum.DEFAULT if weights_enum is not None else "IMAGENET1K_V1"
+            weights_name = str(weights)
+        elif model_init != "random":
+            raise ValueError(f"Unsupported model init: {model_init!r}")
+        model = torchvision.models.densenet121(weights=weights)
+        conv0 = torch.nn.Conv2d(
             1,
             64,
             kernel_size=7,
@@ -3815,9 +3921,20 @@ def make_model(torch: Any, num_targets: int) -> Any:
             padding=3,
             bias=False,
         )
+        if weights is not None:
+            with torch.no_grad():
+                conv0.weight.copy_(model.features.conv0.weight.mean(dim=1, keepdim=True))
+        model.features.conv0 = conv0
         model.classifier = torch.nn.Linear(model.classifier.in_features, num_targets)
-        return model
+        return model, {
+            "architecture": "torchvision.densenet121",
+            "model_init": model_init,
+            "pretrained": weights is not None,
+            "pretrained_weights": weights_name,
+        }
     except Exception:
+        if model_init != "random":
+            raise
         return torch.nn.Sequential(
             torch.nn.Conv2d(1, 16, kernel_size=5, stride=2, padding=2),
             torch.nn.BatchNorm2d(16),
@@ -3828,7 +3945,12 @@ def make_model(torch: Any, num_targets: int) -> Any:
             torch.nn.AdaptiveAvgPool2d((1, 1)),
             torch.nn.Flatten(),
             torch.nn.Linear(32, num_targets),
-        )
+        ), {
+            "architecture": "fallback_small_cnn",
+            "model_init": model_init,
+            "pretrained": False,
+            "pretrained_weights": None,
+        }
 
 
 def evaluate_model(
@@ -5176,7 +5298,12 @@ def build_run_provenance(
         "torch_compile_mode": run_metadata.get("torch_compile_mode"),
         "learning_rate": run_metadata.get("learning_rate"),
         "amp_dtype": run_metadata.get("amp_dtype"),
+        "model_init": run_metadata.get("model_init"),
+        "loss_kind": run_metadata.get("loss_kind"),
         "loss_pos_weight": run_metadata.get("loss_pos_weight"),
+        "loss_pos_weight_cap": run_metadata.get("loss_pos_weight_cap"),
+        "focal_gamma": run_metadata.get("focal_gamma"),
+        "focal_alpha": run_metadata.get("focal_alpha"),
         "read_mode": run_metadata.get("read_mode"),
         "include_metadata": run_metadata.get("include_metadata"),
         "quality_gate": run_metadata.get("quality_gate"),
@@ -5341,7 +5468,12 @@ def run_summary_consistency_errors(
         "torch_compile_mode",
         "learning_rate",
         "amp_dtype",
+        "model_init",
+        "loss_kind",
         "loss_pos_weight",
+        "loss_pos_weight_cap",
+        "focal_gamma",
+        "focal_alpha",
         "read_mode",
         "include_metadata",
         "quality_gate",

@@ -162,6 +162,7 @@ GATE_PRESETS: dict[str, dict[str, Any]] = {
         "gpu_prefetch_reuse_buffers": False,
         "sync_every_step": True,
         "loss_pos_weight": "balanced",
+        "loss_pos_weight_cap": 10.0,
         "quality_gate": True,
         "quality_min_eval_samples": 900,
         "quality_min_metric_targets": 5,
@@ -205,7 +206,12 @@ GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
     "torch_compile_mode": ("--torch-compile-mode",),
     "learning_rate": ("--learning-rate",),
     "amp_dtype": ("--amp-dtype",),
+    "model_init": ("--model-init",),
+    "loss_kind": ("--loss-kind",),
     "loss_pos_weight": ("--loss-pos-weight",),
+    "loss_pos_weight_cap": ("--loss-pos-weight-cap",),
+    "focal_gamma": ("--focal-gamma",),
+    "focal_alpha": ("--focal-alpha",),
     "quality_gate": ("--quality-gate", "--no-quality-gate"),
     "quality_min_eval_samples": ("--quality-min-eval-samples",),
     "quality_min_metric_targets": ("--quality-min-metric-targets",),
@@ -307,7 +313,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "float16", "bfloat16", "disabled"),
         default="auto",
     )
+    parser.add_argument("--model-init", choices=("random", "imagenet"), default="random")
+    parser.add_argument("--loss-kind", choices=("bce", "focal"), default="bce")
     parser.add_argument("--loss-pos-weight", choices=("none", "balanced"), default="none")
+    parser.add_argument("--loss-pos-weight-cap", type=float, default=0.0)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--focal-alpha", type=float, default=0.0)
     parser.add_argument("--quality-gate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--quality-min-eval-samples", type=int, default=0)
     parser.add_argument("--quality-min-metric-targets", type=int, default=0)
@@ -703,8 +714,18 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         str(args.learning_rate),
         "--amp-dtype",
         str(args.amp_dtype),
+        "--model-init",
+        str(args.model_init),
+        "--loss-kind",
+        str(args.loss_kind),
         "--loss-pos-weight",
         str(args.loss_pos_weight),
+        "--loss-pos-weight-cap",
+        str(args.loss_pos_weight_cap),
+        "--focal-gamma",
+        str(args.focal_gamma),
+        "--focal-alpha",
+        str(args.focal_alpha),
         "--quality-gate" if args.quality_gate else "--no-quality-gate",
         "--quality-min-eval-samples",
         str(args.quality_min_eval_samples),
@@ -2127,7 +2148,12 @@ def validate_summary_provenance_artifacts(
         "torch_compile_mode",
         "learning_rate",
         "amp_dtype",
+        "model_init",
+        "loss_kind",
         "loss_pos_weight",
+        "loss_pos_weight_cap",
+        "focal_gamma",
+        "focal_alpha",
         "quality_gate",
         "quality_min_eval_samples",
         "quality_min_metric_targets",
@@ -2178,7 +2204,12 @@ def validate_summary_provenance_artifacts(
             "torch_compile_mode",
             "learning_rate",
             "amp_dtype",
+            "model_init",
+            "loss_kind",
             "loss_pos_weight",
+            "loss_pos_weight_cap",
+            "focal_gamma",
+            "focal_alpha",
             "quality_gate",
             "quality_min_eval_samples",
             "quality_min_metric_targets",
