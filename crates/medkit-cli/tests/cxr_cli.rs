@@ -2,7 +2,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn cxr_cli_indexes_splits_validates_and_caches_fixture() {
@@ -826,8 +829,11 @@ fn run_medkit_fail(args: &[&str]) -> FailedCommand {
 }
 
 fn unique_test_dir() -> PathBuf {
+    let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "medkit-cxr-cli-test-{}",
+        "medkit-cxr-cli-test-{}-{}-{}",
+        std::process::id(),
+        counter,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
