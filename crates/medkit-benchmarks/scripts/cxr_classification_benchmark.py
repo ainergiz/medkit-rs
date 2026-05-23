@@ -205,6 +205,21 @@ def main() -> int:
         help="Compile the PyTorch model before warmup/training and record compile provenance.",
     )
     parser.add_argument("--torch-compile-mode", default="default")
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=1.0e-4,
+        help="AdamW learning rate used for training.",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("auto", "float16", "bfloat16", "disabled"),
+        default="auto",
+        help=(
+            "CUDA autocast dtype policy. auto preserves PyTorch's default "
+            "CUDA autocast dtype, disabled turns autocast and GradScaler off."
+        ),
+    )
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
     parser.add_argument("--include-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
@@ -362,6 +377,8 @@ def main() -> int:
         "channels_last": args.channels_last,
         "torch_compile": args.torch_compile,
         "torch_compile_mode": args.torch_compile_mode,
+        "learning_rate": args.learning_rate,
+        "amp_dtype": args.amp_dtype,
         "profile_batches": args.profile_batches,
         "read_mode": args.read_mode,
         "include_metadata": args.include_metadata,
@@ -1688,6 +1705,8 @@ def run_all_baselines(
                 channels_last=args.channels_last,
                 torch_compile=args.torch_compile,
                 torch_compile_mode=args.torch_compile_mode,
+                learning_rate=args.learning_rate,
+                amp_dtype=args.amp_dtype,
                 loss_pos_weight_values=loss_pos_weight_values,
                 loss_pos_weight_mode=args.loss_pos_weight,
                 seed=args.seed,
@@ -2795,6 +2814,8 @@ def train_and_evaluate(
     channels_last: bool,
     torch_compile: bool,
     torch_compile_mode: str,
+    learning_rate: float,
+    amp_dtype: str,
     loss_pos_weight_values: Sequence[float] | None,
     loss_pos_weight_mode: str,
     seed: int,
@@ -2834,9 +2855,11 @@ def train_and_evaluate(
                 f"torch.compile failed with mode {torch_compile_mode!r}: {error}"
             ) from error
         torch_compile_setup_seconds = time.perf_counter() - compile_start
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4, weight_decay=1.0e-4)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
-    autocast_enabled = device.type == "cuda"
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1.0e-4)
+    autocast_dtype = resolve_cuda_amp_dtype(torch, amp_dtype)
+    autocast_enabled = device.type == "cuda" and amp_dtype != "disabled"
+    grad_scaler_enabled = device.type == "cuda" and amp_dtype in ("auto", "float16")
+    scaler = torch.cuda.amp.GradScaler(enabled=grad_scaler_enabled)
     pos_weight = (
         torch.tensor(list(loss_pos_weight_values), dtype=torch.float32, device=device)
         if loss_pos_weight_values is not None
@@ -2872,6 +2895,7 @@ def train_and_evaluate(
             batches=warmup_batches,
             autocast_enabled=autocast_enabled,
             channels_last=channels_last_active,
+            autocast_dtype=autocast_dtype,
             pos_weight=pos_weight,
             train_order_recorder=train_order_recorder,
         )
@@ -3012,7 +3036,9 @@ def train_and_evaluate(
                 forward_start = torch.cuda.Event(enable_timing=True)
                 forward_end = torch.cuda.Event(enable_timing=True)
                 forward_start.record()
-            with torch.cuda.amp.autocast(enabled=autocast_enabled):
+            with torch.cuda.amp.autocast(
+                **autocast_kwargs(enabled=autocast_enabled, dtype=autocast_dtype)
+            ):
                 logits = model(image)
                 raw_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                     logits,
@@ -3221,6 +3247,11 @@ def train_and_evaluate(
         "torch_compile_mode": str(torch_compile_mode or "default"),
         "torch_compile_status": torch_compile_status,
         "torch_compile_setup_ms": torch_compile_setup_seconds * 1000.0,
+        "learning_rate": learning_rate,
+        "amp_dtype": amp_dtype,
+        "amp_torch_dtype": str(autocast_dtype) if autocast_dtype is not None else None,
+        "autocast_enabled": autocast_enabled,
+        "grad_scaler_enabled": grad_scaler_enabled,
         "warmup_ms": warmup_seconds * 1000.0,
         "loss_pos_weight": loss_pos_weight_mode,
         "loss_pos_weight_values": (
@@ -3694,6 +3725,7 @@ def run_warmup_steps(
     batches: int,
     autocast_enabled: bool,
     channels_last: bool,
+    autocast_dtype: Any | None = None,
     pos_weight: Any | None = None,
     train_order_recorder: TrainOrderRecorder | None = None,
 ) -> None:
@@ -3717,7 +3749,9 @@ def run_warmup_steps(
         labels = batch["labels"].to(device, non_blocking=True).float()
         mask = batch["mask"].to(device, non_blocking=True).float()
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=autocast_enabled):
+        with torch.cuda.amp.autocast(
+            **autocast_kwargs(enabled=autocast_enabled, dtype=autocast_dtype)
+        ):
             logits = model(image)
             raw_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                 logits,
@@ -3731,6 +3765,23 @@ def run_warmup_steps(
         scaler.update()
         if batch_index + 1 >= batches:
             break
+
+
+def resolve_cuda_amp_dtype(torch: Any, amp_dtype: str) -> Any | None:
+    if amp_dtype == "auto" or amp_dtype == "disabled":
+        return None
+    if amp_dtype == "float16":
+        return torch.float16
+    if amp_dtype == "bfloat16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported amp dtype: {amp_dtype!r}")
+
+
+def autocast_kwargs(*, enabled: bool, dtype: Any | None = None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"enabled": enabled}
+    if dtype is not None:
+        kwargs["dtype"] = dtype
+    return kwargs
 
 
 def image_to_float_on_device(torch: Any, image: Any, device: Any, *, channels_last: bool) -> Any:
@@ -5115,6 +5166,8 @@ def build_run_provenance(
         "channels_last": run_metadata.get("channels_last"),
         "torch_compile": run_metadata.get("torch_compile"),
         "torch_compile_mode": run_metadata.get("torch_compile_mode"),
+        "learning_rate": run_metadata.get("learning_rate"),
+        "amp_dtype": run_metadata.get("amp_dtype"),
         "loss_pos_weight": run_metadata.get("loss_pos_weight"),
         "read_mode": run_metadata.get("read_mode"),
         "include_metadata": run_metadata.get("include_metadata"),
@@ -5278,6 +5331,8 @@ def run_summary_consistency_errors(
         "channels_last",
         "torch_compile",
         "torch_compile_mode",
+        "learning_rate",
+        "amp_dtype",
         "loss_pos_weight",
         "read_mode",
         "include_metadata",

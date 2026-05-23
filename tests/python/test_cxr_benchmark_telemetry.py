@@ -698,6 +698,8 @@ def test_run_summary_consistency_accepts_matching_provenance_and_rejects_drift()
         "channels_last": False,
         "torch_compile": False,
         "torch_compile_mode": "default",
+        "learning_rate": 1.0e-4,
+        "amp_dtype": "auto",
         "loss_pos_weight": "none",
         "quality_gate": False,
         "quality_min_eval_samples": 0,
@@ -981,6 +983,12 @@ def test_modal_cxr_wrapper_exposes_sync_policy():
     assert "--torch-compile-mode" in text
     assert "torch_compile=torch_compile" in text
     assert "torch_compile_mode=torch_compile_mode" in text
+    assert "learning_rate: float = 1.0e-4" in text
+    assert "--learning-rate" in text
+    assert "learning_rate=learning_rate" in text
+    assert 'amp_dtype: str = "auto"' in text
+    assert "--amp-dtype" in text
+    assert "amp_dtype=amp_dtype" in text
     assert "gpu_prefetch_reuse_buffers: bool = False" in text
     assert "--gpu-prefetch-reuse-buffers" in text
     assert "gpu_prefetch_reuse_buffers=gpu_prefetch_reuse_buffers" in text
@@ -1183,6 +1191,8 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
             "channels_last": False,
             "torch_compile": False,
             "torch_compile_mode": "default",
+            "learning_rate": 1.0e-4,
+            "amp_dtype": "auto",
             "loss_pos_weight": "none",
             "quality_gate": False,
             "quality_min_eval_samples": 0,
@@ -1220,6 +1230,8 @@ def test_matrix_row_validation_requires_summary_consistency_and_provenance():
             "channels_last": False,
             "torch_compile": False,
             "torch_compile_mode": "default",
+            "learning_rate": 1.0e-4,
+            "amp_dtype": "auto",
             "loss_pos_weight": "none",
             "quality_gate": False,
             "quality_min_eval_samples": 0,

@@ -203,6 +203,8 @@ GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
     "channels_last": ("--channels-last", "--no-channels-last"),
     "torch_compile": ("--torch-compile", "--no-torch-compile"),
     "torch_compile_mode": ("--torch-compile-mode",),
+    "learning_rate": ("--learning-rate",),
+    "amp_dtype": ("--amp-dtype",),
     "loss_pos_weight": ("--loss-pos-weight",),
     "quality_gate": ("--quality-gate", "--no-quality-gate"),
     "quality_min_eval_samples": ("--quality-min-eval-samples",),
@@ -299,6 +301,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--torch-compile-mode", default="default")
+    parser.add_argument("--learning-rate", type=float, default=1.0e-4)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("auto", "float16", "bfloat16", "disabled"),
+        default="auto",
+    )
     parser.add_argument("--loss-pos-weight", choices=("none", "balanced"), default="none")
     parser.add_argument("--quality-gate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--quality-min-eval-samples", type=int, default=0)
@@ -691,6 +699,10 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         "--torch-compile" if args.torch_compile else "--no-torch-compile",
         "--torch-compile-mode",
         str(args.torch_compile_mode),
+        "--learning-rate",
+        str(args.learning_rate),
+        "--amp-dtype",
+        str(args.amp_dtype),
         "--loss-pos-weight",
         str(args.loss_pos_weight),
         "--quality-gate" if args.quality_gate else "--no-quality-gate",
@@ -2102,6 +2114,8 @@ def validate_summary_provenance_artifacts(
         "channels_last",
         "torch_compile",
         "torch_compile_mode",
+        "learning_rate",
+        "amp_dtype",
         "loss_pos_weight",
         "quality_gate",
         "quality_min_eval_samples",
@@ -2151,6 +2165,8 @@ def validate_summary_provenance_artifacts(
             "channels_last",
             "torch_compile",
             "torch_compile_mode",
+            "learning_rate",
+            "amp_dtype",
             "loss_pos_weight",
             "quality_gate",
             "quality_min_eval_samples",
