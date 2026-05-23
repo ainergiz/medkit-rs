@@ -70,16 +70,21 @@ uv run --with torch examples/cxr_dropin_pytorch_train.py --cache-dir data/cxr/.m
 
 ### CXR Benchmark Gates
 
-For current-source Modal benchmark runs, use the local package build until the
-published PyPI package includes the latest CXR prefetch arguments. The matrix
+Modal CXR benchmark runs use the local checkout by default. The image copies the
+repo to `/opt/medkit-rs`, builds `medkit-rs` from that source, and verifies the
+native CXR prefetch signature during image build. Set `MEDKIT_MODAL_USE_PYPI=1`
+only when intentionally comparing against the published wheel. The matrix
 launcher has repeatable raw+medkit gate presets that put all rows under one
 batch id, force a single Modal GPU selector, and run three profiled repeats per
 logical row by default. Use `--repeats 1` only for ad hoc debugging.
+The single-run Modal wrapper launches remote benchmark work with `.spawn()`, so
+detached runs are not tied to a synchronous local `.remote()` caller. For
+background jobs, pass `--background --no-wait`; the printed function call id and
+`/results/cxr/<run-id>` volume path can be used to monitor and retrieve results.
 
 Dry-run a gate first when Modal is not available or before spending GPU time:
 
 ```bash
-MEDKIT_MODAL_USE_PYPI=0 \
 MEDKIT_MODAL_CLI="uvx --python 3.11 modal" \
 python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
   --gate h100-512-b32 \
@@ -90,7 +95,6 @@ python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
 Run the H100 512/b32 gate:
 
 ```bash
-MEDKIT_MODAL_USE_PYPI=0 \
 MEDKIT_MODAL_CLI="uvx --python 3.11 modal" \
 python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
   --gate h100-512-b32 \
@@ -100,7 +104,6 @@ python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
 Run the L4 224/b64 gate:
 
 ```bash
-MEDKIT_MODAL_USE_PYPI=0 \
 MEDKIT_MODAL_CLI="uvx --python 3.11 modal" \
 python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
   --gate l4-224-b64 \
@@ -156,7 +159,6 @@ Run the L4 quality gate when the question is training behavior rather than
 loader speed:
 
 ```bash
-MEDKIT_MODAL_USE_PYPI=0 \
 MEDKIT_MODAL_CLI="uvx --python 3.11 modal" \
 python crates/medkit-benchmarks/scripts/modal_cxr_parallel_matrix.py \
   --gate l4-quality-224-b64 \

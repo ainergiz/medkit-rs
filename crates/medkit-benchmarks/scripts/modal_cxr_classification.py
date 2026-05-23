@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,16 @@ WORK_DIR = VOLUME_ROOT / "cxr"
 REMOTE_REPORT_ROOT = VOLUME_ROOT / "results" / "cxr"
 MODAL_GPU = os.environ.get("MEDKIT_MODAL_GPU", "L4")
 MEDKIT_PACKAGE = os.environ.get("MEDKIT_MODAL_MEDKIT_PACKAGE", "medkit-rs==0.1.1")
-USE_PUBLISHED_MEDKIT = os.environ.get("MEDKIT_MODAL_USE_PYPI", "1") != "0"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+USE_PUBLISHED_MEDKIT = env_flag("MEDKIT_MODAL_USE_PYPI", default=False)
 LOCAL_REPO_ROOT = next(
     (
         parent
@@ -72,6 +82,9 @@ image = (
         "webdataset",
         "datasets",
         "pillow",
+        "pydicom",
+        "pylibjpeg",
+        "pylibjpeg-libjpeg",
         "psutil",
         "scikit-learn",
         "numpy",
@@ -85,11 +98,77 @@ image = (
 )
 
 if not USE_PUBLISHED_MEDKIT:
-    image = image.run_commands("rustc --version && cargo --version && uv pip install --system .")
+    image = image.run_commands(
+        "rustc --version && cargo --version && uv pip install --system .",
+        (
+            "python -c \"import inspect, medkit_rs; "
+            "sig = inspect.signature(medkit_rs.MedkitCxrNativePrefetchDataset); "
+            "assert 'shuffle_block_batches' in sig.parameters, sig; "
+            "print('using local medkit_rs', getattr(medkit_rs, '__version__', None), sig)\""
+        ),
+    )
 
 
 app = modal.App("medkit-rs-cxr-classification")
 volume = modal.Volume.from_name("medkit-rs-cxr", create_if_missing=True)
+
+
+@app.function(
+    image=image,
+    cpu=8,
+    memory=32768,
+    ephemeral_disk=524288,
+    timeout=60 * 60,
+    volumes={str(VOLUME_ROOT): volume},
+)
+def prepare_rsna_dataset(
+    rsna_root: str = "/cache/cxr/datasets/rsna-pneumonia-2018",
+    force: bool = False,
+) -> dict[str, Any]:
+    root = Path(rsna_root)
+    raw_zip = root / "raw" / "pneumonia-challenge-dataset-adjudicated-kaggle_2018.zip"
+    extracted_dir = root / "extracted"
+    marker_path = extracted_dir / ".rsna-extracted.json"
+    volume.reload()
+    if not raw_zip.exists():
+        raise FileNotFoundError(f"RSNA image zip not found on Modal volume: {raw_zip}")
+    if force and extracted_dir.exists():
+        subprocess.run(["rm", "-rf", str(extracted_dir)], check=True)
+    dicom_count = (
+        sum(1 for _path in extracted_dir.rglob("*.dcm")) if extracted_dir.exists() else 0
+    )
+    extracted = False
+    if dicom_count != 30000:
+        if extracted_dir.exists():
+            subprocess.run(["rm", "-rf", str(extracted_dir)], check=True)
+        extracted_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(raw_zip) as archive:
+            archive.extractall(extracted_dir)
+        dicom_count = sum(1 for _path in extracted_dir.rglob("*.dcm"))
+        extracted = True
+    if dicom_count != 30000:
+        raise RuntimeError(f"Expected 30000 RSNA DICOMs, found {dicom_count}")
+    marker_path.write_text(
+        json.dumps(
+            {
+                "dicom_count": dicom_count,
+                "source_zip": str(raw_zip),
+                "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    volume.commit()
+    return {
+        "status": "ok",
+        "rsna_root": str(root),
+        "extracted": extracted,
+        "dicom_count": dicom_count,
+        "raw_zip_bytes": raw_zip.stat().st_size,
+        "extracted_bytes": directory_size(extracted_dir),
+    }
 
 
 @app.function(
@@ -103,6 +182,8 @@ volume = modal.Volume.from_name("medkit-rs-cxr", create_if_missing=True)
 )
 def run_cxr_benchmark(
     run_id: str,
+    dataset: str = "arudaev/chest-xray-14-320",
+    rsna_root: str = "",
     max_samples: int = 6000,
     max_train: int = 4096,
     max_val: int = 1024,
@@ -165,6 +246,8 @@ def run_cxr_benchmark(
         str(REMOTE_REPORT_ROOT),
         "--run-id",
         run_id,
+        "--dataset",
+        dataset,
         "--max-samples",
         str(max_samples),
         "--max-train",
@@ -249,6 +332,8 @@ def run_cxr_benchmark(
         command.extend(["--splits", splits])
     if manifest:
         command.extend(["--manifest", manifest])
+    if rsna_root:
+        command.extend(["--rsna-root", rsna_root])
     if max_train_batches:
         command.extend(["--max-train-batches", str(max_train_batches)])
     if max_eval_batches:
@@ -276,9 +361,8 @@ def run_cxr_benchmark(
     elapsed = time.perf_counter() - start
     report_dir = REMOTE_REPORT_ROOT / run_id
     artifacts = collect_report_artifacts(report_dir)
-    volume.commit()
     if completed.returncode != 0:
-        return {
+        result = {
             "status": "failed",
             "returncode": completed.returncode,
             "elapsed_seconds": elapsed,
@@ -287,19 +371,28 @@ def run_cxr_benchmark(
             "report_dir": str(report_dir),
             "artifacts": artifacts,
         }
-    return {
-        "status": "ok",
-        "elapsed_seconds": elapsed,
-        "command": command,
-        "output": completed.stdout,
-        "report_dir": str(report_dir),
-        "artifacts": artifacts,
-    }
+    else:
+        result = {
+            "status": "ok",
+            "elapsed_seconds": elapsed,
+            "command": command,
+            "output": completed.stdout,
+            "report_dir": str(report_dir),
+            "artifacts": artifacts,
+        }
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "modal-result.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n"
+    )
+    volume.commit()
+    return result
 
 
 @app.local_entrypoint()
 def main(
     run_id: str = "",
+    dataset: str = "arudaev/chest-xray-14-320",
+    rsna_root: str = "",
     max_samples: int = 6000,
     max_train: int = 4096,
     max_val: int = 1024,
@@ -348,62 +441,86 @@ def main(
     smoke: bool = False,
     force_rematerialize: bool = False,
     force_cache: bool = False,
+    background: bool = False,
+    wait: bool = True,
 ) -> None:
     if not run_id:
         gpu_label = MODAL_GPU.lower().replace(" ", "-").replace(":", "-")
         mode = "smoke" if smoke else gpu_label
-        run_id = f"nih-cxr14-320-{mode}-size{image_size}-n{max_samples}-{time.strftime('%Y%m%d-%H%M%S')}"
-    result = run_cxr_benchmark.remote(
-        run_id=run_id,
-        max_samples=max_samples,
-        max_train=max_train,
-        max_val=max_val,
-        max_test=max_test,
-        image_size=image_size,
-        cache_dtype=cache_dtype,
-        batch_size=batch_size,
-        workers=workers,
-        epochs=epochs,
-        loader_batches=loader_batches,
-        warmup_batches=warmup_batches,
-        profile_batches=profile_batches,
-        drop_last_train=drop_last_train,
-        prefetch_depth=prefetch_depth,
-        prefetch_read_workers=prefetch_read_workers,
-        read_mode=read_mode,
-        shuffle_block_batches=shuffle_block_batches,
-        gpu_prefetch_batches=gpu_prefetch_batches,
-        gpu_prefetch_reuse_buffers=gpu_prefetch_reuse_buffers,
-        sync_every_step=sync_every_step,
-        channels_last=channels_last,
-        torch_compile=torch_compile,
-        torch_compile_mode=torch_compile_mode,
-        learning_rate=learning_rate,
-        amp_dtype=amp_dtype,
-        model_init=model_init,
-        loss_kind=loss_kind,
-        loss_pos_weight=loss_pos_weight,
-        loss_pos_weight_cap=loss_pos_weight_cap,
-        focal_gamma=focal_gamma,
-        focal_alpha=focal_alpha,
-        quality_gate=quality_gate,
-        quality_min_eval_samples=quality_min_eval_samples,
-        quality_min_metric_targets=quality_min_metric_targets,
-        quality_min_macro_auroc=quality_min_macro_auroc,
-        quality_min_macro_auprc=quality_min_macro_auprc,
-        train_order_evidence=train_order_evidence,
-        paired_train_order=paired_train_order,
-        include_metadata=include_metadata,
-        max_train_batches=max_train_batches,
-        max_eval_batches=max_eval_batches,
-        baselines=baselines,
-        manifest=manifest,
-        splits=splits,
-        prepare_only=prepare_only,
-        smoke=smoke,
-        force_rematerialize=force_rematerialize,
-        force_cache=force_cache,
-    )
+        dataset_label = dataset.replace("/", "-").replace("_", "-").lower()
+        run_id = f"{dataset_label}-{mode}-size{image_size}-n{max_samples}-{time.strftime('%Y%m%d-%H%M%S')}"
+    benchmark_kwargs = {
+        "run_id": run_id,
+        "dataset": dataset,
+        "rsna_root": rsna_root,
+        "max_samples": max_samples,
+        "max_train": max_train,
+        "max_val": max_val,
+        "max_test": max_test,
+        "image_size": image_size,
+        "cache_dtype": cache_dtype,
+        "batch_size": batch_size,
+        "workers": workers,
+        "epochs": epochs,
+        "loader_batches": loader_batches,
+        "warmup_batches": warmup_batches,
+        "profile_batches": profile_batches,
+        "drop_last_train": drop_last_train,
+        "prefetch_depth": prefetch_depth,
+        "prefetch_read_workers": prefetch_read_workers,
+        "read_mode": read_mode,
+        "shuffle_block_batches": shuffle_block_batches,
+        "gpu_prefetch_batches": gpu_prefetch_batches,
+        "gpu_prefetch_reuse_buffers": gpu_prefetch_reuse_buffers,
+        "sync_every_step": sync_every_step,
+        "channels_last": channels_last,
+        "torch_compile": torch_compile,
+        "torch_compile_mode": torch_compile_mode,
+        "learning_rate": learning_rate,
+        "amp_dtype": amp_dtype,
+        "model_init": model_init,
+        "loss_kind": loss_kind,
+        "loss_pos_weight": loss_pos_weight,
+        "loss_pos_weight_cap": loss_pos_weight_cap,
+        "focal_gamma": focal_gamma,
+        "focal_alpha": focal_alpha,
+        "quality_gate": quality_gate,
+        "quality_min_eval_samples": quality_min_eval_samples,
+        "quality_min_metric_targets": quality_min_metric_targets,
+        "quality_min_macro_auroc": quality_min_macro_auroc,
+        "quality_min_macro_auprc": quality_min_macro_auprc,
+        "train_order_evidence": train_order_evidence,
+        "paired_train_order": paired_train_order,
+        "include_metadata": include_metadata,
+        "max_train_batches": max_train_batches,
+        "max_eval_batches": max_eval_batches,
+        "baselines": baselines,
+        "manifest": manifest,
+        "splits": splits,
+        "prepare_only": prepare_only,
+        "smoke": smoke,
+        "force_rematerialize": force_rematerialize,
+        "force_cache": force_cache,
+    }
+    function_call = run_cxr_benchmark.spawn(**benchmark_kwargs)
+    if background:
+        print(
+            json.dumps(
+                {
+                    "status": "spawned",
+                    "run_id": run_id,
+                    "function_call_id": function_call.object_id,
+                    "dashboard_url": function_call.get_dashboard_url(),
+                    "remote_report_dir": str(REMOTE_REPORT_ROOT / run_id),
+                    "volume_report_path": f"/results/cxr/{run_id}",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        if not wait:
+            return
+    result = function_call.get()
     local_report_dir = LOCAL_REPO_ROOT / "target" / "reports" / "cxr" / run_id
     local_report_dir.mkdir(parents=True, exist_ok=True)
     for name, value in result.get("artifacts", {}).items():
@@ -443,6 +560,16 @@ def collect_report_artifacts(report_dir: Path) -> dict[str, Any]:
         elif path.suffix in {".md", ".txt"}:
             artifacts[path.name] = path.read_text()
     return artifacts
+
+
+def directory_size(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return total
+    for item in path.rglob("*"):
+        if item.is_file():
+            total += item.stat().st_size
+    return total
 
 
 def summarize_result(result: dict[str, Any]) -> dict[str, Any]:

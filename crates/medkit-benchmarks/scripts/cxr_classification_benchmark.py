@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import zipfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -39,6 +40,7 @@ from typing import Any, Iterable, Sequence
 
 
 DEFAULT_DATASET = "arudaev/chest-xray-14-320"
+RSNA_PNEUMONIA_DATASET = "rsna-pneumonia-2018"
 DATASET_FALLBACKS = ("HlexNC/chest-xray-14-320",)
 DEFAULT_TARGETS = (
     "Pneumonia",
@@ -69,6 +71,9 @@ ALL_NIH_LABELS = (
 SMAPS_HEADER_RE = re.compile(r"^[0-9a-fA-F]+-[0-9a-fA-F]+\s")
 H2D_TIMING_DIRECT_COPY = "direct_copy_completion_elapsed"
 H2D_TIMING_CUDA_PREFETCH_STREAM = "cuda_prefetch_stream_elapsed"
+RSNA_CALCULATED_LUNG_OPACITY_LABEL = "L_v8n"
+RSNA_CALCULATED_NORMAL_LABEL = "L_o8w"
+RSNA_CALCULATED_NO_OPACITY_LABEL = "L_yd0"
 
 
 @dataclass(frozen=True)
@@ -85,6 +90,10 @@ class SampleRecord:
     labels: dict[str, int | None]
     split: str = ""
     sha256: str = ""
+    source_format: str = "png"
+    modality: str = "CR"
+    view_position: str = "unknown"
+    label_source: str = "nih_chestxray14_nlp_labels"
 
 
 @dataclass
@@ -119,6 +128,12 @@ def main() -> int:
         description="Run a real CXR classification benchmark and emit report artifacts."
     )
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
+    parser.add_argument(
+        "--rsna-root",
+        type=Path,
+        default=Path("/cache/cxr/datasets/rsna-pneumonia-2018"),
+        help="Root containing RSNA Pneumonia raw/ and extracted/ directories.",
+    )
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--splits", type=Path)
     parser.add_argument("--plan", type=Path)
@@ -348,11 +363,17 @@ def main() -> int:
     baselines = [item.strip() for item in args.baselines.split(",") if item.strip()]
 
     cache_size = args.cache_image_size or args.image_size
-    data_dir = args.work_dir / "materialized"
-    manifest_path = args.work_dir / "manifest.jsonl"
-    split_path = args.work_dir / "splits.json"
-    cache_dir = args.work_dir / f"cache-{cache_size}-{args.cache_dtype}"
-    webdataset_dir = args.work_dir / f"webdataset-{cache_size}"
+    dataset_work_dir = (
+        args.work_dir / safe_artifact_name(args.dataset)
+        if args.dataset == RSNA_PNEUMONIA_DATASET
+        else args.work_dir
+    )
+    data_dir = dataset_work_dir / "materialized"
+    manifest_path = dataset_work_dir / "manifest.jsonl"
+    split_path = dataset_work_dir / "splits.json"
+    cache_dir = dataset_work_dir / f"cache-{cache_size}-{args.cache_dtype}"
+    webdataset_dir = dataset_work_dir / f"webdataset-{cache_size}"
+    dataset_metadata = dataset_metadata_for_args(args)
 
     run_metadata = {
         "run_id": run_id,
@@ -360,13 +381,11 @@ def main() -> int:
         "manifest_requested": str(args.manifest) if args.manifest else None,
         "splits_requested": str(args.splits) if args.splits else None,
         "plan_requested": str(args.plan) if args.plan else None,
-        "dataset_kind": "NIH ChestX-ray14 320px Hugging Face parquet subset",
-        "primary_plan_dataset": "MIMIC-CXR-JPG",
-        "dataset_deviation": (
-            "No local credentialed MIMIC-CXR-JPG data was available. This run uses "
-            "a public NIH ChestX-ray14 320px dataset so the pipeline can execute "
-            "against real CXR images."
-        ),
+        "dataset_kind": dataset_metadata["dataset_kind"],
+        "primary_plan_dataset": dataset_metadata["primary_plan_dataset"],
+        "dataset_deviation": dataset_metadata["dataset_deviation"],
+        "dataset_root": str(args.rsna_root) if args.dataset == RSNA_PNEUMONIA_DATASET else None,
+        "dataset_work_dir": str(dataset_work_dir),
         "targets": targets,
         "uncertain_policy": args.uncertain,
         "missing_policy": "mask_missing",
@@ -437,15 +456,24 @@ def main() -> int:
             requested_samples=args.max_samples,
         )
     if records is None:
-        records, dataset_name = materialize_hf_subset(
-            dataset_name=args.dataset,
-            fallback_names=DATASET_FALLBACKS,
-            out_dir=data_dir,
-            manifest_path=manifest_path,
-            max_samples=args.max_samples,
-            seed=args.seed,
-            targets=targets,
-        )
+        if args.dataset == RSNA_PNEUMONIA_DATASET:
+            records, dataset_name = materialize_rsna_pneumonia(
+                root=args.rsna_root,
+                manifest_path=manifest_path,
+                max_samples=args.max_samples,
+                seed=args.seed,
+                targets=targets,
+            )
+        else:
+            records, dataset_name = materialize_hf_subset(
+                dataset_name=args.dataset,
+                fallback_names=DATASET_FALLBACKS,
+                out_dir=data_dir,
+                manifest_path=manifest_path,
+                max_samples=args.max_samples,
+                seed=args.seed,
+                targets=targets,
+            )
     else:
         dataset_name = args.dataset
     materialize_seconds = time.perf_counter() - materialize_start
@@ -650,6 +678,7 @@ def main() -> int:
             for name, report in reports["profile"].items()
             if report.get("status") == "ok"
         },
+        "speed_claims": ground_truth.get("speed_claims", {}),
         "memory": memory,
         "ground_truth": ground_truth,
         "predictions": reports["predictions"],
@@ -681,6 +710,27 @@ def main() -> int:
         write_json(args.out, summary)
     print(json.dumps(summary, indent=2))
     return 0
+
+
+def dataset_metadata_for_args(args: argparse.Namespace) -> dict[str, str]:
+    if args.dataset == RSNA_PNEUMONIA_DATASET:
+        return {
+            "dataset_kind": "RSNA Pneumonia Detection Challenge 2018 adjudicated DICOM dataset",
+            "primary_plan_dataset": "RSNA Pneumonia Detection Challenge",
+            "dataset_deviation": (
+                "This run uses the RSNA 2018 adjudicated pneumonia challenge DICOMs "
+                "and MD.ai annotations persisted on the Modal volume."
+            ),
+        }
+    return {
+        "dataset_kind": "NIH ChestX-ray14 320px Hugging Face parquet subset",
+        "primary_plan_dataset": "MIMIC-CXR-JPG",
+        "dataset_deviation": (
+            "No local credentialed MIMIC-CXR-JPG data was available. This run uses "
+            "a public NIH ChestX-ray14 320px dataset so the pipeline can execute "
+            "against real CXR images."
+        ),
+    }
 
 
 def materialize_hf_subset(
@@ -775,6 +825,176 @@ def materialize_hf_subset(
     return records, loaded_name
 
 
+def materialize_rsna_pneumonia(
+    *,
+    root: Path,
+    manifest_path: Path,
+    max_samples: int,
+    seed: int,
+    targets: Sequence[str],
+) -> tuple[list[SampleRecord], str]:
+    raw_dir = root / "raw"
+    extracted_dir = ensure_rsna_pneumonia_extracted(root)
+    annotations_path = raw_dir / "pneumonia-challenge-annotations-adjudicated-kaggle_2018.json"
+    mappings_path = raw_dir / "pneumonia-challenge-dataset-mappings_2018.json"
+    if not annotations_path.exists():
+        raise FileNotFoundError(f"RSNA annotations not found: {annotations_path}")
+    if not mappings_path.exists():
+        raise FileNotFoundError(f"RSNA NIH mapping not found: {mappings_path}")
+
+    annotations = load_json(annotations_path)
+    mappings = load_json(mappings_path)
+    final_labels_by_sop: dict[str, set[str]] = {}
+    for annotation in annotations.get("datasets", [{}])[0].get("annotations", []):
+        label_id = str(annotation.get("labelId") or "")
+        if label_id not in {
+            RSNA_CALCULATED_LUNG_OPACITY_LABEL,
+            RSNA_CALCULATED_NORMAL_LABEL,
+            RSNA_CALCULATED_NO_OPACITY_LABEL,
+        }:
+            continue
+        sop_uid = str(annotation.get("SOPInstanceUID") or "")
+        if sop_uid:
+            final_labels_by_sop.setdefault(sop_uid, set()).add(label_id)
+
+    dicom_by_sop = {path.stem: path for path in extracted_dir.rglob("*.dcm")}
+    records: list[SampleRecord] = []
+    skipped: dict[str, int] = {
+        "missing_final_label": 0,
+        "missing_dicom": 0,
+        "unknown_label": 0,
+    }
+    for row in mappings:
+        sop_uid = str(row.get("SOPInstanceUID") or "")
+        final_labels = final_labels_by_sop.get(sop_uid)
+        if not final_labels:
+            skipped["missing_final_label"] += 1
+            continue
+        dicom_path = dicom_by_sop.get(sop_uid)
+        if dicom_path is None:
+            skipped["missing_dicom"] += 1
+            continue
+        pneumonia_value = rsna_pneumonia_label(final_labels)
+        if pneumonia_value is None:
+            skipped["unknown_label"] += 1
+            continue
+        img_id = str(row.get("img_id") or f"{sop_uid}.png")
+        patient_id = img_id.split("_", 1)[0] or str(row.get("studyId") or sop_uid)
+        study_id = str(row.get("StudyInstanceUID") or row.get("studyId") or sop_uid)
+        subset_img_id = str(row.get("subset_img_id") or sop_uid)
+        orig_labels = {str(label) for label in (row.get("orig_labels") or [])}
+        labels = rsna_labels_for_targets(
+            targets=targets,
+            pneumonia_value=pneumonia_value,
+            final_labels=final_labels,
+            orig_labels=orig_labels,
+        )
+        records.append(
+            SampleRecord(
+                sample_id=f"{patient_id}/{subset_img_id}",
+                patient_id=patient_id,
+                study_id=study_id,
+                image_id=sop_uid,
+                image_path=str(dicom_path),
+                filename=f"{sop_uid}.dcm",
+                source_split=f"rsna_subset_group_{row.get('subset_group', 'unknown')}",
+                width=1024,
+                height=1024,
+                labels=labels,
+                sha256=stable_hash({"dataset": RSNA_PNEUMONIA_DATASET, "sop": sop_uid}),
+                source_format="dicom",
+                modality="CR",
+                view_position="unknown",
+                label_source="rsna_2018_adjudicated_mdai_calculated_labels",
+            )
+        )
+
+    if not records:
+        raise RuntimeError(
+            "No RSNA records were materialized; skipped="
+            + json.dumps(skipped, sort_keys=True)
+        )
+    rng = random.Random(seed)
+    rng.shuffle(records)
+    if max_samples > 0:
+        records = records[:max_samples]
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    write_manifest(manifest_path, records)
+    write_json(
+        manifest_path.parent / "rsna-pneumonia-materialize-report.json",
+        {
+            "dataset": RSNA_PNEUMONIA_DATASET,
+            "root": str(root),
+            "records": len(records),
+            "skipped": skipped,
+            "targets": list(targets),
+            "final_label_ids": {
+                "pneumonia_positive": RSNA_CALCULATED_LUNG_OPACITY_LABEL,
+                "normal": RSNA_CALCULATED_NORMAL_LABEL,
+                "no_lung_opacity_not_normal": RSNA_CALCULATED_NO_OPACITY_LABEL,
+            },
+        },
+    )
+    return records, RSNA_PNEUMONIA_DATASET
+
+
+def ensure_rsna_pneumonia_extracted(root: Path) -> Path:
+    raw_zip = root / "raw" / "pneumonia-challenge-dataset-adjudicated-kaggle_2018.zip"
+    extracted_dir = root / "extracted"
+    marker_path = extracted_dir / ".rsna-extracted.json"
+    if marker_path.exists():
+        marker = load_json(marker_path)
+        if int(marker.get("dicom_count", 0)) == 30000:
+            return extracted_dir
+    current_count = sum(1 for _path in extracted_dir.rglob("*.dcm")) if extracted_dir.exists() else 0
+    if current_count == 30000:
+        write_json(marker_path, {"dicom_count": current_count, "source_zip": str(raw_zip)})
+        return extracted_dir
+    if not raw_zip.exists():
+        raise FileNotFoundError(f"RSNA image zip not found: {raw_zip}")
+    if extracted_dir.exists():
+        shutil.rmtree(extracted_dir)
+    extracted_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(raw_zip) as archive:
+        archive.extractall(extracted_dir)
+    dicom_count = sum(1 for _path in extracted_dir.rglob("*.dcm"))
+    if dicom_count != 30000:
+        raise RuntimeError(f"Expected 30000 RSNA DICOMs after extraction, found {dicom_count}")
+    write_json(marker_path, {"dicom_count": dicom_count, "source_zip": str(raw_zip)})
+    return extracted_dir
+
+
+def rsna_pneumonia_label(final_labels: set[str]) -> int | None:
+    if RSNA_CALCULATED_LUNG_OPACITY_LABEL in final_labels:
+        return 1
+    if (
+        RSNA_CALCULATED_NORMAL_LABEL in final_labels
+        or RSNA_CALCULATED_NO_OPACITY_LABEL in final_labels
+    ):
+        return 0
+    return None
+
+
+def rsna_labels_for_targets(
+    *,
+    targets: Sequence[str],
+    pneumonia_value: int,
+    final_labels: set[str],
+    orig_labels: set[str],
+) -> dict[str, int | None]:
+    labels: dict[str, int | None] = {}
+    for target in targets:
+        if target == "Pneumonia":
+            labels[target] = pneumonia_value
+        elif target == "No Finding":
+            labels[target] = 1 if RSNA_CALCULATED_NORMAL_LABEL in final_labels else 0
+        elif target in ALL_NIH_LABELS:
+            labels[target] = 1 if target in orig_labels else 0
+        else:
+            labels[target] = None
+    return labels
+
+
 def image_to_pil(image_obj: Any, Image: Any) -> Any:
     if hasattr(image_obj, "convert"):
         return image_obj
@@ -815,7 +1035,10 @@ def assign_patient_safe_splits(
     for record in records:
         by_patient.setdefault(record.patient_id, []).append(record)
 
-    groups = list(by_patient.values())
+    groups = [
+        sorted(by_patient[patient_id], key=lambda record: record.sample_id)
+        for patient_id in sorted(by_patient)
+    ]
     rng = random.Random(seed)
     rng.shuffle(groups)
     caps = {"train": max_train, "val": max_val, "test": max_test}
@@ -918,13 +1141,18 @@ def build_manifest_summary(
     run_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     by_split: dict[str, int] = {}
-    view_counts = {"unknown": len(records)}
+    view_counts: dict[str, int] = {}
+    source_format_counts: dict[str, int] = {}
     target_counts = {
         target: {"positive": 0, "negative": 0, "missing": 0, "uncertain": 0}
         for target in targets
     }
     for record in records:
         by_split[record.split] = by_split.get(record.split, 0) + 1
+        view_counts[record.view_position] = view_counts.get(record.view_position, 0) + 1
+        source_format_counts[record.source_format] = (
+            source_format_counts.get(record.source_format, 0) + 1
+        )
         for target in targets:
             value = record.labels.get(target)
             if value == 1:
@@ -947,11 +1175,14 @@ def build_manifest_summary(
         "targets": list(targets),
         "target_counts": target_counts,
         "view_counts": view_counts,
-        "source_format": "png",
+        "source_format": (
+            "mixed" if len(source_format_counts) > 1 else next(iter(source_format_counts), "unknown")
+        ),
+        "source_format_counts": source_format_counts,
         "metadata_limitations": [
-            "NIH filename-derived patient ids are used because the HF parquet subset exposes filename, labels, and image only.",
-            "View position is not exposed by this dataset export.",
-            "Uncertain labels are not exposed by this NIH export.",
+            "Dataset-specific metadata is normalized into the benchmark SampleRecord schema.",
+            "View position may be unknown when the source dataset does not expose it.",
+            "Uncertain labels are masked only when the adapter emits None/-1 labels.",
         ],
     }
 
@@ -1447,35 +1678,73 @@ class TrainBatchSchedule:
         }
 
 
-class FixedTrainBatchScheduleSampler:
-    def __init__(self, schedule: TrainBatchSchedule) -> None:
+class FixedBatchSampler:
+    def __init__(self, batches: Sequence[Sequence[int]]) -> None:
+        self.batches = tuple(tuple(int(index) for index in batch) for batch in batches)
+
+    def __iter__(self) -> Iterable[list[int]]:
+        return iter([list(batch) for batch in self.batches])
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+
+class ScheduledTorchMapLoader:
+    """Build a fresh DataLoader for each fixed train-schedule iteration."""
+
+    def __init__(
+        self,
+        *,
+        torch: Any,
+        dataset: Any,
+        schedule: TrainBatchSchedule,
+        num_workers: int,
+        pin_memory: bool,
+        persistent_workers: bool,
+        metadata: dict[str, Any],
+    ) -> None:
+        self.torch = torch
+        self.dataset = dataset
         self.schedule = schedule
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        self.persistent_workers = persistent_workers
+        self.metadata = dict(metadata)
         self.iteration_index = 0
         self.extra_empty_iterations = 0
 
-    def __iter__(self) -> Iterable[list[int]]:
+    def __iter__(self) -> Iterable[Any]:
         if self.iteration_index >= len(self.schedule.iteration_batches):
             self.iteration_index += 1
             self.extra_empty_iterations += 1
             return iter(())
         batches = self.schedule.batches_for_iteration(self.iteration_index)
         self.iteration_index += 1
-        return iter([list(batch) for batch in batches])
+        loader = self.torch.utils.data.DataLoader(
+            self.dataset,
+            batch_sampler=FixedBatchSampler(batches),
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+        )
+        return iter(loader)
 
     def __len__(self) -> int:
-        index = min(self.iteration_index, max(len(self.schedule.iteration_batches) - 1, 0))
         if not self.schedule.iteration_batches:
             return 0
+        index = min(self.iteration_index, len(self.schedule.iteration_batches) - 1)
         return len(self.schedule.iteration_batches[index])
 
     def report_metadata(self) -> dict[str, Any]:
         summary = self.schedule.summary()
         return {
+            **self.metadata,
             "paired_train_order": True,
             "batch_schedule": "fixed_by_iteration",
             "batch_schedule_hash": (summary.get("hashes") or {}).get("schedule_hash"),
             "batch_schedule_iteration_count": summary.get("iteration_count"),
             "batch_schedule_iteration_names": summary.get("iteration_names"),
+            "batch_schedule_current_iteration": self.iteration_index,
             "batch_schedule_extra_empty_iterations": self.extra_empty_iterations,
         }
 
@@ -1606,9 +1875,36 @@ def preprocess_image_to_numpy(path: str, *, image_size: int, mean: float, std: f
 
 
 def load_resized_grayscale(path: str, image_size: int) -> Any:
+    if Path(path).suffix.lower() in {".dcm", ".dicom", ".ima"}:
+        return load_resized_dicom_grayscale(path, image_size)
     pillow = import_pillow()
     Image = pillow["Image"]
     image = Image.open(path).convert("L")
+    return resize_pil_to_array(image, image_size)
+
+
+def load_resized_dicom_grayscale(path: str, image_size: int) -> Any:
+    numpy = import_numpy()
+    pillow = import_pillow()
+    Image = pillow["Image"]
+    pydicom = import_pydicom()
+    dataset = pydicom.dcmread(path)
+    array = dataset.pixel_array.astype("float32")
+    if array.ndim == 3:
+        array = array[..., 0]
+    slope = float(getattr(dataset, "RescaleSlope", 1.0) or 1.0)
+    intercept = float(getattr(dataset, "RescaleIntercept", 0.0) or 0.0)
+    array = array * slope + intercept
+    photometric = str(getattr(dataset, "PhotometricInterpretation", "")).upper()
+    if photometric == "MONOCHROME1":
+        array = float(array.max()) + float(array.min()) - array
+    low = float(array.min())
+    high = float(array.max())
+    if high <= low:
+        scaled = numpy.zeros(array.shape, dtype="uint8")
+    else:
+        scaled = numpy.clip((array - low) / (high - low) * 255.0, 0.0, 255.0).astype("uint8")
+    image = Image.fromarray(scaled, mode="L")
     return resize_pil_to_array(image, image_size)
 
 
@@ -1885,22 +2181,15 @@ def make_loader_factory(
     ) -> Any:
         if use_train_batch_schedule(split, shuffle):
             assert train_batch_schedule is not None
-            sampler = FixedTrainBatchScheduleSampler(train_batch_schedule)
-            # Multiprocess DataLoader prefetch can consume fixed schedule
-            # iterations ahead of the training loop. Keep paired train-order
-            # runs single-process so the recorded order is the executed order.
-            scheduled_num_workers = 0
-            loader = torch.utils.data.DataLoader(
-                dataset,
-                batch_sampler=sampler,
+            scheduled_num_workers = num_workers
+            return ScheduledTorchMapLoader(
+                torch=torch,
+                dataset=dataset,
+                schedule=train_batch_schedule,
                 num_workers=scheduled_num_workers,
                 pin_memory=pin_memory,
                 persistent_workers=False,
-            )
-            schedule_metadata = sampler.report_metadata()
-            return with_report_metadata(
-                loader,
-                {
+                metadata={
                     "baseline": baseline_name,
                     "batch_size": batch_size,
                     "cache_dtype": cache_dtype_from_metadata(cache_dir),
@@ -1908,13 +2197,16 @@ def make_loader_factory(
                     "shuffle_block_batches": shuffle_block_batches,
                     "shuffle": shuffle,
                     "drop_last": drop_last_for_split(split),
-                    "num_workers": scheduled_num_workers,
                     "requested_num_workers": num_workers,
+                    "num_workers": scheduled_num_workers,
                     "pin_memory": pin_memory,
-                    "worker_mode": "paired_schedule_single_process",
+                    "worker_mode": (
+                        "paired_schedule_pytorch_workers"
+                        if scheduled_num_workers > 0
+                        else "paired_schedule_single_process"
+                    ),
                     "native_prefetch": False,
                     **(metadata or {}),
-                    **schedule_metadata,
                 },
             )
         loader = torch.utils.data.DataLoader(
@@ -2340,7 +2632,7 @@ def monai_rows(records: Sequence[SampleRecord], targets: Sequence[str], numpy: A
                 "sample_id": record.sample_id,
                 "source_path": record.image_path,
                 "sample_hash": record.sha256,
-                "view_position": "unknown",
+                "view_position": record.view_position,
             }
         )
     return rows
@@ -2382,7 +2674,7 @@ class RawCxrDataset:
             "sample_id": record.sample_id,
             "source_path": record.image_path,
             "sample_hash": record.sha256,
-            "view_position": "unknown",
+            "view_position": record.view_position,
         }
 
 
@@ -2446,7 +2738,7 @@ class CachedCxrDataset:
             "sample_id": record.get("sample_id", ""),
             "source_path": record.get("image_path", ""),
             "sample_hash": record.get("sha256", ""),
-            "view_position": "unknown",
+            "view_position": record.get("view_position", "unknown"),
         }
 
 
@@ -2504,7 +2796,7 @@ class TorchXRayVisionCxrDataset:
             "sample_id": record.sample_id,
             "source_path": record.image_path,
             "sample_hash": record.sha256,
-            "view_position": "unknown",
+            "view_position": record.view_position,
         }
 
 
@@ -5655,6 +5947,9 @@ def environment_report(run_metadata: dict[str, Any]) -> dict[str, Any]:
         "medkit_rs",
         "datasets",
         "PIL",
+        "pydicom",
+        "pylibjpeg",
+        "pylibjpeg-libjpeg",
         "psutil",
         "numpy",
         "sklearn",
@@ -5756,15 +6051,15 @@ def record_to_json(record: SampleRecord) -> dict[str, Any]:
         "image_id": record.image_id,
         "image_path": record.image_path,
         "filename": record.filename,
-        "source_format": "png",
-        "modality": "CR",
-        "view_position": "unknown",
+        "source_format": record.source_format,
+        "modality": record.modality,
+        "view_position": record.view_position,
         "laterality": None,
         "width": record.width,
         "height": record.height,
         "photometric_interpretation": "MONOCHROME2",
         "labels": record.labels,
-        "label_source": "nih_chestxray14_nlp_labels",
+        "label_source": record.label_source,
         "source_split": record.source_split,
         "split": record.split,
         "sha256": record.sha256,
@@ -5865,13 +6160,16 @@ def memory_summary(reports: dict[str, dict[str, dict[str, Any]]]) -> dict[str, A
 
 
 def training_ground_truth_report(reports: dict[str, dict[str, dict[str, Any]]]) -> dict[str, Any]:
+    prediction_baselines = (reports.get("predictions", {}).get("baselines") or {})
+    train_order_baselines = (reports.get("train_order", {}).get("baselines") or {})
     baselines = sorted(
         {
             *reports.get("loader", {}).keys(),
             *reports.get("gpu", {}).keys(),
             *reports.get("profile", {}).keys(),
             *reports.get("quality", {}).keys(),
-            *reports.get("train_order", {}).keys(),
+            *prediction_baselines.keys(),
+            *train_order_baselines.keys(),
         }
     )
     rows = {
@@ -5881,8 +6179,8 @@ def training_ground_truth_report(reports: dict[str, dict[str, dict[str, Any]]]) 
             gpu=reports.get("gpu", {}).get(baseline, {}),
             profile=reports.get("profile", {}).get(baseline, {}),
             quality=reports.get("quality", {}).get(baseline, {}),
-            predictions=((reports.get("predictions", {}).get("baselines") or {}).get(baseline, {})),
-            train_order=((reports.get("train_order", {}).get("baselines") or {}).get(baseline, {})),
+            predictions=prediction_baselines.get(baseline, {}),
+            train_order=train_order_baselines.get(baseline, {}),
         )
         for baseline in baselines
     }
@@ -5896,6 +6194,7 @@ def training_ground_truth_report(reports: dict[str, dict[str, dict[str, Any]]]) 
         "schema_version": 1,
         "baselines": rows,
         "comparisons": comparisons,
+        "speed_claims": speed_claim_report(rows=rows, comparisons=comparisons),
         "paired_quality": (reports.get("predictions", {}) or {}).get("paired_comparisons", {}),
         "paired_train_order": (reports.get("train_order", {}) or {}).get("paired_comparisons", {}),
     }
@@ -5930,6 +6229,7 @@ def training_ground_truth_row(
             ),
             "data_wait_percent": gpu.get("data_wait_percent"),
         },
+        "pipeline": pipeline_summary(gpu=gpu, loader=loader),
         "profile": {
             "timing_scope": profile_record_modes(profile, "timing_scope"),
             "h2d_timing_mode": profile_summary.get("profile_h2d_timing_mode"),
@@ -6015,7 +6315,9 @@ def compare_ground_truth_rows(
     candidate: dict[str, Any],
     raw: dict[str, Any],
 ) -> dict[str, Any]:
+    speed_comparison = speed_comparison_report(candidate=candidate, raw=raw)
     return {
+        "speed_comparison": speed_comparison,
         "train_samples_per_second_speedup": ratio_values(
             nested_numeric(candidate, "speed", "train_samples_per_second"),
             nested_numeric(raw, "speed", "train_samples_per_second"),
@@ -6048,6 +6350,101 @@ def compare_ground_truth_rows(
         if (candidate.get("train_order") or {}).get("status") == "ok"
         and (raw.get("train_order") or {}).get("status") == "ok"
         else {},
+    }
+
+
+def pipeline_summary(*, gpu: dict[str, Any], loader: dict[str, Any]) -> dict[str, Any]:
+    pipeline = gpu.get("pipeline") or loader.get("pipeline") or {}
+    if not isinstance(pipeline, dict):
+        return {}
+    keys = (
+        "baseline",
+        "worker_mode",
+        "batch_schedule",
+        "paired_train_order",
+        "num_workers",
+        "requested_num_workers",
+        "pin_memory",
+        "native_prefetch",
+        "prefetch_depth",
+        "prefetch_read_workers",
+        "read_mode",
+        "include_metadata",
+    )
+    return {key: pipeline.get(key) for key in keys if key in pipeline}
+
+
+def speed_comparison_report(candidate: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
+    measured_speedup = ratio_values(
+        nested_numeric(candidate, "speed", "train_samples_per_second"),
+        nested_numeric(raw, "speed", "train_samples_per_second"),
+    )
+    raw_pipeline = raw.get("pipeline") or {}
+    candidate_pipeline = candidate.get("pipeline") or {}
+    reasons: list[str] = []
+    headline_eligible = True
+    if raw_pipeline.get("worker_mode") == "paired_schedule_single_process":
+        headline_eligible = False
+        reasons.append(
+            "raw PyTorch used the strict paired train-order single-process loader"
+        )
+    requested_workers = raw_pipeline.get("requested_num_workers")
+    actual_workers = raw_pipeline.get("num_workers")
+    if requested_workers and actual_workers == 0:
+        headline_eligible = False
+        reasons.append(
+            f"raw PyTorch requested {requested_workers} workers but ran with 0 workers"
+        )
+    if raw_pipeline.get("paired_train_order") and not candidate_pipeline.get("paired_train_order"):
+        headline_eligible = False
+        reasons.append("candidate and raw paired-train-order modes differ")
+    train_order = paired_train_order_summary(
+        candidate=candidate.get("train_order") or {},
+        raw=raw.get("train_order") or {},
+    )
+    if (
+        raw_pipeline.get("paired_train_order")
+        and candidate_pipeline.get("paired_train_order")
+        and train_order
+        and not train_order.get("paired")
+    ):
+        headline_eligible = False
+        reasons.append("paired train-order evidence failed")
+    return {
+        "headline_eligible": headline_eligible,
+        "measured_train_samples_per_second_speedup": measured_speedup,
+        "headline_train_samples_per_second_speedup": measured_speedup
+        if headline_eligible
+        else None,
+        "denominator_baseline": raw.get("baseline"),
+        "denominator_worker_mode": raw_pipeline.get("worker_mode"),
+        "candidate_worker_mode": candidate_pipeline.get("worker_mode"),
+        "reasons": reasons,
+    }
+
+
+def speed_claim_report(
+    *,
+    rows: dict[str, dict[str, Any]],
+    comparisons: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    claims: dict[str, Any] = {}
+    for key, comparison in comparisons.items():
+        speed_comparison = comparison.get("speed_comparison") or {}
+        claims[key] = {
+            "headline_eligible": bool(speed_comparison.get("headline_eligible")),
+            "headline_train_samples_per_second_speedup": speed_comparison.get(
+                "headline_train_samples_per_second_speedup"
+            ),
+            "measured_train_samples_per_second_speedup": speed_comparison.get(
+                "measured_train_samples_per_second_speedup"
+            ),
+            "reasons": speed_comparison.get("reasons") or [],
+        }
+    return {
+        "schema_version": 1,
+        "raw_baseline": "pytorch_raw" if "pytorch_raw" in rows else None,
+        "claims": claims,
     }
 
 
@@ -6434,7 +6831,7 @@ def kib_to_mb(value: int | float) -> float:
 
 def package_version(name: str) -> str | None:
     try:
-        if name in {"nvidia-dali-cuda130", "nvidia-dali-cuda120"}:
+        if name in {"nvidia-dali-cuda130", "nvidia-dali-cuda120", "pylibjpeg-libjpeg"}:
             import importlib.metadata
 
             return importlib.metadata.version(name)
@@ -6589,6 +6986,14 @@ def import_pillow() -> dict[str, Any]:
     except ImportError as error:
         raise RuntimeError("Pillow is required for image preprocessing") from error
     return {"Image": Image}
+
+
+def import_pydicom() -> Any:
+    try:
+        import pydicom  # type: ignore
+    except ImportError as error:
+        raise RuntimeError("pydicom is required for DICOM-backed CXR benchmarks") from error
+    return pydicom
 
 
 def import_sklearn_metrics() -> Any:
