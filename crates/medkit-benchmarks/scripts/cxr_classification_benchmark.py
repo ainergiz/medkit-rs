@@ -4775,6 +4775,7 @@ def threshold_report(y_true: Any, y_score: Any, y_mask: Any, targets: Sequence[s
         truth = y_true[valid, index]
         report["targets"][target] = {
             "threshold_0_5": binary_operating_point(truth, scores, 0.5),
+            "max_f1": choose_threshold_for_max_f1(truth, scores),
             "fixed_sensitivity_0_8": choose_threshold_for_sensitivity(truth, scores, 0.8),
             "fixed_specificity_0_8": choose_threshold_for_specificity(truth, scores, 0.8),
         }
@@ -5203,15 +5204,33 @@ def binary_operating_point(y_true: Any, y_score: Any, threshold: float) -> dict[
     tn = int(numpy.logical_and(~pred, ~truth).sum())
     fp = int(numpy.logical_and(pred, ~truth).sum())
     fn = int(numpy.logical_and(~pred, truth).sum())
+    sensitivity = tp / max(tp + fn, 1)
+    specificity = tn / max(tn + fp, 1)
+    precision = tp / max(tp + fp, 1)
+    f1 = 2.0 * precision * sensitivity / max(precision + sensitivity, sys.float_info.epsilon)
     return {
         "threshold": float(threshold),
-        "sensitivity": tp / max(tp + fn, 1),
-        "specificity": tn / max(tn + fp, 1),
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "precision": precision,
+        "f1": f1,
         "tp": tp,
         "tn": tn,
         "fp": fp,
         "fn": fn,
     }
+
+
+def choose_threshold_for_max_f1(y_true: Any, y_score: Any) -> dict[str, Any]:
+    best = None
+    for threshold in sorted(set(float(value) for value in y_score)):
+        point = binary_operating_point(y_true, y_score, threshold)
+        if best is None or (point["f1"], point["sensitivity"]) > (
+            best["f1"],
+            best["sensitivity"],
+        ):
+            best = point
+    return best or {"status": "unavailable", "reason": "no score thresholds"}
 
 
 def choose_threshold_for_sensitivity(y_true: Any, y_score: Any, target: float) -> dict[str, Any]:

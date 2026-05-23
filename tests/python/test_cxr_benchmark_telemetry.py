@@ -663,6 +663,24 @@ def test_quality_gate_and_balanced_loss_helpers_reject_weak_quality():
     assert any("metric targets" in error for error in report["errors"])
 
 
+def test_threshold_report_includes_max_f1_operating_point():
+    benchmark = load_benchmark_module()
+    numpy = benchmark.import_numpy()
+
+    report = benchmark.threshold_report(
+        numpy.array([[1.0], [1.0], [0.0], [0.0]], dtype="float32"),
+        numpy.array([[0.9], [0.8], [0.4], [0.1]], dtype="float32"),
+        numpy.ones((4, 1), dtype="float32"),
+        ["Finding"],
+    )
+
+    max_f1 = report["targets"]["Finding"]["max_f1"]
+    assert max_f1["threshold"] == 0.800000011920929
+    assert max_f1["precision"] == 1.0
+    assert max_f1["sensitivity"] == 1.0
+    assert max_f1["f1"] == 1.0
+
+
 def test_profile_report_disabled_without_requested_batches():
     benchmark = load_benchmark_module()
 
