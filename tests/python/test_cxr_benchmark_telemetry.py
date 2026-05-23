@@ -838,6 +838,7 @@ def test_cache_preflight_and_registry_record_reuse_audit(tmp_path):
         targets=targets,
         image_size=224,
         cache_dtype="float32",
+        cache_splits=("train", "val", "test"),
         cache_key_mode="content",
         force_cache=False,
         allow_destructive_cache=False,
@@ -890,6 +891,7 @@ def test_cache_preflight_and_registry_record_reuse_audit(tmp_path):
         targets=targets,
         image_size=224,
         cache_dtype="float32",
+        cache_splits=("train", "val", "test"),
         cache_key_mode="content",
         force_cache=False,
         allow_destructive_cache=False,
@@ -901,6 +903,116 @@ def test_cache_preflight_and_registry_record_reuse_audit(tmp_path):
     assert reuse["metadata_matches"] is True
     assert reuse["registry_hit"] is True
     assert reuse["registry_entry"]["cache_size_bytes"] == 123
+
+
+def test_split_selective_cache_key_and_scope_audits(tmp_path):
+    benchmark = load_benchmark_module()
+    record = benchmark.SampleRecord(
+        sample_id="sample-1",
+        patient_id="patient-1",
+        study_id="study-1",
+        image_id="image-1",
+        image_path="/tmp/one.dcm",
+        filename="one.dcm",
+        source_split="train",
+        width=10,
+        height=10,
+        labels={"Pneumonia": 1},
+        split="train",
+        sha256="sha-one",
+        source_format="dicom",
+    )
+    targets = ["Pneumonia"]
+
+    full_dir = benchmark.cache_dir_for_run(
+        dataset_work_dir=tmp_path,
+        image_size=224,
+        cache_dtype="float32",
+        cache_key_mode="content",
+        records=[record],
+        targets=targets,
+        cache_splits=("train", "val", "test"),
+    )
+    train_only_dir = benchmark.cache_dir_for_run(
+        dataset_work_dir=tmp_path,
+        image_size=224,
+        cache_dtype="float32",
+        cache_key_mode="content",
+        records=[record],
+        targets=targets,
+        cache_splits=("train",),
+    )
+    legacy_train_only_dir = benchmark.cache_dir_for_run(
+        dataset_work_dir=tmp_path,
+        image_size=224,
+        cache_dtype="float32",
+        cache_key_mode="legacy",
+        records=[record],
+        targets=targets,
+        cache_splits=("train",),
+    )
+
+    assert full_dir != train_only_dir
+    assert "-s" not in full_dir.name
+    assert "-s" in train_only_dir.name
+    assert legacy_train_only_dir.name.startswith("cache-224-float32-s")
+
+    train_cache_report = {
+        "cache_schema_version": 1,
+        "cache_kind": "medkit_rust_compatible_mmap_float32",
+        "dtype": "float32",
+        "image_size": 224,
+        "targets": targets,
+        "source_manifest_checksum": benchmark.manifest_checksum([record]),
+        "split_names": ["train"],
+        "splits": {"train": {"samples": 1, "shape": [1, 1, 224, 224]}},
+    }
+    assert benchmark.cache_matches_run(
+        train_cache_report,
+        records=[record],
+        targets=targets,
+        image_size=224,
+        cache_dtype="float32",
+        cache_splits=("train",),
+    )
+    assert not benchmark.cache_matches_run(
+        train_cache_report,
+        records=[record],
+        targets=targets,
+        image_size=224,
+        cache_dtype="float32",
+        cache_splits=("train", "val", "test"),
+    )
+
+
+def test_split_selective_cache_scope_rejects_eval_claims():
+    benchmark = load_benchmark_module()
+    cache_report = {"split_names": ["train"]}
+    speed_args = argparse.Namespace(
+        prepare_only=False,
+        skip_eval=True,
+        quality_gate=False,
+        eval_predictions=False,
+    )
+    benchmark.validate_cache_scope_for_run(args=speed_args, cache_report=cache_report)
+
+    eval_args = argparse.Namespace(
+        prepare_only=False,
+        skip_eval=False,
+        quality_gate=False,
+        eval_predictions=False,
+    )
+    with pytest.raises(ValueError, match="requires val split"):
+        benchmark.validate_cache_scope_for_run(args=eval_args, cache_report=cache_report)
+
+    quality_args = argparse.Namespace(
+        prepare_only=False,
+        skip_eval=True,
+        quality_gate=True,
+        eval_predictions=False,
+    )
+    with pytest.raises(ValueError, match="quality gate requires val split"):
+        benchmark.validate_cache_scope_for_run(args=quality_args, cache_report=cache_report)
 
 
 def test_split_report_records_reproducibility_checksums(tmp_path):
@@ -1222,6 +1334,8 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
         assert command[command.index("--dataset") + 1] == "arudaev/chest-xray-14-320"
         assert command[command.index("--cache-build-workers") + 1] == "1"
         assert command[command.index("--cache-key-mode") + 1] == "legacy"
+        assert command[command.index("--cache-splits") + 1] == "train,val,test"
+        assert "--no-skip-eval" in command
         assert "--gpu-prefetch-batches" in command
         assert "--no-gpu-prefetch-reuse-buffers" in command
         assert "--sync-every-step" in command
@@ -1281,6 +1395,7 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
         row=quality_rows[0],
     )
     assert "--quality-gate" in quality_command
+    assert "--no-skip-eval" in quality_command
     assert "--train-order-evidence" in quality_command
     assert "--paired-train-order" in quality_command
     assert "--loss-pos-weight" in quality_command
@@ -1357,6 +1472,26 @@ def test_gate_presets_build_same_batch_raw_and_medkit_rows_on_one_gpu_type():
         == "/cache/cxr/datasets/rsna-pneumonia-2018"
     )
 
+    speed_only_args = matrix.parse_args(
+        [
+            "--gate",
+            "l4-224-b64",
+            "--batch-id",
+            "speed-cache",
+            "--cache-splits",
+            "train",
+            "--skip-eval",
+        ]
+    )
+    speed_only_row = matrix.rows_for_args(speed_only_args)[0]
+    speed_only_command = matrix.build_command(
+        speed_only_args,
+        run_id=matrix.run_id_for("speed-cache", speed_only_row),
+        row=speed_only_row,
+    )
+    assert speed_only_command[speed_only_command.index("--cache-splits") + 1] == "train"
+    assert "--skip-eval" in speed_only_command
+
 
 def test_matrix_modal_cli_command_can_be_overridden(monkeypatch):
     matrix = load_matrix_module()
@@ -1424,6 +1559,12 @@ def test_modal_cxr_wrapper_exposes_sync_policy():
     assert 'cache_key_mode: str = "legacy"' in text
     assert "--cache-key-mode" in text
     assert "cache_key_mode=cache_key_mode" in text
+    assert 'cache_splits: str = "train,val,test"' in text
+    assert "--cache-splits" in text
+    assert "cache_splits=cache_splits" in text
+    assert "skip_eval: bool = False" in text
+    assert "--skip-eval" in text
+    assert "skip_eval=skip_eval" in text
     assert "allow_destructive_cache: bool = False" in text
     assert "--allow-destructive-cache" in text
     assert "allow_destructive_cache=allow_destructive_cache" in text

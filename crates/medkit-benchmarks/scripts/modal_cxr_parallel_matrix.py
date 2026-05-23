@@ -179,6 +179,7 @@ GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
     "baselines": ("--baselines",),
     "image_size": ("--image-size",),
     "cache_dtypes": ("--cache-dtypes", "--cache-dtype"),
+    "cache_splits": ("--cache-splits",),
     "batch_size": ("--batch-size",),
     "workers": ("--workers",),
     "max_samples": ("--max-samples",),
@@ -217,6 +218,7 @@ GATE_OPTION_FLAGS: dict[str, tuple[str, ...]] = {
     "quality_min_metric_targets": ("--quality-min-metric-targets",),
     "quality_min_macro_auroc": ("--quality-min-macro-auroc",),
     "quality_min_macro_auprc": ("--quality-min-macro-auprc",),
+    "skip_eval": ("--skip-eval", "--no-skip-eval"),
     "train_order_evidence": ("--train-order-evidence", "--no-train-order-evidence"),
     "paired_train_order": ("--paired-train-order", "--no-paired-train-order"),
     "read_modes": ("--read-modes", "--read-mode"),
@@ -284,6 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--cache-dtype", choices=("float32", "float16", "uint8"), default="float32")
     parser.add_argument("--cache-build-workers", type=int, default=1)
+    parser.add_argument("--cache-splits", default="train,val,test")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-samples", type=int, default=6000)
@@ -327,6 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quality-min-metric-targets", type=int, default=0)
     parser.add_argument("--quality-min-macro-auroc", type=float, default=0.0)
     parser.add_argument("--quality-min-macro-auprc", type=float, default=0.0)
+    parser.add_argument("--skip-eval", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--train-order-evidence", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--paired-train-order", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--read-mode", choices=("mmap", "stream"), default="mmap")
@@ -710,6 +714,8 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         str(args.cache_build_workers),
         "--cache-key-mode",
         args.cache_key_mode,
+        "--cache-splits",
+        args.cache_splits,
         "--batch-size",
         str(args.batch_size),
         "--workers",
@@ -764,6 +770,7 @@ def build_command(args: argparse.Namespace, *, run_id: str, row: Row) -> list[st
         str(args.quality_min_macro_auroc),
         "--quality-min-macro-auprc",
         str(args.quality_min_macro_auprc),
+        "--skip-eval" if args.skip_eval else "--no-skip-eval",
         "--train-order-evidence"
         if (args.quality_gate if args.train_order_evidence is None else args.train_order_evidence)
         else "--no-train-order-evidence",

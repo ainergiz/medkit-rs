@@ -163,6 +163,15 @@ def main() -> int:
             "and target fingerprints so subset/full caches cannot overwrite each other."
         ),
     )
+    parser.add_argument(
+        "--cache-splits",
+        default="train,val,test",
+        help=(
+            "Comma-separated splits to materialize in the medkit cache. Use train for "
+            "speed-only cache-wait probes, train,val for quality probes, and "
+            "train,val,test for full promotion evidence."
+        ),
+    )
     parser.add_argument("--targets", default=",".join(DEFAULT_TARGETS))
     parser.add_argument("--max-samples", type=int, default=6000)
     parser.add_argument("--max-train", type=int, default=4096)
@@ -341,6 +350,14 @@ def main() -> int:
         action="store_true",
         help="Materialize, split, cache, and emit reproducibility artifacts without training.",
     )
+    parser.add_argument(
+        "--skip-eval",
+        action="store_true",
+        help=(
+            "Train and profile without opening/evaluating the validation split. This is "
+            "only valid for speed/cache experiments; quality and prediction claims are rejected."
+        ),
+    )
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
 
@@ -355,6 +372,10 @@ def main() -> int:
         args.epochs = min(args.epochs, 1)
     if args.force_rematerialize:
         args.force_cache = True
+    args.cache_splits = parse_cache_splits(args.cache_splits)
+    validate_requested_cache_splits(args.cache_splits)
+    if args.skip_eval and (args.quality_gate or args.eval_predictions):
+        raise ValueError("--skip-eval cannot be combined with quality/eval-prediction claims")
     if args.cache_build_workers < 1:
         raise ValueError("--cache-build-workers must be >= 1")
     if args.loss_pos_weight_cap < 0.0:
@@ -437,6 +458,7 @@ def main() -> int:
         "cache_dtype": args.cache_dtype,
         "cache_build_workers": args.cache_build_workers,
         "cache_key_mode": args.cache_key_mode,
+        "cache_splits": list(args.cache_splits),
         "allow_destructive_cache": args.allow_destructive_cache,
         "batch_size": args.batch_size,
         "drop_last_train": args.drop_last_train,
@@ -449,6 +471,7 @@ def main() -> int:
         "warmup_batches": args.warmup_batches,
         "max_train_batches": args.max_train_batches,
         "max_eval_batches": args.max_eval_batches,
+        "skip_eval": args.skip_eval,
         "prefetch_depth": args.prefetch_depth,
         "prefetch_read_workers": args.prefetch_read_workers,
         "shuffle_block_batches": args.shuffle_block_batches,
@@ -562,6 +585,7 @@ def main() -> int:
         image_size=cache_size,
         cache_dtype=args.cache_dtype,
         cache_key_mode=args.cache_key_mode,
+        cache_splits=args.cache_splits,
         records=records,
         targets=targets,
     )
@@ -571,6 +595,7 @@ def main() -> int:
         targets=targets,
         image_size=cache_size,
         cache_dtype=args.cache_dtype,
+        cache_splits=args.cache_splits,
     )
     cache_start = time.perf_counter()
     cache_metadata_path = cache_dir / "cache-metadata.json"
@@ -582,6 +607,7 @@ def main() -> int:
         targets=targets,
         image_size=cache_size,
         cache_dtype=args.cache_dtype,
+        cache_splits=args.cache_splits,
         cache_key_mode=args.cache_key_mode,
         force_cache=args.force_cache,
         allow_destructive_cache=args.allow_destructive_cache,
@@ -604,6 +630,7 @@ def main() -> int:
             targets=targets,
             image_size=cache_size,
             cache_dtype=args.cache_dtype,
+            cache_splits=args.cache_splits,
         )
     if rebuild_cache:
         cache_report = build_cache(
@@ -614,6 +641,7 @@ def main() -> int:
             cache_dtype=args.cache_dtype,
             cache_build_workers=args.cache_build_workers,
             cache_key_mode=args.cache_key_mode,
+            cache_splits=args.cache_splits,
             seed=args.seed,
         )
     else:
@@ -626,6 +654,7 @@ def main() -> int:
         cache_report=cache_report,
     )
     write_json(report_dir / "cache-registry-entry.json", cache_registry_entry)
+    validate_cache_scope_for_run(args=args, cache_report=cache_report)
 
     if "webdataset" in baselines:
         webdataset_start = time.perf_counter()
@@ -1625,6 +1654,7 @@ def build_cache(
     cache_dtype: str,
     cache_build_workers: int,
     cache_key_mode: str,
+    cache_splits: Sequence[str],
     seed: int,
 ) -> dict[str, Any]:
     numpy = import_numpy()
@@ -1641,7 +1671,8 @@ def build_cache(
     mean_std_seconds = time.perf_counter() - mean_std_start
     split_reports: dict[str, Any] = {}
     failed: list[str] = []
-    for split in ("train", "val", "test"):
+    materialized_splits = list(cache_splits)
+    for split in materialized_splits:
         split_start = time.perf_counter()
         split_records = [record for record in records if record.split == split]
         images_path = cache_dir / f"{split}-images.{cache_dtype}.dat"
@@ -1719,6 +1750,7 @@ def build_cache(
             targets=targets,
             image_size=image_size,
             cache_dtype=cache_dtype,
+            cache_splits=cache_splits,
         ),
         "cache_reused": False,
         "channels": 1,
@@ -1736,7 +1768,15 @@ def build_cache(
         "transform_plan_hash": transform_hash,
         "transform_fingerprint": transform_hash,
         "source_manifest_checksum": manifest_checksum(records),
-        "split_names": ["train", "val", "test"],
+        "split_names": materialized_splits,
+        "requested_split_names": ["train", "val", "test"],
+        "cache_split_policy": {
+            "materialized_splits": materialized_splits,
+            "omitted_splits": [
+                split for split in ("train", "val", "test") if split not in materialized_splits
+            ],
+            "scope": "full" if tuple(materialized_splits) == ("train", "val", "test") else "partial",
+        },
         "image_size_policy": {
             "channels": 1,
             "height": image_size,
@@ -1870,24 +1910,35 @@ def cache_identity_report(
     targets: Sequence[str],
     image_size: int,
     cache_dtype: str,
+    cache_splits: Sequence[str] = ("train", "val", "test"),
 ) -> dict[str, Any]:
     transform_fingerprint = stable_hash(
         cache_transform_plan(image_size=image_size, cache_dtype=cache_dtype)
     )
     source_manifest_checksum = manifest_checksum(records)
     target_fingerprint = stable_hash({"targets": list(targets)})
+    materialized_splits = list(cache_splits)
+    split_fingerprint = stable_hash({"cache_splits": materialized_splits})
+    split_suffix = (
+        ""
+        if tuple(materialized_splits) == ("train", "val", "test")
+        else f"-s{split_fingerprint[:12]}"
+    )
     return {
         "schema_version": 1,
         "image_size": image_size,
         "cache_dtype": cache_dtype,
+        "cache_splits": materialized_splits,
         "source_manifest_checksum": source_manifest_checksum,
         "transform_fingerprint": transform_fingerprint,
         "target_fingerprint": target_fingerprint,
+        "split_fingerprint": split_fingerprint,
         "content_key": (
             f"cache-{image_size}-{cache_dtype}-"
             f"m{source_manifest_checksum[:12]}-"
             f"x{transform_fingerprint[:12]}-"
             f"y{target_fingerprint[:12]}"
+            f"{split_suffix}"
         ),
     }
 
@@ -1898,11 +1949,16 @@ def cache_dir_for_run(
     image_size: int,
     cache_dtype: str,
     cache_key_mode: str,
+    cache_splits: Sequence[str] = ("train", "val", "test"),
     records: Sequence[SampleRecord],
     targets: Sequence[str],
 ) -> Path:
-    if cache_key_mode == "legacy":
+    materialized_splits = list(cache_splits)
+    if cache_key_mode == "legacy" and tuple(materialized_splits) == ("train", "val", "test"):
         return dataset_work_dir / f"cache-{image_size}-{cache_dtype}"
+    if cache_key_mode == "legacy":
+        split_fingerprint = stable_hash({"cache_splits": materialized_splits})
+        return dataset_work_dir / f"cache-{image_size}-{cache_dtype}-s{split_fingerprint[:12]}"
     if cache_key_mode != "content":
         raise ValueError(f"unsupported cache key mode: {cache_key_mode}")
     return dataset_work_dir / "caches" / cache_identity_report(
@@ -1910,6 +1966,7 @@ def cache_dir_for_run(
         targets=targets,
         image_size=image_size,
         cache_dtype=cache_dtype,
+        cache_splits=cache_splits,
     )["content_key"]
 
 
@@ -1930,6 +1987,52 @@ def enforce_destructive_cache_guard(
     )
 
 
+def parse_cache_splits(value: str | Sequence[str]) -> tuple[str, ...]:
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+    else:
+        parts = [str(part).strip() for part in value if str(part).strip()]
+    return tuple(parts)
+
+
+def validate_requested_cache_splits(cache_splits: Sequence[str]) -> None:
+    allowed = {"train", "val", "test"}
+    if not cache_splits:
+        raise ValueError("--cache-splits must include at least train")
+    unknown = sorted(set(cache_splits) - allowed)
+    if unknown:
+        raise ValueError(f"--cache-splits contains unsupported splits: {unknown}")
+    duplicates = sorted({split for split in cache_splits if list(cache_splits).count(split) > 1})
+    if duplicates:
+        raise ValueError(f"--cache-splits contains duplicates: {duplicates}")
+    if "train" not in cache_splits:
+        raise ValueError("--cache-splits must include train because normalization is train-based")
+    canonical_order = [split for split in ("train", "val", "test") if split in cache_splits]
+    if list(cache_splits) != canonical_order:
+        raise ValueError(
+            "--cache-splits must be in canonical order: train, train,val, or train,val,test"
+        )
+
+
+def validate_cache_scope_for_run(*, args: argparse.Namespace, cache_report: dict[str, Any]) -> None:
+    materialized = set(cache_report.get("split_names") or ("train", "val", "test"))
+    missing_train = "train" not in materialized
+    missing_val = "val" not in materialized
+    if missing_train:
+        raise ValueError("cache scope is missing train split; training cannot run")
+    if args.quality_gate and missing_val:
+        raise ValueError("quality gate requires val split in --cache-splits")
+    if args.eval_predictions and missing_val:
+        raise ValueError("eval prediction capture requires val split in --cache-splits")
+    if args.prepare_only:
+        return
+    if missing_val and not args.skip_eval:
+        raise ValueError(
+            "training with evaluation requires val split in --cache-splits; "
+            "use --skip-eval only for speed/cache experiments"
+        )
+
+
 def cache_registry_path(dataset_work_dir: Path) -> Path:
     return dataset_work_dir / "cache-registry.json"
 
@@ -1943,6 +2046,7 @@ def cache_preflight_report(
     targets: Sequence[str],
     image_size: int,
     cache_dtype: str,
+    cache_splits: Sequence[str],
     cache_key_mode: str,
     force_cache: bool,
     allow_destructive_cache: bool,
@@ -1953,6 +2057,7 @@ def cache_preflight_report(
         targets=targets,
         image_size=image_size,
         cache_dtype=cache_dtype,
+        cache_splits=cache_splits,
     )
     registry_path = cache_registry_path(dataset_work_dir)
     registry = load_cache_registry(registry_path)
@@ -1972,6 +2077,7 @@ def cache_preflight_report(
                     targets=targets,
                     image_size=image_size,
                     cache_dtype=cache_dtype,
+                    cache_splits=cache_splits,
                 )
             else:
                 metadata_error = "metadata JSON is not an object"
@@ -2098,6 +2204,7 @@ def cache_matches_run(
     targets: Sequence[str],
     image_size: int,
     cache_dtype: str,
+    cache_splits: Sequence[str] = ("train", "val", "test"),
 ) -> bool:
     if int(cache_report.get("cache_schema_version", 0)) != 1:
         return False
@@ -2111,6 +2218,12 @@ def cache_matches_run(
         return False
     if cache_report.get("source_manifest_checksum") != manifest_checksum(records):
         return False
+    expected_splits = list(cache_splits)
+    cached_splits = cache_report.get("split_names")
+    if cached_splits is None:
+        cached_splits = ["train", "val", "test"]
+    if list(cached_splits) != expected_splits:
+        return False
     splits = cache_report.get("splits")
     if not isinstance(splits, dict):
         return False
@@ -2120,7 +2233,8 @@ def cache_matches_run(
         if record.split in counts:
             counts[record.split] += 1
 
-    for split, expected_count in counts.items():
+    for split in expected_splits:
+        expected_count = counts[split]
         split_info = splits.get(split)
         if not isinstance(split_info, dict):
             return False
@@ -2650,7 +2764,7 @@ def run_all_baselines(
 
         try:
             train_loader = loader_factory("train", shuffle=False)
-            val_loader = loader_factory("val", shuffle=False)
+            val_loader = None if args.skip_eval else loader_factory("val", shuffle=False)
             reports["loader"][baseline] = benchmark_loader(
                 train_loader,
                 max_batches=args.loader_batches,
@@ -3795,7 +3909,7 @@ def train_and_evaluate(
     torch: Any,
     baseline: str,
     train_loader: Any,
-    val_loader: Any,
+    val_loader: Any | None,
     train_records: Sequence[SampleRecord],
     eval_records: Sequence[SampleRecord],
     targets: Sequence[str],
@@ -4178,33 +4292,55 @@ def train_and_evaluate(
         losses.extend(float(loss.cpu().item()) for loss in deferred_losses)
     total_seconds = time.perf_counter() - train_start
     gpu_utilization = gpu_utilization_sampler.stop()
-    evaluation = evaluate_model(
-        torch=torch,
-        model=model,
-        loader=val_loader,
-        device=device,
-        max_batches=max_eval_batches,
-        channels_last=channels_last_active,
-        fallback_records=eval_records,
-        targets=targets,
-    )
-    validate_eval_arrays(
-        y_true=evaluation.y_true,
-        y_score=evaluation.y_score,
-        y_mask=evaluation.y_mask,
-        y_logits=evaluation.y_logits,
-        targets=targets,
-    )
-    quality = metric_report(evaluation.y_true, evaluation.y_score, evaluation.y_mask, targets)
-    quality["status"] = "ok"
-    quality["baseline"] = baseline
-    if evaluation.localization is not None:
-        evaluation.localization.setdefault("baseline", baseline)
-        quality["localization"] = evaluation.localization
-    thresholds = threshold_report(evaluation.y_true, evaluation.y_score, evaluation.y_mask, targets)
-    thresholds["status"] = "ok"
-    thresholds["baseline"] = baseline
-    if prediction_artifact_path is not None:
+    if val_loader is None:
+        evaluation = None
+        quality = {
+            "status": "skipped",
+            "baseline": baseline,
+            "reason": "validation evaluation skipped",
+        }
+        thresholds = {
+            "status": "skipped",
+            "baseline": baseline,
+            "reason": "validation evaluation skipped",
+        }
+        prediction_report = prediction_capture_disabled_report(
+            baseline=baseline,
+            reason="validation evaluation skipped",
+        )
+        quality["prediction_capture"] = {
+            "enabled": False,
+            "status": "disabled",
+            "reason": prediction_report.get("reason"),
+        }
+    else:
+        evaluation = evaluate_model(
+            torch=torch,
+            model=model,
+            loader=val_loader,
+            device=device,
+            max_batches=max_eval_batches,
+            channels_last=channels_last_active,
+            fallback_records=eval_records,
+            targets=targets,
+        )
+        validate_eval_arrays(
+            y_true=evaluation.y_true,
+            y_score=evaluation.y_score,
+            y_mask=evaluation.y_mask,
+            y_logits=evaluation.y_logits,
+            targets=targets,
+        )
+        quality = metric_report(evaluation.y_true, evaluation.y_score, evaluation.y_mask, targets)
+        quality["status"] = "ok"
+        quality["baseline"] = baseline
+        if evaluation.localization is not None:
+            evaluation.localization.setdefault("baseline", baseline)
+            quality["localization"] = evaluation.localization
+        thresholds = threshold_report(evaluation.y_true, evaluation.y_score, evaluation.y_mask, targets)
+        thresholds["status"] = "ok"
+        thresholds["baseline"] = baseline
+    if prediction_artifact_path is not None and evaluation is not None:
         prediction_report = write_eval_predictions_artifact(
             path=prediction_artifact_path,
             baseline=baseline,
@@ -4223,7 +4359,7 @@ def train_and_evaluate(
         quality["metric_recompute_matches_predictions"] = prediction_report.get(
             "metric_recompute_matches_quality"
         )
-    else:
+    elif evaluation is not None:
         prediction_report = prediction_capture_disabled_report(
             baseline=baseline,
             reason="eval prediction capture disabled",
@@ -6113,6 +6249,13 @@ def quality_gate_report(
     baseline_checks: dict[str, Any] = {}
     for baseline, report in quality.items():
         if report.get("status") != "ok":
+            if not enabled and run_metadata.get("skip_eval") and report.get("status") == "skipped":
+                baseline_checks[baseline] = {
+                    "status": report.get("status"),
+                    "reason": report.get("reason"),
+                }
+                warnings.append(f"{baseline} quality evaluation skipped by --skip-eval")
+                continue
             errors.append(f"{baseline} quality status is {report.get('status')!r}")
             baseline_checks[baseline] = {"status": report.get("status"), "reason": report.get("reason")}
             continue
@@ -6759,6 +6902,11 @@ def build_run_provenance(
         "cache_dtype": run_metadata.get("cache_dtype"),
         "cache_build_workers": run_metadata.get("cache_build_workers"),
         "cache_key_mode": run_metadata.get("cache_key_mode"),
+        "cache_splits": (
+            list(run_metadata["cache_splits"])
+            if run_metadata.get("cache_splits") is not None
+            else None
+        ),
         "allow_destructive_cache": run_metadata.get("allow_destructive_cache"),
         "batch_size": run_metadata.get("batch_size"),
         "drop_last_train": run_metadata.get("drop_last_train"),
@@ -6796,6 +6944,7 @@ def build_run_provenance(
         "warmup_batches": run_metadata.get("warmup_batches"),
         "max_train_batches": run_metadata.get("max_train_batches"),
         "max_eval_batches": run_metadata.get("max_eval_batches"),
+        "skip_eval": run_metadata.get("skip_eval"),
         "seed": run_metadata.get("seed"),
         "cache": {
             "cache_dir": cache_report.get("cache_dir"),
@@ -6921,7 +7070,11 @@ def run_summary_consistency_errors(
             for split, details in cache_splits.items()
             if isinstance(details, dict)
         }
-        expect_equal(errors, "cache split samples", cache_split_samples, split_counts)
+        expected_cache_split_samples = {
+            split: split_counts.get(split)
+            for split in cache_split_samples
+        }
+        expect_equal(errors, "cache split samples", cache_split_samples, expected_cache_split_samples)
         expect_equal(
             errors,
             "provenance.cache.split_samples",
@@ -6937,6 +7090,7 @@ def run_summary_consistency_errors(
         "cache_dtype",
         "cache_build_workers",
         "cache_key_mode",
+        "cache_splits",
         "allow_destructive_cache",
         "batch_size",
         "drop_last_train",
@@ -6973,6 +7127,7 @@ def run_summary_consistency_errors(
         "warmup_batches",
         "max_train_batches",
         "max_eval_batches",
+        "skip_eval",
         "seed",
     ):
         expect_equal(errors, f"provenance.{field}", provenance.get(field), run_metadata.get(field))

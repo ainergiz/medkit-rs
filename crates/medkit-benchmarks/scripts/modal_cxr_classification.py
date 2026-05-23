@@ -192,6 +192,7 @@ def run_cxr_benchmark(
     cache_dtype: str = "float32",
     cache_build_workers: int = 1,
     cache_key_mode: str = "legacy",
+    cache_splits: str = "train,val,test",
     batch_size: int = 64,
     workers: int = 4,
     epochs: int = 1,
@@ -231,6 +232,7 @@ def run_cxr_benchmark(
     manifest: str = "",
     splits: str = "",
     prepare_only: bool = False,
+    skip_eval: bool = False,
     smoke: bool = False,
     force_rematerialize: bool = False,
     force_cache: bool = False,
@@ -267,6 +269,8 @@ def run_cxr_benchmark(
         str(cache_build_workers),
         "--cache-key-mode",
         cache_key_mode,
+        "--cache-splits",
+        cache_splits,
         "--batch-size",
         str(batch_size),
         "--workers",
@@ -355,6 +359,8 @@ def run_cxr_benchmark(
         command.append("--allow-destructive-cache")
     if prepare_only:
         command.append("--prepare-only")
+    if skip_eval:
+        command.append("--skip-eval")
 
     env = os.environ.copy()
     env["MEDKIT_BENCHMARK_USE_LOCAL_SOURCE"] = "0" if USE_PUBLISHED_MEDKIT else "1"
@@ -410,6 +416,7 @@ def main(
     cache_dtype: str = "float32",
     cache_build_workers: int = 1,
     cache_key_mode: str = "legacy",
+    cache_splits: str = "train,val,test",
     batch_size: int = 64,
     workers: int = 4,
     epochs: int = 1,
@@ -449,6 +456,7 @@ def main(
     manifest: str = "",
     splits: str = "",
     prepare_only: bool = False,
+    skip_eval: bool = False,
     smoke: bool = False,
     force_rematerialize: bool = False,
     force_cache: bool = False,
@@ -470,6 +478,7 @@ def main(
     # gpu_prefetch_reuse_buffers=gpu_prefetch_reuse_buffers.
     # train_order_evidence=train_order_evidence, paired_train_order=paired_train_order.
     # cache_build_workers=cache_build_workers, cache_key_mode=cache_key_mode.
+    # cache_splits=cache_splits, skip_eval=skip_eval.
     # allow_destructive_cache=allow_destructive_cache.
     benchmark_kwargs = {
         "run_id": run_id,
@@ -483,6 +492,7 @@ def main(
         "cache_dtype": cache_dtype,
         "cache_build_workers": cache_build_workers,
         "cache_key_mode": cache_key_mode,
+        "cache_splits": cache_splits,
         "batch_size": batch_size,
         "workers": workers,
         "epochs": epochs,
@@ -522,6 +532,7 @@ def main(
         "manifest": manifest,
         "splits": splits,
         "prepare_only": prepare_only,
+        "skip_eval": skip_eval,
         "smoke": smoke,
         "force_rematerialize": force_rematerialize,
         "force_cache": force_cache,
