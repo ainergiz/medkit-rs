@@ -62,6 +62,7 @@ struct CxrPrefetcher {
     batch_size: usize,
     prefetch_depth: usize,
     read_workers: usize,
+    pin_memory: bool,
     stats: CxrPrefetchStats,
     closed: bool,
 }
@@ -528,6 +529,12 @@ impl CxrPrefetcher {
         out.set_item("read_micros", self.stats.read_micros)?;
         out.set_item("scatter_micros", self.stats.scatter_micros)?;
         out.set_item("read_workers", self.read_workers)?;
+        out.set_item("batch_size", self.batch_size)?;
+        out.set_item("prefetch_depth", self.prefetch_depth)?;
+        out.set_item("slot_count", self.buffers.len())?;
+        out.set_item("preallocated_batch_buffers", self.buffers.len())?;
+        out.set_item("buffer_reuse_enabled", !self.buffers.is_empty())?;
+        out.set_item("pin_memory", self.pin_memory)?;
         Ok(out.into())
     }
 
@@ -628,6 +635,7 @@ impl CxrPrefetcher {
             batch_size,
             prefetch_depth: slot_count,
             read_workers: read_workers.max(1),
+            pin_memory,
             stats: CxrPrefetchStats::default(),
             closed: false,
         })
@@ -967,6 +975,7 @@ mod tests {
             batch_size: 2,
             prefetch_depth: 1,
             read_workers: 3,
+            pin_memory: false,
             stats: CxrPrefetchStats::default(),
             closed: false,
         }
@@ -1513,6 +1522,7 @@ def empty_like(tensor):
             batch_size: 2,
             prefetch_depth: 1,
             read_workers: 3,
+            pin_memory: false,
             stats: CxrPrefetchStats::default(),
             closed: false,
         }
@@ -2311,6 +2321,54 @@ def empty_like(tensor):
                     .unwrap(),
                 3
             );
+            assert_eq!(
+                stats
+                    .get_item("batch_size")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                stats
+                    .get_item("prefetch_depth")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                stats
+                    .get_item("slot_count")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                stats
+                    .get_item("preallocated_batch_buffers")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                0
+            );
+            assert!(!stats
+                .get_item("buffer_reuse_enabled")
+                .unwrap()
+                .unwrap()
+                .extract::<bool>()
+                .unwrap());
+            assert!(!stats
+                .get_item("pin_memory")
+                .unwrap()
+                .unwrap()
+                .extract::<bool>()
+                .unwrap());
         });
     }
 

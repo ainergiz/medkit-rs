@@ -1035,6 +1035,13 @@ def repeat_metric_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
             extract_metric(result, "train_native_prefetch_runs_per_batch")
             for result in results
         ),
+        "train_native_prefetch_slot_count": summarize_metric_values(
+            extract_metric(result, "train_native_prefetch_slot_count") for result in results
+        ),
+        "train_native_prefetch_preallocated_batch_buffers": summarize_metric_values(
+            extract_metric(result, "train_native_prefetch_preallocated_batch_buffers")
+            for result in results
+        ),
     }
     for metric in (*PROFILE_PHASE_METRICS, *PROFILE_EVENT_METRICS):
         metrics[metric] = summarize_metric_values(extract_metric(result, metric) for result in results)
@@ -1637,6 +1644,10 @@ def extract_metric(result: dict[str, Any], metric: str) -> float | None:
         ),
         "train_native_prefetch_runs_per_batch": gpu_row.get(
             "train_native_prefetch_runs_per_batch"
+        ),
+        "train_native_prefetch_slot_count": gpu_row.get("train_native_prefetch_slot_count"),
+        "train_native_prefetch_preallocated_batch_buffers": gpu_row.get(
+            "train_native_prefetch_preallocated_batch_buffers"
         ),
         "gpu_pss_mb": memory.get("smaps_pss_mb"),
         "gpu_anon_pss_mb": memory.get("smaps_pss_anon_mb"),

@@ -3340,6 +3340,8 @@ def native_prefetch_timing_fields(
     scatter_ms = _stats_float(stats, "scatter_micros") / 1000.0
     read_scatter_ms = read_ms + scatter_ms
     denominator = indexed_batches or stats_batches or float(batches)
+    slot_count = _stats_float(stats, "slot_count")
+    preallocated_batch_buffers = _stats_float(stats, "preallocated_batch_buffers")
     output: dict[str, Any] = {
         f"{prefix}_native_prefetch_batches": stats_batches,
         f"{prefix}_native_prefetch_indexed_batches": indexed_batches,
@@ -3347,6 +3349,12 @@ def native_prefetch_timing_fields(
         f"{prefix}_native_prefetch_read_ms": read_ms,
         f"{prefix}_native_prefetch_scatter_ms": scatter_ms,
         f"{prefix}_native_prefetch_read_scatter_ms": read_scatter_ms,
+        f"{prefix}_native_prefetch_slot_count": slot_count,
+        f"{prefix}_native_prefetch_preallocated_batch_buffers": preallocated_batch_buffers,
+        f"{prefix}_native_prefetch_buffer_reuse_enabled": bool(
+            stats.get("buffer_reuse_enabled")
+        ),
+        f"{prefix}_native_prefetch_pin_memory": bool(stats.get("pin_memory")),
     }
     if denominator > 0.0:
         output[f"{prefix}_native_prefetch_runs_per_batch"] = indexed_runs / denominator

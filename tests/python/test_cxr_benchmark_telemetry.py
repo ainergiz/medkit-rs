@@ -1099,6 +1099,10 @@ def test_native_prefetch_timing_fields_summarize_pipeline_stats():
                 "indexed_runs": 12,
                 "read_micros": 8000,
                 "scatter_micros": 4000,
+                "slot_count": 2,
+                "preallocated_batch_buffers": 2,
+                "buffer_reuse_enabled": True,
+                "pin_memory": True,
             }
         },
         batches=4,
@@ -1111,6 +1115,10 @@ def test_native_prefetch_timing_fields_summarize_pipeline_stats():
     assert fields["train_native_prefetch_scatter_ms_per_batch"] == 1.0
     assert fields["train_native_prefetch_read_scatter_ms_per_batch"] == 3.0
     assert fields["train_native_prefetch_read_scatter_percent"] == 10.0
+    assert fields["train_native_prefetch_slot_count"] == 2.0
+    assert fields["train_native_prefetch_preallocated_batch_buffers"] == 2.0
+    assert fields["train_native_prefetch_buffer_reuse_enabled"] is True
+    assert fields["train_native_prefetch_pin_memory"] is True
 
 
 def test_matrix_pipeline_validation_rejects_policy_drift():
