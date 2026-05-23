@@ -852,6 +852,9 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
     train_order = load_json_if_exists(row_dir / "train-order-summary.json")
     environment = load_json_if_exists(row_dir / "environment.json")
     summary_consistency = load_json_if_exists(row_dir / "summary-consistency.json")
+    cache_report = load_json_if_exists(row_dir / "cache-report.json")
+    cache_preflight = load_json_if_exists(row_dir / "cache-preflight.json")
+    cache_registry_entry = load_json_if_exists(row_dir / "cache-registry-entry.json")
     elapsed = time.perf_counter() - active.started_at
     validation_errors = validate_row_artifacts(
         active=active,
@@ -867,6 +870,8 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
         train_order=train_order,
         environment=environment,
         summary_consistency=summary_consistency,
+        cache_report=cache_report,
+        cache_preflight=cache_preflight,
         artifact_dir=row_dir,
     )
     status = "ok" if not validation_errors else "failed"
@@ -894,6 +899,9 @@ def collect_row(active: RunningRow, batch_dir: Path, returncode: int) -> dict[st
         "train_order": train_order,
         "environment": environment,
         "summary_consistency": summary_consistency,
+        "cache_report": cache_report,
+        "cache_preflight": cache_preflight,
+        "cache_registry_entry": cache_registry_entry,
         "modal_status": modal_result.get("status") if modal_result else None,
         "validation_errors": validation_errors,
     }
@@ -926,6 +934,7 @@ def write_batch_summary(
     comparator_batch: Path | None = None,
 ) -> None:
     repeat_summary = summarize_repeats(completed, running, pending, modal_gpu=modal_gpu)
+    cache_wait_summary = summarize_cache_wait(completed, running, pending)
     comparator = load_comparator_repeat_summary(comparator_batch) if comparator_batch else None
     promotion_readiness = promotion_readiness_report(
         repeat_summary,
@@ -954,12 +963,14 @@ def write_batch_summary(
         ],
         "pending": [row.__dict__ for row in pending],
         "repeat_summary": repeat_summary,
+        "cache_wait_summary": cache_wait_summary,
         "promotion_readiness": promotion_readiness,
     }
     if any(row.get("status") != "ok" for row in completed):
         summary["status"] = "failed" if not running else "running_with_failures"
     write_json(batch_dir / "batch-summary.json", summary)
     write_json(batch_dir / "repeat-summary.json", repeat_summary)
+    write_json(batch_dir / "cache-wait-summary.json", cache_wait_summary)
 
 
 def terminate_running_rows(running: list[RunningRow]) -> None:
@@ -1060,6 +1071,263 @@ def summarize_repeats(
         "train_order_comparisons": train_order_comparisons,
         "train_order_pairing_errors": train_order_pairing_errors,
     }
+
+
+def summarize_cache_wait(
+    completed: list[dict[str, Any]],
+    running: list[RunningRow],
+    pending: list[Row],
+) -> dict[str, Any]:
+    expected: dict[str, dict[str, Any]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for result in completed:
+        key = repeat_group_key(result)
+        expected.setdefault(key, repeat_group_descriptor(result))
+        groups.setdefault(key, []).append(cache_wait_row_summary(result))
+    for active in running:
+        key = repeat_group_key(active.row)
+        expected.setdefault(key, repeat_group_descriptor(active.row))
+    for row in pending:
+        key = repeat_group_key(row)
+        expected.setdefault(key, repeat_group_descriptor(row))
+
+    group_summaries: dict[str, Any] = {}
+    for key, descriptor in sorted(expected.items()):
+        rows = groups.get(key, [])
+        failed_rows = [row for row in rows if row.get("status") != "ok"]
+        metrics = {
+            "cache_stage_seconds": summarize_metric_values(
+                numeric_value(row.get("cache_stage_seconds")) for row in rows
+            ),
+            "build_seconds": summarize_metric_values(
+                numeric_value(row.get("build_seconds")) for row in rows
+            ),
+            "stage_minus_build_seconds": summarize_metric_values(
+                numeric_value(row.get("stage_minus_build_seconds")) for row in rows
+            ),
+            "cache_size_bytes": summarize_metric_values(
+                numeric_value(row.get("cache_size_bytes")) for row in rows
+            ),
+            "sample_payload_seconds": summarize_metric_values(
+                numeric_value(row.get("split_phase_totals", {}).get("sample_payload_seconds"))
+                for row in rows
+            ),
+            "hash_seconds": summarize_metric_values(
+                numeric_value(row.get("split_phase_totals", {}).get("hash_seconds"))
+                for row in rows
+            ),
+            "metadata_write_seconds": summarize_metric_values(
+                numeric_value(row.get("split_phase_totals", {}).get("metadata_write_seconds"))
+                for row in rows
+            ),
+            "image_flush_seconds": summarize_metric_values(
+                numeric_value(row.get("split_phase_totals", {}).get("image_flush_seconds"))
+                for row in rows
+            ),
+        }
+        content_keys = sorted(
+            {
+                str(row.get("content_key"))
+                for row in rows
+                if row.get("content_key") is not None
+            }
+        )
+        evidence_modes = count_values(str(row.get("evidence_mode") or "unknown") for row in rows)
+        if failed_rows:
+            status = "failed"
+        elif rows and len(rows) >= int(descriptor.get("repeat_count") or 1):
+            status = "ok"
+        else:
+            status = "running"
+        group_summaries[key] = {
+            **descriptor,
+            "status": status,
+            "rows": rows,
+            "metrics": metrics,
+            "diagnostics": {
+                "evidence_modes": evidence_modes,
+                "cache_reused_count": sum(1 for row in rows if row.get("cache_reused") is True),
+                "cold_rebuild_count": sum(
+                    1 for row in rows if row.get("evidence_mode") == "cold_rebuild"
+                ),
+                "content_keys": content_keys,
+                "single_content_key": len(content_keys) <= 1 if rows else None,
+                "cache_dirs": sorted(
+                    {
+                        str(row.get("cache_dir"))
+                        for row in rows
+                        if row.get("cache_dir") is not None
+                    }
+                ),
+            },
+        }
+
+    errors = [
+        f"{key}: {error}"
+        for key, group in group_summaries.items()
+        for row in group.get("rows", [])
+        for error in row.get("errors", [])
+    ]
+    if any(group.get("status") == "failed" for group in group_summaries.values()):
+        status = "failed"
+    elif group_summaries and all(group.get("status") == "ok" for group in group_summaries.values()):
+        status = "ok"
+    else:
+        status = "running"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "classification": (
+            "cache_wait_evidence_failed"
+            if status == "failed"
+            else "cache_wait_evidence_recorded"
+            if status == "ok"
+            else "cache_wait_evidence_pending"
+        ),
+        "requirements": {
+            "cold_evidence": "cache_reused=false and preflight action rebuild/blocked_destructive_rebuild",
+            "reuse_evidence": "cache_reused=true or preflight action reuse",
+            "required_artifacts": [
+                "cache-report.json",
+                "cache-preflight.json",
+                "run-summary.json",
+                "summary-consistency.json",
+            ],
+            "required_identity_fields": [
+                "source_manifest_checksum",
+                "transform_fingerprint",
+                "target_fingerprint",
+                "content_key",
+                "cache_dtype",
+                "image_size",
+            ],
+        },
+        "groups": group_summaries,
+        "errors": errors,
+    }
+
+
+def cache_wait_row_summary(result: dict[str, Any]) -> dict[str, Any]:
+    cache_report = result.get("cache_report") or {}
+    cache_preflight = result.get("cache_preflight") or {}
+    errors: list[str] = []
+    if not cache_report:
+        errors.append("missing cache-report.json")
+        cache_report = {}
+    if not cache_preflight:
+        errors.append("missing cache-preflight.json")
+        cache_preflight = {}
+    if cache_report.get("cache_schema_version") not in (None, 1):
+        errors.append(f"unsupported cache schema {cache_report.get('cache_schema_version')!r}")
+    if cache_report.get("cache_reused") is None:
+        errors.append("cache_reused missing")
+    for field in ("build_seconds", "cache_stage_seconds", "cache_size_bytes"):
+        if numeric_value(cache_report.get(field)) is None:
+            errors.append(f"{field} missing or non-numeric")
+
+    identity = cache_report.get("cache_identity") or {}
+    if not isinstance(identity, dict):
+        identity = {}
+    for field in (
+        "source_manifest_checksum",
+        "transform_fingerprint",
+        "target_fingerprint",
+        "content_key",
+        "cache_dtype",
+        "image_size",
+    ):
+        if identity.get(field) is None:
+            errors.append(f"cache identity {field} missing")
+
+    preflight_action = cache_preflight.get("action")
+    cache_reused = cache_report.get("cache_reused")
+    if cache_reused is True or preflight_action == "reuse":
+        evidence_mode = "reuse"
+    elif cache_reused is False and preflight_action == "blocked_destructive_rebuild":
+        evidence_mode = "blocked_destructive_rebuild"
+    elif cache_reused is False:
+        evidence_mode = "cold_rebuild"
+    else:
+        evidence_mode = "unknown"
+
+    split_phase_totals = cache_split_phase_totals(cache_report)
+    build_seconds = numeric_value(cache_report.get("build_seconds"))
+    stage_seconds = numeric_value(cache_report.get("cache_stage_seconds"))
+    stage_minus_build_seconds = None
+    if evidence_mode == "cold_rebuild" and stage_seconds is not None and build_seconds is not None:
+        stage_minus_build_seconds = stage_seconds - build_seconds
+    return {
+        "run_id": result.get("run_id"),
+        "status": "failed" if errors else "ok",
+        "errors": errors,
+        "evidence_mode": evidence_mode,
+        "cache_reused": cache_reused,
+        "preflight_action": preflight_action,
+        "preflight_reasons": cache_preflight.get("reasons") or [],
+        "cache_dir": cache_report.get("cache_dir"),
+        "cache_key_mode": cache_report.get("cache_key_mode"),
+        "cache_kind": cache_report.get("cache_kind"),
+        "cache_dtype": cache_report.get("dtype") or identity.get("cache_dtype"),
+        "image_size": cache_report.get("image_size") or identity.get("image_size"),
+        "cache_splits": list(cache_report.get("split_names") or []),
+        "content_key": identity.get("content_key"),
+        "source_manifest_checksum": (
+            identity.get("source_manifest_checksum")
+            or cache_report.get("source_manifest_checksum")
+        ),
+        "transform_fingerprint": (
+            identity.get("transform_fingerprint")
+            or cache_report.get("transform_fingerprint")
+        ),
+        "target_fingerprint": identity.get("target_fingerprint"),
+        "build_seconds": build_seconds,
+        "cache_stage_seconds": stage_seconds,
+        "stage_minus_build_seconds": stage_minus_build_seconds,
+        "cache_size_bytes": cache_report.get("cache_size_bytes"),
+        "mean_std_seconds": cache_report.get("mean_std_seconds"),
+        "split_phase_totals": split_phase_totals,
+        "split_samples": {
+            split: details.get("samples")
+            for split, details in (cache_report.get("splits") or {}).items()
+            if isinstance(details, dict)
+        },
+        "split_image_bytes": {
+            split: details.get("image_bytes")
+            for split, details in (cache_report.get("splits") or {}).items()
+            if isinstance(details, dict)
+        },
+    }
+
+
+def cache_split_phase_totals(cache_report: dict[str, Any]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    splits = cache_report.get("splits") or {}
+    if not isinstance(splits, dict):
+        return totals
+    fields = (
+        "build_seconds",
+        "sample_payload_seconds",
+        "metadata_write_seconds",
+        "image_flush_seconds",
+        "labels_masks_write_seconds",
+        "hash_seconds",
+        "image_bytes",
+    )
+    for details in splits.values():
+        if not isinstance(details, dict):
+            continue
+        for field in fields:
+            value = numeric_value(details.get(field))
+            if value is not None:
+                totals[field] = totals.get(field, 0.0) + value
+    return totals
+
+
+def count_values(values: Iterable[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return counts
 
 
 def repeat_metric_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1783,6 +2051,8 @@ def validate_row_artifacts(
     quality: dict[str, Any],
     environment: dict[str, Any],
     summary_consistency: dict[str, Any] | None = None,
+    cache_report: dict[str, Any] | None = None,
+    cache_preflight: dict[str, Any] | None = None,
     quality_gate: dict[str, Any] | None = None,
     predictions: dict[str, Any] | None = None,
     train_order: dict[str, Any] | None = None,
@@ -1795,6 +2065,8 @@ def validate_row_artifacts(
     metadata = environment.get("run_metadata") or {}
     predictions = predictions or {}
     train_order = train_order or {}
+    cache_report = cache_report or {}
+    cache_preflight = cache_preflight or {}
 
     if returncode != 0:
         errors.append(f"modal command returned {returncode}")
@@ -1808,6 +2080,20 @@ def validate_row_artifacts(
         errors.append("missing gpu-throughput.json")
     if not environment:
         errors.append("missing environment.json")
+    if artifact_dir is not None:
+        if not cache_report:
+            errors.append("missing cache-report.json")
+        if not cache_preflight:
+            errors.append("missing cache-preflight.json")
+    if cache_report or cache_preflight:
+        cache_wait_errors = cache_wait_row_summary(
+            {
+                "run_id": active.run_id,
+                "cache_report": cache_report,
+                "cache_preflight": cache_preflight,
+            }
+        ).get("errors", [])
+        errors.extend(f"cache wait: {error}" for error in cache_wait_errors)
     if metadata and "quality_gate" in metadata and not quality_gate:
         errors.append("missing quality-gate.json")
     if not summary_consistency:

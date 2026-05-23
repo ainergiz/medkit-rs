@@ -1990,6 +1990,94 @@ def test_matrix_repeat_summary_aggregates_three_repeat_metrics():
     assert prediction_comparison["missing_from_medkit_count"] == 0
 
 
+def test_matrix_cache_wait_summary_separates_cold_and_reuse_evidence():
+    matrix = load_matrix_module()
+    cold_report = {
+        "cache_schema_version": 1,
+        "cache_reused": False,
+        "cache_dir": "/cache/cxr/cold",
+        "cache_key_mode": "content",
+        "cache_kind": "medkit_rust_compatible_mmap_float32",
+        "dtype": "float32",
+        "image_size": 224,
+        "build_seconds": 120.0,
+        "cache_stage_seconds": 123.0,
+        "cache_size_bytes": 1000,
+        "mean_std_seconds": 10.0,
+        "split_names": ["train", "val"],
+        "cache_identity": {
+            "cache_dtype": "float32",
+            "content_key": "cache-key",
+            "image_size": 224,
+            "source_manifest_checksum": "manifest",
+            "target_fingerprint": "target",
+            "transform_fingerprint": "transform",
+        },
+        "splits": {
+            "train": {
+                "samples": 8,
+                "image_bytes": 800,
+                "build_seconds": 90.0,
+                "sample_payload_seconds": 80.0,
+                "hash_seconds": 4.0,
+                "metadata_write_seconds": 1.0,
+                "image_flush_seconds": 0.5,
+            },
+            "val": {
+                "samples": 2,
+                "image_bytes": 200,
+                "build_seconds": 20.0,
+                "sample_payload_seconds": 18.0,
+                "hash_seconds": 1.0,
+                "metadata_write_seconds": 0.25,
+                "image_flush_seconds": 0.1,
+            },
+        },
+    }
+    reuse_report = {
+        **cold_report,
+        "cache_reused": True,
+        "build_seconds": 120.0,
+        "cache_stage_seconds": 0.2,
+    }
+    results = [
+        {
+            "run_id": "cold-row",
+            "status": "ok",
+            "baseline": "medkit_native_prefetch_pinned",
+            "cache_dtype": "float32",
+            "read_mode": "stream",
+            "repeat_count": 1,
+            "cache_report": cold_report,
+            "cache_preflight": {"action": "rebuild", "reasons": ["cache_metadata_missing"]},
+        },
+        {
+            "run_id": "reuse-row",
+            "status": "ok",
+            "baseline": "pytorch_raw",
+            "cache_dtype": "float32",
+            "read_mode": "mmap",
+            "repeat_count": 1,
+            "cache_report": reuse_report,
+            "cache_preflight": {"action": "reuse", "reasons": ["cache_metadata_matches"]},
+        },
+    ]
+
+    summary = matrix.summarize_cache_wait(results, running=[], pending=[])
+    cold_group = summary["groups"]["medkit_native_prefetch_pinned:float32:stream"]
+    reuse_group = summary["groups"]["pytorch_raw:float32:mmap"]
+
+    assert summary["status"] == "ok"
+    assert cold_group["rows"][0]["evidence_mode"] == "cold_rebuild"
+    assert reuse_group["rows"][0]["evidence_mode"] == "reuse"
+    assert cold_group["metrics"]["cache_stage_seconds"]["mean"] == 123.0
+    assert cold_group["metrics"]["stage_minus_build_seconds"]["mean"] == 3.0
+    assert cold_group["metrics"]["sample_payload_seconds"]["mean"] == 98.0
+    assert cold_group["diagnostics"]["content_keys"] == ["cache-key"]
+    assert reuse_group["diagnostics"]["cache_reused_count"] == 1
+    assert reuse_group["metrics"]["stage_minus_build_seconds"]["count"] == 0
+
+
 def test_matrix_prediction_validation_requires_quality_artifact(tmp_path):
     matrix = load_matrix_module()
     errors: list[str] = []
