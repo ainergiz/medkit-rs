@@ -574,6 +574,20 @@ def main() -> int:
     )
     cache_start = time.perf_counter()
     cache_metadata_path = cache_dir / "cache-metadata.json"
+    cache_preflight = cache_preflight_report(
+        dataset_work_dir=dataset_work_dir,
+        cache_dir=cache_dir,
+        cache_metadata_path=cache_metadata_path,
+        records=records,
+        targets=targets,
+        image_size=cache_size,
+        cache_dtype=args.cache_dtype,
+        cache_key_mode=args.cache_key_mode,
+        force_cache=args.force_cache,
+        allow_destructive_cache=args.allow_destructive_cache,
+        smoke=args.smoke,
+    )
+    write_json(report_dir / "cache-preflight.json", cache_preflight)
     enforce_destructive_cache_guard(
         force_cache=args.force_cache,
         allow_destructive_cache=args.allow_destructive_cache,
@@ -607,6 +621,11 @@ def main() -> int:
         cache_report["cache_reused"] = True
     cache_report["cache_stage_seconds"] = time.perf_counter() - cache_start
     write_json(report_dir / "cache-report.json", cache_report)
+    cache_registry_entry = update_cache_registry(
+        dataset_work_dir=dataset_work_dir,
+        cache_report=cache_report,
+    )
+    write_json(report_dir / "cache-registry-entry.json", cache_registry_entry)
 
     if "webdataset" in baselines:
         webdataset_start = time.perf_counter()
@@ -1909,6 +1928,167 @@ def enforce_destructive_cache_guard(
         f"{cache_dir}. Pass --allow-destructive-cache for intentional rebuilds, "
         "or omit --force-cache to reuse a matching cache."
     )
+
+
+def cache_registry_path(dataset_work_dir: Path) -> Path:
+    return dataset_work_dir / "cache-registry.json"
+
+
+def cache_preflight_report(
+    *,
+    dataset_work_dir: Path,
+    cache_dir: Path,
+    cache_metadata_path: Path,
+    records: Sequence[SampleRecord],
+    targets: Sequence[str],
+    image_size: int,
+    cache_dtype: str,
+    cache_key_mode: str,
+    force_cache: bool,
+    allow_destructive_cache: bool,
+    smoke: bool,
+) -> dict[str, Any]:
+    identity = cache_identity_report(
+        records=records,
+        targets=targets,
+        image_size=image_size,
+        cache_dtype=cache_dtype,
+    )
+    registry_path = cache_registry_path(dataset_work_dir)
+    registry = load_cache_registry(registry_path)
+    registry_entry = registry.get("entries", {}).get(identity["content_key"])
+    metadata_exists = cache_metadata_path.exists()
+    metadata_error = ""
+    metadata_matches = False
+    existing_cache: dict[str, Any] | None = None
+    if metadata_exists:
+        try:
+            loaded = load_json(cache_metadata_path)
+            if isinstance(loaded, dict):
+                existing_cache = loaded
+                metadata_matches = cache_matches_run(
+                    existing_cache,
+                    records=records,
+                    targets=targets,
+                    image_size=image_size,
+                    cache_dtype=cache_dtype,
+                )
+            else:
+                metadata_error = "metadata JSON is not an object"
+        except Exception as error:
+            metadata_error = str(error)
+
+    reasons: list[str] = []
+    if force_cache:
+        reasons.append("force_cache_requested")
+    if not metadata_exists:
+        reasons.append("cache_metadata_missing")
+    if metadata_error:
+        reasons.append("cache_metadata_unreadable")
+    if metadata_exists and not metadata_error and not metadata_matches:
+        reasons.append("cache_metadata_mismatch")
+    if (
+        force_cache
+        and not allow_destructive_cache
+        and not smoke
+        and metadata_exists
+    ):
+        action = "blocked_destructive_rebuild"
+    elif force_cache or not metadata_exists or metadata_error or not metadata_matches:
+        action = "rebuild"
+    else:
+        action = "reuse"
+        reasons.append("cache_metadata_matches")
+
+    return {
+        "schema_version": 1,
+        "cache_dir": str(cache_dir),
+        "metadata_path": str(cache_metadata_path),
+        "cache_key_mode": cache_key_mode,
+        "cache_identity": identity,
+        "registry_path": str(registry_path),
+        "registry_hit": registry_entry is not None,
+        "registry_entry": registry_entry,
+        "cache_dir_exists": cache_dir.exists(),
+        "metadata_exists": metadata_exists,
+        "metadata_error": metadata_error,
+        "metadata_matches": metadata_matches,
+        "force_cache": force_cache,
+        "allow_destructive_cache": allow_destructive_cache,
+        "smoke": smoke,
+        "action": action,
+        "reasons": reasons,
+    }
+
+
+def load_cache_registry(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"schema_version": 1, "entries": {}}
+    try:
+        registry = load_json(path)
+    except Exception as error:
+        return {"schema_version": 1, "entries": {}, "load_error": str(error)}
+    if not isinstance(registry, dict):
+        return {"schema_version": 1, "entries": {}, "load_error": "registry is not an object"}
+    entries = registry.get("entries")
+    if not isinstance(entries, dict):
+        registry["entries"] = {}
+    registry.setdefault("schema_version", 1)
+    return registry
+
+
+def update_cache_registry(
+    *,
+    dataset_work_dir: Path,
+    cache_report: dict[str, Any],
+) -> dict[str, Any]:
+    registry_path = cache_registry_path(dataset_work_dir)
+    registry = load_cache_registry(registry_path)
+    identity = cache_report.get("cache_identity")
+    if not isinstance(identity, dict):
+        identity = {
+            "content_key": str(cache_report.get("cache_dir", "")),
+            "source_manifest_checksum": cache_report.get("source_manifest_checksum"),
+            "transform_fingerprint": cache_report.get("transform_fingerprint"),
+            "target_fingerprint": stable_hash({"targets": cache_report.get("targets", [])}),
+            "image_size": cache_report.get("image_size"),
+            "cache_dtype": cache_report.get("dtype"),
+        }
+    content_key = str(identity.get("content_key") or cache_report.get("cache_dir", ""))
+    split_samples = {
+        split: info.get("samples")
+        for split, info in (cache_report.get("splits") or {}).items()
+        if isinstance(info, dict)
+    }
+    entry = {
+        "schema_version": 1,
+        "content_key": content_key,
+        "cache_dir": str(cache_report.get("cache_dir", "")),
+        "metadata_path": str(Path(str(cache_report.get("cache_dir", ""))) / "cache-metadata.json"),
+        "cache_key_mode": cache_report.get("cache_key_mode"),
+        "cache_kind": cache_report.get("cache_kind"),
+        "dtype": cache_report.get("dtype"),
+        "image_size": cache_report.get("image_size"),
+        "source_manifest_checksum": identity.get("source_manifest_checksum"),
+        "transform_fingerprint": identity.get("transform_fingerprint")
+        or cache_report.get("transform_fingerprint"),
+        "target_fingerprint": identity.get("target_fingerprint"),
+        "targets": list(cache_report.get("targets", [])),
+        "split_samples": split_samples,
+        "cache_size_bytes": cache_report.get("cache_size_bytes"),
+        "cache_reused": cache_report.get("cache_reused"),
+        "cache_stage_seconds": cache_report.get("cache_stage_seconds"),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    registry.setdefault("entries", {})[content_key] = entry
+    registry["updated_at"] = entry["updated_at"]
+    registry["entry_count"] = len(registry["entries"])
+    write_json(registry_path, registry)
+    return {
+        "schema_version": 1,
+        "registry_path": str(registry_path),
+        "entry": entry,
+    }
 
 
 def cache_matches_run(
@@ -6636,6 +6816,8 @@ def build_run_provenance(
             "run_summary": "run-summary.json",
             "manifest": "manifest.jsonl",
             "splits": "splits.json",
+            "cache_preflight": "cache-preflight.json",
+            "cache_registry_entry": "cache-registry-entry.json",
             "summary_consistency": "summary-consistency.json",
             "step_profile": "step-profile.json",
             "environment": "environment.json",

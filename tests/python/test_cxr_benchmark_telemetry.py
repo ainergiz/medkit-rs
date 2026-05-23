@@ -802,6 +802,107 @@ def test_force_cache_requires_explicit_destructive_allowance(tmp_path):
     )
 
 
+def test_cache_preflight_and_registry_record_reuse_audit(tmp_path):
+    benchmark = load_benchmark_module()
+    record = benchmark.SampleRecord(
+        sample_id="sample-1",
+        patient_id="patient-1",
+        study_id="study-1",
+        image_id="image-1",
+        image_path="/tmp/one.dcm",
+        filename="one.dcm",
+        source_split="train",
+        width=10,
+        height=10,
+        labels={"Pneumonia": 1},
+        split="train",
+        sha256="sha-one",
+        source_format="dicom",
+    )
+    targets = ["Pneumonia"]
+    cache_dir = benchmark.cache_dir_for_run(
+        dataset_work_dir=tmp_path,
+        image_size=224,
+        cache_dtype="float32",
+        cache_key_mode="content",
+        records=[record],
+        targets=targets,
+    )
+    metadata_path = cache_dir / "cache-metadata.json"
+
+    missing = benchmark.cache_preflight_report(
+        dataset_work_dir=tmp_path,
+        cache_dir=cache_dir,
+        cache_metadata_path=metadata_path,
+        records=[record],
+        targets=targets,
+        image_size=224,
+        cache_dtype="float32",
+        cache_key_mode="content",
+        force_cache=False,
+        allow_destructive_cache=False,
+        smoke=False,
+    )
+    assert missing["action"] == "rebuild"
+    assert missing["metadata_exists"] is False
+    assert "cache_metadata_missing" in missing["reasons"]
+
+    cache_dir.mkdir(parents=True)
+    cache_report = {
+        "cache_schema_version": 1,
+        "cache_kind": "medkit_rust_compatible_mmap_float32",
+        "cache_dir": str(cache_dir),
+        "cache_key_mode": "content",
+        "cache_identity": benchmark.cache_identity_report(
+            records=[record],
+            targets=targets,
+            image_size=224,
+            cache_dtype="float32",
+        ),
+        "cache_reused": False,
+        "dtype": "float32",
+        "image_size": 224,
+        "targets": targets,
+        "source_manifest_checksum": benchmark.manifest_checksum([record]),
+        "transform_fingerprint": benchmark.cache_transform_plan(
+            image_size=224,
+            cache_dtype="float32",
+        ),
+        "splits": {
+            "train": {"samples": 1, "shape": [1, 1, 224, 224]},
+            "val": {"samples": 0, "shape": [0, 1, 224, 224]},
+            "test": {"samples": 0, "shape": [0, 1, 224, 224]},
+        },
+        "cache_size_bytes": 123,
+        "cache_stage_seconds": 1.5,
+    }
+    benchmark.write_json(metadata_path, cache_report)
+    registry_entry = benchmark.update_cache_registry(
+        dataset_work_dir=tmp_path,
+        cache_report=cache_report,
+    )
+
+    reuse = benchmark.cache_preflight_report(
+        dataset_work_dir=tmp_path,
+        cache_dir=cache_dir,
+        cache_metadata_path=metadata_path,
+        records=[record],
+        targets=targets,
+        image_size=224,
+        cache_dtype="float32",
+        cache_key_mode="content",
+        force_cache=False,
+        allow_destructive_cache=False,
+        smoke=False,
+    )
+
+    assert registry_entry["entry"]["content_key"] == cache_report["cache_identity"]["content_key"]
+    assert reuse["action"] == "reuse"
+    assert reuse["metadata_matches"] is True
+    assert reuse["registry_hit"] is True
+    assert reuse["registry_entry"]["cache_size_bytes"] == 123
+
+
 def test_split_report_records_reproducibility_checksums(tmp_path):
     benchmark = load_benchmark_module()
     records = [
