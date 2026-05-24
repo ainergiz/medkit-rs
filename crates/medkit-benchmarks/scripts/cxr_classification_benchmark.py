@@ -1919,11 +1919,7 @@ def cache_identity_report(
     target_fingerprint = stable_hash({"targets": list(targets)})
     materialized_splits = list(cache_splits)
     split_fingerprint = stable_hash({"cache_splits": materialized_splits})
-    split_suffix = (
-        ""
-        if tuple(materialized_splits) == ("train", "val", "test")
-        else f"-s{split_fingerprint[:12]}"
-    )
+    split_suffix = f"-s{split_fingerprint[:12]}"
     return {
         "schema_version": 1,
         "image_size": image_size,

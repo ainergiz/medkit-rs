@@ -763,6 +763,7 @@ def test_content_cache_key_includes_manifest_transform_and_targets(tmp_path):
     assert legacy_first == legacy_second == tmp_path / "cache-224-float32"
     assert content_first != content_second
     assert content_first.parent == tmp_path / "caches"
+    assert "-s" in content_first.name
     assert content_first.name == benchmark.cache_identity_report(
         records=[first],
         targets=["Pneumonia"],
@@ -905,6 +906,48 @@ def test_cache_preflight_and_registry_record_reuse_audit(tmp_path):
     assert reuse["registry_entry"]["cache_size_bytes"] == 123
 
 
+def test_content_cache_key_keeps_full_split_scope_visible(tmp_path):
+    benchmark = load_benchmark_module()
+    record = benchmark.SampleRecord(
+        sample_id="sample-1",
+        patient_id="patient-1",
+        study_id="study-1",
+        image_id="image-1",
+        image_path="/tmp/one.dcm",
+        filename="one.dcm",
+        source_split="train",
+        width=10,
+        height=10,
+        labels={"Pneumonia": 1},
+        split="train",
+        sha256="sha-one",
+        source_format="dicom",
+    )
+    targets = ["Pneumonia"]
+
+    full_identity = benchmark.cache_identity_report(
+        records=[record],
+        targets=targets,
+        image_size=224,
+        cache_dtype="float32",
+        cache_splits=("train", "val", "test"),
+    )
+    train_identity = benchmark.cache_identity_report(
+        records=[record],
+        targets=targets,
+        image_size=224,
+        cache_dtype="float32",
+        cache_splits=("train",),
+    )
+
+    assert full_identity["split_fingerprint"] != train_identity["split_fingerprint"]
+    assert full_identity["content_key"].endswith(f"-s{full_identity['split_fingerprint'][:12]}")
+    assert train_identity["content_key"].endswith(
+        f"-s{train_identity['split_fingerprint'][:12]}"
+    )
+    assert full_identity["content_key"] != train_identity["content_key"]
+
+
 def test_split_selective_cache_key_and_scope_audits(tmp_path):
     benchmark = load_benchmark_module()
     record = benchmark.SampleRecord(
@@ -953,7 +996,7 @@ def test_split_selective_cache_key_and_scope_audits(tmp_path):
     )
 
     assert full_dir != train_only_dir
-    assert "-s" not in full_dir.name
+    assert "-s" in full_dir.name
     assert "-s" in train_only_dir.name
     assert legacy_train_only_dir.name.startswith("cache-224-float32-s")
 
