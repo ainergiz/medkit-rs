@@ -16,7 +16,7 @@ use medkit_cache::{
 use medkit_cxr::{
     cache_cxr_with_options, index_cxr, ingest_cxr_dicom, split_cxr, validate_cache_cxr,
     validate_cxr, CacheConfig as CxrCacheConfig, CacheSummary as CxrCacheSummary,
-    CacheValidationSummary as CxrCacheValidationSummary, CxrCacheOptions,
+    CacheValidationSummary as CxrCacheValidationSummary, CxrCacheDType, CxrCacheOptions,
     IndexConfig as CxrIndexConfig, IndexSummary as CxrIndexSummary,
     IngestConfig as CxrIngestConfig, IngestSummary as CxrIngestSummary, LabelAction,
     SplitConfig as CxrSplitConfig, SplitSummary as CxrSplitSummary,
@@ -1038,6 +1038,10 @@ fn parse_cxr_cache_command(mut args: impl Iterator<Item = OsString>) -> Result<C
             "--plan" => plan_path = Some(next_path(&mut rest, "--plan")?),
             "--cache" => cache_dir = Some(next_path(&mut rest, "--cache")?),
             "--targets" => options.targets = parse_csv_list(&next_string(&mut rest, "--targets")?),
+            "--cache-dtype" => {
+                options.cache_dtype =
+                    parse_cxr_cache_dtype(&next_string(&mut rest, "--cache-dtype")?)?
+            }
             "--uncertain" => {
                 options.label_policy.uncertain =
                     parse_label_action(&next_string(&mut rest, "--uncertain")?, "--uncertain")?
@@ -1541,6 +1545,12 @@ fn parse_label_action(value: &str, flag: &str) -> Result<LabelAction, CliError> 
         .map_err(|error| CliError::Message(format!("invalid {flag}: {error}")))
 }
 
+fn parse_cxr_cache_dtype(value: &str) -> Result<CxrCacheDType, CliError> {
+    value
+        .parse::<CxrCacheDType>()
+        .map_err(|error| CliError::Message(format!("invalid --cache-dtype: {error}")))
+}
+
 fn parse_transfer_syntax_action(value: &str) -> Result<String, CliError> {
     match value {
         "fail" | "warn" | "skip" => Ok(value.to_string()),
@@ -1984,7 +1994,7 @@ fn usage() -> String {
         "  medkit cxr index --images <dir> [--metadata metadata.csv.gz] [--labels labels.csv.gz] [--reports reports] --out manifest.jsonl",
         "  medkit cxr validate <manifest.jsonl> [--require-frontal] [--check-patient-leakage] [--check-duplicates] --report validation.md",
         "  medkit cxr split <manifest.jsonl> --by patient_id --train 0.8 --val 0.1 --test 0.1 [--stratify Pneumonia,view_position] [--seed 0] --out splits.json",
-        "  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache [--targets Pneumonia,No Finding] [--uncertain ignore] [--missing ignore] [--dicom-apply-rescale true] [--dicom-voi auto] [--dicom-invert-monochrome1 true] [--dicom-decoder-backend medkit-native] [--allow-transfer-syntaxes uid,uid] [--unsupported-transfer-syntax fail]",
+        "  medkit cxr cache <manifest.jsonl> --splits splits.json --plan cxr-512.toml --cache .medkit/cxr-cache [--targets Pneumonia,No Finding] [--cache-dtype float32|float16|uint8] [--uncertain ignore] [--missing ignore] [--dicom-apply-rescale true] [--dicom-voi auto] [--dicom-invert-monochrome1 true] [--dicom-decoder-backend medkit-native] [--allow-transfer-syntaxes uid,uid] [--unsupported-transfer-syntax fail]",
         "  medkit cxr validate-cache <cache> [--split train] [--targets Pneumonia] [--image-shape n,c,h,w] [--plan cxr-512.toml] [--report cache-validation.md] [--json cache-validation.json]",
         "  medkit cxr ingest <raw-dicom> --recipe cxr-dicom-512.toml --labels labels.csv --cache .medkit/cxr-cache --workdir .medkit/cxr-ingest --report ingestion-report.md [--dry-run] [--workers 4]",
         "  medkit cxr benchmark [--manifest manifest.jsonl] [--splits splits.json] [--plan cxr-512.toml] [--targets Pneumonia] [--baselines pytorch_raw,monai_raw,medkit_cached_mmap] [--batch-sizes 64,128] [--workers 8,16] [--device cuda:0] [--out benchmark.json]",

@@ -100,6 +100,8 @@ fn cxr_cli_indexes_splits_validates_and_caches_fixture() {
         cache.to_str().unwrap(),
         "--targets",
         "No Finding,Pneumonia",
+        "--cache-dtype",
+        "uint8",
         "--uncertain",
         "positive",
         "--missing",
@@ -115,6 +117,11 @@ fn cxr_cli_indexes_splits_validates_and_caches_fixture() {
     assert_eq!(cache_json["cache_schema_version"].as_u64().unwrap(), 1);
     assert_eq!(cache_json["report_schema_version"].as_u64().unwrap(), 1);
     assert_eq!(cache_json["image_size"].as_u64().unwrap(), 8);
+    assert_eq!(cache_json["dtype"].as_str().unwrap(), "uint8");
+    assert_eq!(
+        cache_json["image_size_policy"]["dtype"].as_str().unwrap(),
+        "uint8"
+    );
     assert_eq!(
         cache_json["label_policy"]["uncertain"].as_str().unwrap(),
         "positive"
@@ -149,7 +156,7 @@ fn cxr_cli_indexes_splits_validates_and_caches_fixture() {
         cache_json["transform_fingerprint"].as_str().unwrap(),
         cache_json["transform_plan_hash"].as_str().unwrap()
     );
-    assert!(cache.join("train-images.float32.dat").exists());
+    assert!(cache.join("train-images.uint8.dat").exists());
 
     let cache_validation = root.join("cache-validation.md");
     let cache_validation_json = root.join("cache-validation.json");
@@ -487,6 +494,10 @@ fn cxr_cli_reports_parse_errors_without_running_products() {
     assert!(cache_unknown_arg
         .stderr
         .contains("unknown argument: --unknown"));
+
+    let cache_bad_dtype =
+        run_medkit_fail(&["cxr", "cache", "manifest.jsonl", "--cache-dtype", "int16"]);
+    assert!(cache_bad_dtype.stderr.contains("invalid --cache-dtype"));
 
     let cache_help = run_medkit_fail(&["cxr", "cache", "manifest.jsonl", "--help"]);
     assert!(cache_help.stderr.contains("Usage:"));
